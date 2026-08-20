@@ -1,0 +1,23 @@
+{
+  "servers": {
+    "toy": {
+      "transport": { "command": "bun", "args": ["run", "test/toy-server.ts"] },
+      "grant": [
+        "tools",
+        "pushEvents",
+        "inferenceRequest",
+        "inferenceLifecycle",
+        "channels.register",
+        "channels.incoming",
+        "channels.publish",
+        "contextHooks.beforeInference.observe",
+        "contextHooks.beforeInference.inject.beforeUser"
+      ],
+      "enableFeatureSets": ["*"],
+      "inferenceRequest": "channel"
+    },
+    "toy2": {
+      "transport": { "command": "bun", "args": ["run", "test/toy-server.ts"] }
+    }
+  }
+}

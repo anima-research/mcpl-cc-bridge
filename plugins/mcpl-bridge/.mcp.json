@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "mcpl": {
+      "command": "sh",
+      "args": ["${CLAUDE_PLUGIN_ROOT}/run.sh"]
+    }
+  }
+}

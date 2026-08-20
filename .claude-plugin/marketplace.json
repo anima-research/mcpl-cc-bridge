@@ -1,0 +1,12 @@
+{
+  "name": "mcpl-bridge-dev",
+  "description": "Local dev marketplace for the MCPL bridge plugin",
+  "owner": { "name": "antra" },
+  "plugins": [
+    {
+      "name": "mcpl-bridge",
+      "description": "Bridge MCPL servers into Claude Code: tools via MCP, push events and channels via the claude/channel capability, beforeInference/lifecycle via hooks.",
+      "source": "./plugins/mcpl-bridge"
+    }
+  ]
+}
