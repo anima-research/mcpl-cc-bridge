@@ -8,6 +8,7 @@
         "inferenceRequest",
         "inferenceLifecycle",
         "channels.register",
+        "channels.lifecycle",
         "channels.incoming",
         "channels.publish",
         "contextHooks.beforeInference.observe",

@@ -18,7 +18,7 @@ import { existsSync, mkdirSync, rmSync } from 'fs'
 import { homedir } from 'os'
 import { join } from 'path'
 import { loadConfig } from './config'
-import { McplServerHandle, type IncomingDelivery } from './mcpl-host'
+import { McplServerHandle, renderContent, type IncomingDelivery } from './mcpl-host'
 
 import { appendFileSync } from 'fs'
 const DEBUG_LOG = join(process.env.CLAUDE_CONFIG_DIR ?? join(homedir(), '.claude'), 'mcpl-bridge', 'debug.log')
@@ -46,7 +46,8 @@ const mcp = new Server(
       'Messages from MCPL servers arrive as <channel source="mcpl" server="..." ...> blocks:',
       '- kind="channel-message" / kind="push-event": events from the MCPL server. To reply on a channel, call mcpl_send with that server and channel_id.',
       '- kind="inference-request": the MCPL server is asking for a completion. Compose the answer and call mcpl_answer with the request_id from the message. Do this promptly — the request is held open.',
-      'Proxied MCPL tools are named <server>__<tool>. mcpl_status shows connections, grants, and channels.',
+      '- A registered channel is CLOSED until opened: closed channels only reach you as push-event wakes (mentions etc.). Call mcpl_open to follow a channel (its messages then arrive as channel-message, optionally with backscroll) and mcpl_close to stop.',
+      'Proxied MCPL tools are named <server>__<tool>. mcpl_status shows connections, grants, open and registered channels.',
     ].join('\n'),
   },
 )
@@ -90,6 +91,31 @@ const BRIDGE_TOOLS = [
         text: { type: 'string' },
       },
       required: ['server', 'channel_id', 'text'],
+    },
+  },
+  {
+    name: 'mcpl_open',
+    description: 'Open (follow) a registered channel of a bridged MCPL server (channels/open). Ambient messages in an open channel are delivered to you as channel-message pushes. Optionally returns recent history. Use the server id and channel_id from a received <channel> message or from mcpl_status / the server\'s channel-listing tools.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        server: { type: 'string', description: 'bridged server id' },
+        channel_id: { type: 'string', description: 'registered channel id, e.g. portal:<discord channel id>' },
+        history_limit: { type: 'number', description: 'number of recent messages to return with the open (default 0)' },
+      },
+      required: ['server', 'channel_id'],
+    },
+  },
+  {
+    name: 'mcpl_close',
+    description: 'Close (stop following) a channel previously opened with mcpl_open (channels/close).',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        server: { type: 'string', description: 'bridged server id' },
+        channel_id: { type: 'string' },
+      },
+      required: ['server', 'channel_id'],
     },
   },
   {
@@ -146,12 +172,17 @@ async function callToolImpl(name: string, args: Record<string, unknown>): Promis
     if (name === 'mcpl_status') {
       const lines: string[] = []
       for (const [id, h] of handles) {
+        // A server can register hundreds of channels (every Discord channel a
+        // persona can see); listing them all in every status call is noise.
+        const ids = [...h.channels.keys()]
+        const channels = ids.length <= 40 ? `[${ids.join(', ') || '—'}]` : `${ids.length} registered`
         lines.push(
           `${id}: ${h.status}` +
             ` | grant=[${h.grant.join(', ') || '—'}]` +
             ` | featureSets=[${h.featureSetsEnabled.join(', ') || '—'}]` +
             ` | tools=${h.tools.length}` +
-            ` | channels=[${[...h.channels.keys()].join(', ') || '—'}]` +
+            ` | channels=${channels}` +
+            ` | open=[${[...h.openChannels].join(', ') || '—'}]` +
             (h.pendingInferenceIds.length ? ` | pending inference: ${h.pendingInferenceIds.join(', ')}` : '') +
             (h.manifestRevision ? ` | rev=${h.manifestRevision.slice(0, 18)}…` : ''),
         )
@@ -163,6 +194,25 @@ async function callToolImpl(name: string, args: Record<string, unknown>): Promis
       if (!h) return text(`unknown server: ${args.server}`, true)
       const r = (await h.publish(String(args.channel_id), String(args.text))) as { delivered?: boolean; messageId?: string }
       return text(r?.delivered ? `delivered${r.messageId ? ` (${r.messageId})` : ''}` : 'not delivered')
+    }
+    if (name === 'mcpl_open') {
+      const h = handles.get(String(args.server))
+      if (!h) return text(`unknown server: ${args.server}`, true)
+      const limit = Number(args.history_limit ?? 0)
+      const r = await h.openChannel(String(args.channel_id), Number.isFinite(limit) && limit > 0 ? Math.floor(limit) : 0)
+      const lines = [`opened ${r?.channel?.id ?? args.channel_id}${r?.channel?.label ? ` (${r.channel.label})` : ''}`]
+      const history = r?.history ?? []
+      if (history.length) {
+        lines.push(`history (${history.length}${r.historyTruncated ? ', truncated' : ''}, oldest first):`)
+        for (const m of history) lines.push(`[${m.timestamp ?? ''}] ${m.author?.name ?? 'unknown'} (${m.messageId}): ${renderContent(m.content)}`)
+      }
+      return text(lines.join('\n'))
+    }
+    if (name === 'mcpl_close') {
+      const h = handles.get(String(args.server))
+      if (!h) return text(`unknown server: ${args.server}`, true)
+      const r = await h.closeChannel(String(args.channel_id))
+      return text(r?.closed === false ? `not closed: ${args.channel_id}` : `closed ${args.channel_id}`)
     }
     if (name === 'mcpl_answer') {
       const h = handles.get(String(args.server))

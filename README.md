@@ -7,6 +7,10 @@ adapter process is simultaneously:
    forwards `tools/list_changed`, and adds bridge tools:
    - `mcpl_status` — connections, grants, feature sets, channels, pending inference
    - `mcpl_send` — `channels/publish` into a registered channel
+   - `mcpl_open` / `mcpl_close` — `channels/open` / `channels/close` (§14.3);
+     an open channel's ambient traffic arrives as `channels/incoming`, a closed
+     one only reaches the session via `push/event` wakes. Descriptors flagged
+     `initiallyOpen` are opened automatically after `channels/register`.
    - `mcpl_answer` — resolve a held `inference/request`
 2. **Channel provider** (`claude/channel`) — `push/event`, `channels/incoming`,
    and `inference/request` arrive as `<channel source="mcpl" ...>` messages that
@@ -52,6 +56,8 @@ and inference answers don't stall behind permission prompts:
 ```json
 { "permissions": { "allow": [
   "mcp__plugin_mcpl-bridge_mcpl__mcpl_send",
+  "mcp__plugin_mcpl-bridge_mcpl__mcpl_open",
+  "mcp__plugin_mcpl-bridge_mcpl__mcpl_close",
   "mcp__plugin_mcpl-bridge_mcpl__mcpl_answer",
   "mcp__plugin_mcpl-bridge_mcpl__mcpl_status"
 ] } }
@@ -84,17 +90,40 @@ Config resolution: `$MCPL_BRIDGE_CONFIG` → `<project>/.mcpl-bridge.json` →
     "heartbeat": {
       "transport": { "command": "node", "args": ["/path/to/heartbeat-mcpl/dist/index.js"] },
       "grant": ["tools", "pushEvents"]
+    },
+    "portal": {
+      "transport": {
+        "command": "node",
+        "args": ["/abs/path/portal/portal-mcpl/dist/src/server-cli.js"],
+        "env": {
+          "PORTAL_URL": "wss://portal.example",
+          "PORTAL_INVITE": "inv_…",
+          "PORTAL_PERSONA_NAME": "claude-code",
+          "PORTAL_CREDENTIALS": "/Users/you/.portal/claude-code.creds.json",
+          "PORTAL_SUBSCRIPTIONS": "<discord-channel-id>,<discord-channel-id>"
+        }
+      },
+      "inferenceRequest": "deny",
+      "reconnect": true
     }
   }
 }
 ```
+
+The `portal` entry hosts [anima-research/portal](https://github.com/anima-research/portal)'s
+MCPL server (`portal-mcpl`, a Discord bridge) with the default grant. Its
+`portal.messaging` feature set `uses` `channels.lifecycle`, so it needs the
+default grant (or an explicit one that includes `channels.lifecycle`) —
+otherwise fail-closed derivation disables the whole messaging set and only the
+read-only sets survive. Channels listed in `PORTAL_SUBSCRIPTIONS` are advertised
+`initiallyOpen` and auto-opened; open others at runtime with `mcpl_open`.
 
 Notes:
 - `grant` is the security boundary. **Omitted = the default grant**: everything
   the bridge can honor except `inject.system`, `inject.afterUser`, and the
   unimplemented channel extras (lifecycle/streaming/typing) — i.e. `tools`,
   `pushEvents`, `modelInfo`, `inferenceRequest`, `inferenceLifecycle`,
-  `channels.{register,incoming,publish,acknowledge}`,
+  `channels.{register,incoming,publish,acknowledge,lifecycle}`,
   `contextHooks.beforeInference.observe` + `inject.beforeUser`.
   An **explicit `[]`** = plain MCP passthrough (tools only). `*` matches exactly
   one segment; `contextHooks.*` grants none of the depth-4 inject leaves — spell

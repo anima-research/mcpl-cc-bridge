@@ -118,6 +118,7 @@ try {
   const names = tools.tools.map(t => t.name)
   ok(names.includes('toy__ping'), `proxied tool toy__ping listed (got: ${names.join(', ')})`)
   ok(names.includes('mcpl_status') && names.includes('mcpl_send') && names.includes('mcpl_answer'), 'bridge tools listed')
+  ok(names.includes('mcpl_open') && names.includes('mcpl_close'), 'lifecycle bridge tools listed')
 
   const ping = (await request('tools/call', { name: 'toy__ping', arguments: { echo: 'x' } })) as { content: Array<{ text: string }> }
   ok(ping?.content?.[0]?.text === 'pong x', `toy__ping → "${ping?.content?.[0]?.text}"`)
@@ -151,6 +152,24 @@ try {
     content: Array<{ text: string }>
   }
   ok((sent?.content?.[0]?.text ?? '').startsWith('delivered'), `mcpl_send → "${sent?.content?.[0]?.text}"`)
+
+  // ── channels/open + channels/close via mcpl_open / mcpl_close ──
+  const opened = (await request('tools/call', { name: 'mcpl_open', arguments: { server: 'toy', channel_id: 'toy:lobby', history_limit: 1 } })) as {
+    content: Array<{ text: string }>
+  }
+  const openedText = opened?.content?.[0]?.text ?? ''
+  ok(openedText.startsWith('opened toy:lobby'), `mcpl_open → "${openedText.split('\n')[0]}"`)
+  ok(openedText.includes('earlier lobby chatter'), 'mcpl_open returned requested history')
+  const status2 = (await request('tools/call', { name: 'mcpl_status', arguments: {} })) as { content: Array<{ text: string }> }
+  const status2Text = status2?.content?.[0]?.text ?? ''
+  ok(/open=\[[^\]]*toy:lobby/.test(status2Text), 'mcpl_status lists toy:lobby as open')
+  ok(/open=\[[^\]]*toy:auto/.test(status2Text), 'initiallyOpen channel toy:auto was auto-opened')
+  const closed = (await request('tools/call', { name: 'mcpl_close', arguments: { server: 'toy', channel_id: 'toy:lobby' } })) as {
+    content: Array<{ text: string }>
+  }
+  ok((closed?.content?.[0]?.text ?? '') === 'closed toy:lobby', `mcpl_close → "${closed?.content?.[0]?.text}"`)
+  const status3 = (await request('tools/call', { name: 'mcpl_status', arguments: {} })) as { content: Array<{ text: string }> }
+  ok(!/open=\[[^\]]*toy:lobby/.test(status3?.content?.[0]?.text ?? ''), 'mcpl_status no longer lists toy:lobby as open')
 
   // ── Hook socket: UserPromptSubmit → beforeInference fan-out ──
   const sockPath = join(process.env.CLAUDE_CONFIG_DIR ?? join(process.env.HOME!, '.claude'), 'mcpl-bridge', `sock-${SESSION_KEY}.sock`)

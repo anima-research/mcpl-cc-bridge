@@ -35,7 +35,7 @@ const MCPL_CAPS = {
   pushEvents: true,
   inferenceRequest: true,
   inferenceLifecycle: true,
-  channels: { register: true, incoming: true, publish: true },
+  channels: { register: true, lifecycle: true, incoming: true, publish: true },
   contextHooks: { beforeInference: { observe: true, inject: { beforeUser: true, system: true } } },
   featureSets: {
     toy: {
@@ -45,6 +45,7 @@ const MCPL_CAPS = {
         'inferenceRequest',
         'inferenceLifecycle',
         'channels.register',
+        'channels.lifecycle',
         'channels.incoming',
         'channels.publish',
         'contextHooks.beforeInference.observe',
@@ -56,13 +57,18 @@ const MCPL_CAPS = {
 
 let policyReady = false
 let demoStarted = false
+const openChannels = new Set<string>()
 
 async function startDemo() {
   if (demoStarted || !policyReady) return
   demoStarted = true
   try {
     const reg = (await request('channels/register', {
-      channels: [{ id: 'toy:lobby', type: 'chat', label: 'Toy Lobby', direction: 'bidirectional' }],
+      channels: [
+        { id: 'toy:lobby', type: 'chat', label: 'Toy Lobby', direction: 'bidirectional' },
+        // initiallyOpen: the bridge should channels/open this one on its own.
+        { id: 'toy:auto', type: 'chat', label: 'Toy Auto', direction: 'bidirectional', initiallyOpen: true },
+      ],
     })) as { results?: Array<{ id: string; accepted: boolean }> }
     log(`register: ${JSON.stringify(reg?.results)}`)
     if (!reg?.results?.some(r => r.id === 'toy:lobby' && r.accepted)) return
@@ -171,6 +177,35 @@ function handle(msg: Json) {
           { namespace: 'toy', position: 'afterUser', content: 'TOY-UNGRANTED: this must not appear' },
         ],
       })
+      return
+    }
+    case 'channels/open': {
+      const channelId = String(params.channelId)
+      const limit = ((params.history as Json | undefined)?.limit as number | undefined) ?? 0
+      log(`open ${channelId} (history ${limit})`)
+      openChannels.add(channelId)
+      respond(id, {
+        channel: { id: channelId, type: 'chat', label: channelId === 'toy:auto' ? 'Toy Auto' : 'Toy Lobby', direction: 'bidirectional' },
+        ...(limit > 0
+          ? {
+              history: [
+                {
+                  channelId,
+                  messageId: 'toy-h1',
+                  author: { id: 'u1', name: 'toybot' },
+                  timestamp: new Date(0).toISOString(),
+                  content: [{ type: 'text', text: 'earlier lobby chatter' }],
+                },
+              ],
+            }
+          : {}),
+      })
+      return
+    }
+    case 'channels/close': {
+      const channelId = String(params.channelId)
+      log(`close ${channelId}`)
+      respond(id, { closed: openChannels.delete(channelId) })
       return
     }
     case 'channels/publish': {

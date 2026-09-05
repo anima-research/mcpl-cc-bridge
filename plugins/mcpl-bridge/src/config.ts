@@ -34,7 +34,7 @@ export type TransportConfig = StdioTransportConfig | WsTransportConfig
 /**
  * Default grant when a server config omits "grant": everything the bridge can
  * honor except the sensitive inject positions (system prompt, afterUser) and
- * the unimplemented channel extras (lifecycle/streaming/typing).
+ * the unimplemented channel extras (streaming/typing).
  * An EXPLICIT `"grant": []` still means plain-MCP passthrough — absence of a
  * path is denial once a grant list exists; only the missing field defaults.
  */
@@ -48,6 +48,7 @@ export const DEFAULT_GRANT: string[] = [
   'channels.incoming',
   'channels.publish',
   'channels.acknowledge',
+  'channels.lifecycle',
   'contextHooks.beforeInference.observe',
   'contextHooks.beforeInference.inject.beforeUser',
 ]
