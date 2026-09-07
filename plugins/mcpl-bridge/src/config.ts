@@ -13,6 +13,7 @@
 import { existsSync, readFileSync } from 'fs'
 import { homedir } from 'os'
 import { join } from 'path'
+import type { WakeConfig } from './wake'
 
 export type StdioTransportConfig = {
   command: string
@@ -34,7 +35,7 @@ export type TransportConfig = StdioTransportConfig | WsTransportConfig
 /**
  * Default grant when a server config omits "grant": everything the bridge can
  * honor except the sensitive inject positions (system prompt, afterUser) and
- * the unimplemented channel extras (lifecycle/streaming/typing).
+ * the unimplemented channel extras (streaming/typing).
  * An EXPLICIT `"grant": []` still means plain-MCP passthrough — absence of a
  * path is denial once a grant list exists; only the missing field defaults.
  */
@@ -45,6 +46,7 @@ export const DEFAULT_GRANT: string[] = [
   'inferenceRequest',
   'inferenceLifecycle',
   'channels.register',
+  'channels.lifecycle',
   'channels.incoming',
   'channels.publish',
   'channels.acknowledge',
@@ -68,6 +70,20 @@ export type ServerConfig = {
    * Default: "channel" when the grant includes "inferenceRequest", else "deny".
    */
   inferenceRequest?: 'channel' | 'deny'
+  /**
+   * When a delivery starts a turn. "all" (default): every push/event and
+   * channels/incoming wakes the session. "chat": the loop-break preset (DMs
+   * wake; a bot addressing the bot, and ambient traffic, are held for the next
+   * wake). Or an explicit { wake, hold, holdCap } rule set — see wake.ts.
+   */
+  wake?: WakeConfig
+  /**
+   * Channel ids to hold open (channels/open) whenever the server registers
+   * them — the host's durable desired-open state. Requires channels.lifecycle
+   * in the grant and the server advertising it. mcpl_open/mcpl_close adjust
+   * the live set; this list is what survives a restart.
+   */
+  openChannels?: string[]
   /** Reconnect on transport failure. Default: true for ws, false for stdio. */
   reconnect?: boolean
   reconnectIntervalMs?: number
@@ -106,6 +122,20 @@ export function loadConfig(): { config: BridgeConfig; path: string | null } {
     if (!/^[a-zA-Z0-9_-]+$/.test(id)) throw new Error(`${path}: bad server id ${JSON.stringify(id)}`)
     if (!s.transport) throw new Error(`${path}: servers.${id}: missing transport`)
     if (s.grant !== undefined && !Array.isArray(s.grant)) throw new Error(`${path}: servers.${id}: grant must be an array when present (omit for the default grant; [] = plain MCP)`)
+    if (s.wake !== undefined && s.wake !== 'all' && s.wake !== 'chat' && (typeof s.wake !== 'object' || s.wake === null || Array.isArray(s.wake))) {
+      throw new Error(`${path}: servers.${id}: wake must be "all", "chat", or a { wake, hold, holdCap } object`)
+    }
+    if (typeof s.wake === 'object' && s.wake !== null) {
+      for (const k of ['wake', 'hold'] as const) {
+        const rules = s.wake[k]
+        if (rules !== undefined && !(Array.isArray(rules) && rules.every(r => Array.isArray(r) && r.every(t => typeof t === 'string')))) {
+          throw new Error(`${path}: servers.${id}: wake.${k} must be an array of tag arrays`)
+        }
+      }
+    }
+    if (s.openChannels !== undefined && !(Array.isArray(s.openChannels) && s.openChannels.every(c => typeof c === 'string'))) {
+      throw new Error(`${path}: servers.${id}: openChannels must be an array of channel ids`)
+    }
   }
   return { config: raw, path }
 }

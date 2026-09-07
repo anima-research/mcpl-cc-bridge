@@ -4,7 +4,9 @@
  * drives the MCP handshake, and asserts every bridged surface:
  *   tools proxying, channel push (channels/incoming + push/event + tag closure),
  *   hook socket (beforeInference → additionalContext, ungranted injection dropped),
- *   channels/publish via mcpl_send, inference/request via mcpl_answer.
+ *   channels/publish via mcpl_send, inference/request via mcpl_answer,
+ *   wake policy (held from-bot reply folded into the next wake / user turn),
+ *   push/event origin → meta, channels/open + close via config and tools.
  */
 import { spawn } from 'child_process'
 import { join } from 'path'
@@ -30,7 +32,11 @@ const child = spawn('bun', ['run', 'src/main.ts'], {
   env: CHILD_ENV,
   stdio: ['pipe', 'pipe', 'pipe'],
 })
-child.stderr.on('data', (d: Buffer) => process.stderr.write(`  | ${d}`))
+let stderr1 = ''
+child.stderr.on('data', (d: Buffer) => {
+  stderr1 += d.toString()
+  process.stderr.write(`  | ${d}`)
+})
 
 let seq = 0
 const pendingReq = new Map<number, (v: unknown) => void>()
@@ -126,6 +132,9 @@ try {
   const statusText = status?.content?.[0]?.text ?? ''
   ok(statusText.includes('toy: ready'), `mcpl_status shows ready: "${statusText.split('\n')[0]}"`)
   ok(statusText.includes('toy:lobby'), 'mcpl_status shows registered channel toy:lobby')
+  ok(statusText.includes('channels.lifecycle'), 'channels.lifecycle is in the effective grant')
+  ok(/toy: .*open=\[toy:lobby\]/.test(statusText), 'openChannels config opened toy:lobby after channels/register')
+  ok(stderr1.includes('toy: open: toy:lobby'), 'toy server received channels/open')
 
   // ── Channel pushes ──
   const hello = await waitForChannel(p => meta(p).kind === 'channel-message', 'channels/incoming delivered as channel push')
@@ -135,6 +144,30 @@ try {
   }
   const push = await waitForChannel(p => meta(p).kind === 'push-event', 'push/event delivered as channel push')
   if (push) ok(String(push.content).includes('toy push event fired'), 'push event content intact')
+
+  // ── Wake policy: toy is wake="chat", toy2 is the default ("all") ──
+  await waitForChannel(p => meta(p).server === 'toy2' && String(p.content).includes('bot echo'), 'default policy (toy2) wakes on a from-bot reply')
+  const mention = await waitForChannel(p => meta(p).server === 'toy' && String(p.content).includes('toy human mention'), 'from-human mention woke toy under wake="chat"')
+  const leaked = notifications.find(
+    n => n.method === 'notifications/claude/channel' && meta(n.params).server === 'toy' && String(n.params.content).includes('bot echo') && !String(n.params.content).includes('<held'),
+  )
+  ok(!leaked, 'wake="chat" held the from-bot reply instead of waking on it')
+  if (mention) {
+    const c = String(mention.content)
+    ok(c.includes('<held server="toy" count="1"') && c.includes('bot echo') && c.indexOf('</held>') < c.indexOf('toy human mention'), 'held reply folded in ahead of the waking message')
+    ok(meta(mention).held === '1', 'meta.held carries the folded count')
+    ok(meta(mention).channel_id === 'toy:lobby' && meta(mention).message_id === 'toy-m3' && meta(mention).author === 'toyhuman', `push/event origin passed through as meta (channel_id=${meta(mention).channel_id} message_id=${meta(mention).message_id} author=${meta(mention).author})`)
+    ok(meta(mention).native_channel_id === 'raw-lobby', 'native channel id kept beside the MCPL id')
+  }
+
+  // ── channels/open + close via tools ──
+  const closed = (await request('tools/call', { name: 'mcpl_close', arguments: { server: 'toy', channel_id: 'toy:lobby' } })) as { content: Array<{ text: string }> }
+  ok(closed?.content?.[0]?.text === 'closed toy:lobby', `mcpl_close → "${closed?.content?.[0]?.text}"`)
+  ok(stderr1.includes('toy: close: toy:lobby'), 'toy server received channels/close')
+  const reopened = (await request('tools/call', { name: 'mcpl_open', arguments: { server: 'toy', channel_id: 'toy:lobby' } })) as { content: Array<{ text: string }> }
+  ok(reopened?.content?.[0]?.text === 'opened toy:lobby', `mcpl_open → "${reopened?.content?.[0]?.text}"`)
+  const status2 = (await request('tools/call', { name: 'mcpl_status', arguments: {} })) as { content: Array<{ text: string }> }
+  ok(/toy: .*open=\[toy:lobby\]/.test(status2?.content?.[0]?.text ?? ''), 'mcpl_status reflects the reopened channel')
 
   // ── inference/request → mcpl_answer roundtrip ──
   const inf = await waitForChannel(p => meta(p).kind === 'inference-request' && meta(p).server === 'toy', 'inference/request delivered as channel push')
@@ -153,6 +186,8 @@ try {
   ok((sent?.content?.[0]?.text ?? '').startsWith('delivered'), `mcpl_send → "${sent?.content?.[0]?.text}"`)
 
   // ── Hook socket: UserPromptSubmit → beforeInference fan-out ──
+  // The toy's second bot reply must be held before the hook fires for the flush assertion below.
+  for (let i = 0; i < 40 && !stderr1.includes('incoming(bot2) result'); i++) await new Promise(r => setTimeout(r, 250))
   const sockPath = join(process.env.CLAUDE_CONFIG_DIR ?? join(process.env.HOME!, '.claude'), 'mcpl-bridge', `sock-${SESSION_KEY}.sock`)
   const hookReply = await new Promise<string>((resolve, reject) => {
     const chunks: Buffer[] = []
@@ -187,6 +222,7 @@ try {
   ok(ctx.includes('TOY-CONTEXT'), 'beforeInference injection reached additionalContext')
   ok(!ctx.includes('TOY-UNGRANTED'), 'ungranted afterUser injection was dropped')
   ok(ctx.includes('position="beforeUser"'), 'injection position preserved')
+  ok(ctx.includes('<held server="toy" count="1"') && ctx.includes('bot echo 2'), 'held delivery flushed into UserPromptSubmit additionalContext')
 
   // ── Default grant: toy2 has no "grant" field ──
   ok(names.includes('toy2__ping'), 'default-grant server toy2 proxied its tool')

@@ -5,19 +5,24 @@ adapter process is simultaneously:
 
 1. **MCP server** — proxies MCPL `tools/list`/`tools/call` as `<server>__<tool>`,
    forwards `tools/list_changed`, and adds bridge tools:
-   - `mcpl_status` — connections, grants, feature sets, channels, pending inference
+   - `mcpl_status` — connections, grants, feature sets, channels (registered
+     and open), held count, pending inference
    - `mcpl_send` — `channels/publish` into a registered channel
+   - `mcpl_open` / `mcpl_close` — `channels/open` / `channels/close` on a
+     registered channel (subscribe to / leave its ordinary traffic)
    - `mcpl_answer` — resolve a held `inference/request`
 2. **Channel provider** (`claude/channel`) — `push/event`, `channels/incoming`,
    and `inference/request` arrive as `<channel source="mcpl" ...>` messages that
-   start a turn (wake authority included).
+   start a turn (wake authority included), subject to the per-server
+   [wake policy](#wake-policy).
 3. **MCPL host proper** — the policy plane lives here, per SPEC 0.5:
    - effective grant = advertised ∩ config allowlist (`capabilityPatternMatches`,
      exact-depth `*`), absence is denial
    - mandatory initial `featureSets/update` as a **Request**; degradation receipts
      honored (`fallback: mcp-only | close`), never widened in response
    - dual-shape `featureSets` normalization (0.5 object / 0.4 array)
-   - per-descriptor channel authorization with itemized results
+   - per-descriptor channel authorization with itemized results; host-owned
+     desired-open state reconciled through `channels/open` at every registration
    - grant + channel state reset at every transport epoch (reconnect w/ jittered backoff)
    - `mcpl/manifestChanged` → rate-limited re-fetch, content digest verified
      (mismatch logged, content authoritative), reduce-first re-grant
@@ -92,9 +97,9 @@ Config resolution: `$MCPL_BRIDGE_CONFIG` → `<project>/.mcpl-bridge.json` →
 Notes:
 - `grant` is the security boundary. **Omitted = the default grant**: everything
   the bridge can honor except `inject.system`, `inject.afterUser`, and the
-  unimplemented channel extras (lifecycle/streaming/typing) — i.e. `tools`,
+  unimplemented channel extras (streaming/typing) — i.e. `tools`,
   `pushEvents`, `modelInfo`, `inferenceRequest`, `inferenceLifecycle`,
-  `channels.{register,incoming,publish,acknowledge}`,
+  `channels.{register,lifecycle,incoming,publish,acknowledge}`,
   `contextHooks.beforeInference.observe` + `inject.beforeUser`.
   An **explicit `[]`** = plain MCP passthrough (tools only). `*` matches exactly
   one segment; `contextHooks.*` grants none of the depth-4 inject leaves — spell
@@ -110,6 +115,75 @@ Notes:
   `"deny"` answers `-32002`.
 - Reconnect defaults: on for websocket, off for stdio (a bounced ws server
   comes back on its own; a crashed child needs a restart).
+- `wake` — when a delivery starts a turn; see [Wake policy](#wake-policy).
+  Default `"all"`.
+- `openChannels` — registered channel ids to hold open across restarts; see
+  [Opening channels](#opening-channels).
+
+## Wake policy
+
+Every `push/event` and every `channels/incoming` on a known channel is admitted
+by the grant first; the wake policy then decides only *when* the session sees
+it: now, as its own turn, or held and folded into the next turn as context.
+It routes on the §16 `chat:*` tags after the host's closure (`chat:mention` ⇒
+`chat:addressed`, and so on). Tags are never authority; they only order time.
+
+```json
+"wake": "chat"
+```
+
+- `"all"` (default) — every delivery wakes. Right for a heartbeat, a queue, a
+  server whose events are all for you.
+- `"chat"` — the loop-break preset for chat-shaped servers:
+  `chat:dm` wakes; `chat:from-bot` + `chat:reply`, `chat:from-bot` +
+  `chat:mention`, and `chat:ambient` are held; everything else wakes. Two
+  agents on the same channel can't ping-pong each other awake, and an open
+  channel's ordinary traffic accrues instead of starting a turn per message.
+  A mention or reply carrying no `chat:from-*` tag still wakes — a producer
+  that doesn't say who spoke is outside the rule's reach.
+- an object — your own rules, each an AND-set of tags, `wake` checked before
+  `hold`, default wake:
+
+  ```json
+  "wake": { "wake": [["chat:dm"], ["chat:mention"]], "hold": [["chat:ambient"]], "holdCap": 100 }
+  ```
+
+Held deliveries are late, not lost. They ride in at the top of the next wake
+for that server as a `<held server="…" count="N">` block, one line each with
+timestamp, message id, channel, author and (trimmed) text, and the same block
+reaches the next user turn through the `UserPromptSubmit` hook. `mcpl_status`
+shows `held=N` while anything is waiting. `holdCap` (default 50) bounds the
+buffer per server; past it the oldest are dropped and the block says
+`evicted="K"` so the loss is visible. `inference/request` is never held — a
+server is blocked on the answer — and held items don't fold into one, since it
+asks for a completion rather than opening a conversation.
+
+## Opening channels
+
+A registered channel delivers only what addresses the agent (mentions, replies,
+DMs) until the host opens it; `channels/open` is what subscribes the session to
+its ordinary traffic, delivered as `channels/incoming`. Desired-open state is
+the host's (SPEC §14): the bridge keeps a per-server set seeded from
+`openChannels` in config, adjusted by `mcpl_open` / `mcpl_close` for the
+session, and reconciled against every `channels/register` — so a reconnect
+re-opens what you had open. A server's `initiallyOpen` hint on a descriptor is
+honored only when the config carries no `openChannels` at all.
+
+```json
+"grant": ["tools", "pushEvents", "channels.register", "channels.lifecycle", "channels.incoming", "channels.publish"],
+"openChannels": ["discord:1526641224692400339:1526641225124544753"]
+```
+
+`channels.lifecycle` must be in the grant and advertised by the server; when
+either is missing, `mcpl_open` says so and the reconcile logs it rather than
+failing the connection. `mcpl_open` takes an optional `history_limit` and
+returns what the server hands back with the open, oldest first.
+
+`push/event` carries an opaque `origin`; chat-shaped producers put the routing
+facts there. The bridge passes the common ones through as message meta
+(`channel_id` — the MCPL id when the producer supplies one, with the raw id as
+`native_channel_id` — `message_id`, `author`, `author_id`, `thread_id`,
+`channel_name`, `guild`), so a wake is addressable without a history call.
 
 ## Double-spawn and state (primary/replica)
 
@@ -147,7 +221,7 @@ happens to route a call through.
 ```bash
 cd plugins/mcpl-bridge
 bun install
-bun run test/smoke.ts     # full-surface smoke test against test/toy-server.ts
+bun run test/smoke.ts     # full-surface smoke test against test/toy-server.ts (wake policy, open/close included)
 ```
 
 `src/vendor/mcpl-core/` is vendored from

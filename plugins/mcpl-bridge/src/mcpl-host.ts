@@ -18,7 +18,10 @@ import {
   textContent,
   type CapabilityPath,
   type ChannelDescriptor,
+  type ChannelsCloseResult,
   type ChannelsIncomingParams,
+  type ChannelsOpenParams,
+  type ChannelsOpenResult,
   type ChannelsRegisterParams,
   type ContentBlock,
   type ContextBeforeInferenceParams,
@@ -28,6 +31,7 @@ import {
   type FeatureSetsUpdateResult,
   type InferenceLifecycleParams,
   type InferenceRequestParams,
+  type IncomingChannelMessage,
   type InitializeCapabilities,
   type McplInitializeResult,
   type PushEventParams,
@@ -65,7 +69,7 @@ const HOST_MCPL_CAPS = {
   inferenceLifecycle: true,
   modelInfo: true,
   contextHooks: { beforeInference: { observe: true, inject: { system: true, beforeUser: true, afterUser: true } } },
-  channels: { register: true, publish: true, incoming: true, acknowledge: true },
+  channels: { register: true, lifecycle: true, publish: true, incoming: true, acknowledge: true },
   featureSets: true,
 }
 
@@ -94,6 +98,11 @@ export class McplServerHandle {
   status: 'connecting' | 'ready' | 'mcp-only' | 'disconnected' | 'closed' = 'disconnected'
   tools: McplTool[] = []
   channels = new Map<string, ChannelDescriptor>()
+  /** Channels currently open on the live connection (channels/open succeeded this epoch). */
+  openChannels = new Set<string>()
+  /** Desired-open state: config `openChannels` plus mcpl_open/mcpl_close during the session.
+   *  Survives reconnects — reconciled against each channels/register. */
+  private desiredOpen: Set<string>
   grant: CapabilityPath[] = []
   featureSetsEnabled: string[] = []
   manifestRevision: string | null = null
@@ -119,6 +128,7 @@ export class McplServerHandle {
     this.prefix = cfg.toolPrefix ?? id
     this.cb = cb
     this.policy = cfg.grant ?? DEFAULT_GRANT
+    this.desiredOpen = new Set(cfg.openChannels ?? [])
     this.backoffMs = cfg.reconnectIntervalMs ?? 5000
     this.firstAttempt = new Promise<void>(r => (this.firstAttemptResolve = r))
   }
@@ -147,6 +157,7 @@ export class McplServerHandle {
     this.grant = []
     this.featureSetsEnabled = []
     this.channels.clear()
+    this.openChannels.clear()
     this.manifestRevision = null
     for (const [, p] of this.pendingInference) p.reject({ code: ERR.CAPABILITY_DENIED, message: 'connection lost' })
     this.pendingInference.clear()
@@ -375,6 +386,13 @@ export class McplServerHandle {
       case 'push/event': {
         const p = params as PushEventParams
         const tags = expandTags(p.tags)
+        // origin is opaque to the spec, but chat-shaped producers put the
+        // routing facts there (which channel, which message, who). Pass the
+        // common ones through as meta so a wake is addressable without a
+        // history call; the empty ones are dropped at the notification edge.
+        const o = (p.origin && typeof p.origin === 'object' ? p.origin : {}) as Record<string, unknown>
+        const s = (v: unknown) => (v == null ? '' : String(v))
+        const mcplChannel = s(o.mcplChannelId)
         this.cb.deliver({
           server: this.id,
           kind: 'push-event',
@@ -383,6 +401,14 @@ export class McplServerHandle {
             event_id: String(p.eventId ?? ''),
             feature_set: String(p.featureSet ?? ''),
             ts: String(p.timestamp ?? ''),
+            channel_id: mcplChannel || s(o.channelId),
+            native_channel_id: mcplChannel ? s(o.channelId) : '',
+            channel_name: s(o.channelName),
+            guild: s(o.guildName),
+            thread_id: s(o.threadId),
+            message_id: s(o.messageId),
+            author: s(o.authorName),
+            author_id: s(o.authorId),
             ...(tags.length ? { tags: tags.join(' ') } : {}),
           },
         })
@@ -393,7 +419,10 @@ export class McplServerHandle {
       case 'channels/changed': {
         const p = (params ?? {}) as ChannelsRegisterParams & { added?: ChannelDescriptor[]; removed?: string[]; updated?: ChannelDescriptor[] }
         const incoming = methodName === 'channels/register' ? (p.channels ?? []) : [...(p.added ?? []), ...(p.updated ?? [])]
-        for (const rid of methodName === 'channels/changed' ? (p.removed ?? []) : []) this.channels.delete(rid)
+        for (const rid of methodName === 'channels/changed' ? (p.removed ?? []) : []) {
+          this.channels.delete(rid)
+          this.openChannels.delete(rid)
+        }
         // Per-descriptor authorization; itemized results are mandatory (§14.5).
         const results = incoming.map(d => {
           if (!d || typeof d.id !== 'string' || !d.id) return { id: String(d?.id ?? ''), accepted: false, reason: 'invalid descriptor' }
@@ -401,6 +430,13 @@ export class McplServerHandle {
           return { id: d.id, accepted: true }
         })
         respond({ results })
+        // Desired-open state is the host's; the server's initiallyOpen hint
+        // counts only where we hold no state of our own (§14 descriptor note).
+        const toOpen = results
+          .filter(r => r.accepted)
+          .map(r => r.id)
+          .filter(cid => this.desiredOpen.has(cid) || (this.cfg.openChannels === undefined && this.channels.get(cid)?.initiallyOpen === true))
+        if (toOpen.length) void this.reconcileOpen(toOpen, myEpoch)
         return
       }
       case 'channels/list': {
@@ -478,6 +514,60 @@ export class McplServerHandle {
       }
       default: {
         deny(ERR.METHOD_NOT_FOUND, `method not supported by this host: ${methodName}`)
+      }
+    }
+  }
+
+  /**
+   * channels/open — host-owned subscription to a registered channel. After
+   * this the server delivers that channel's ambient traffic as
+   * channels/incoming instead of only addressed pushes. Returns any history
+   * the server handed back with the open (oldest first).
+   */
+  async openChannel(channelId: string, historyLimit = 0): Promise<{ history: IncomingChannelMessage[]; truncated: boolean }> {
+    const conn = this.conn
+    if (!conn || conn.isClosed) throw new Error(`${this.id}: not connected`)
+    if (!granted(this.grant, 'channels.lifecycle')) throw new Error(`${this.id}: channels.lifecycle not granted (add it to the server's grant; the server must advertise it too)`)
+    const desc = this.channels.get(channelId)
+    if (!desc) throw new Error(`${this.id}: unknown channel ${channelId} (known: ${[...this.channels.keys()].join(', ') || 'none'})`)
+    const params: ChannelsOpenParams = {
+      channelId,
+      type: desc.type,
+      address: desc.address ?? {},
+      ...(historyLimit > 0 ? { history: { limit: historyLimit } } : {}),
+    }
+    const r = (await conn.sendRequest('channels/open', params)) as ChannelsOpenResult
+    this.openChannels.add(channelId)
+    this.desiredOpen.add(channelId)
+    return { history: r?.history ?? [], truncated: r?.historyTruncated === true }
+  }
+
+  async closeChannel(channelId: string): Promise<boolean> {
+    const conn = this.conn
+    if (!conn || conn.isClosed) throw new Error(`${this.id}: not connected`)
+    if (!granted(this.grant, 'channels.lifecycle')) throw new Error(`${this.id}: channels.lifecycle not granted`)
+    // Forget the intent first: a close that fails on the wire must not be
+    // silently undone by the next reconnect's reconcile.
+    this.desiredOpen.delete(channelId)
+    this.openChannels.delete(channelId)
+    const r = (await conn.sendRequest('channels/close', { channelId })) as ChannelsCloseResult
+    return r?.closed === true
+  }
+
+  /** Re-open desired channels after a (re)registration; failures are logged, not fatal. */
+  private async reconcileOpen(ids: string[], myEpoch: number): Promise<void> {
+    for (const cid of ids) {
+      if (myEpoch !== this.epoch) return
+      if (this.openChannels.has(cid)) continue
+      if (!granted(this.grant, 'channels.lifecycle')) {
+        this.log(`cannot open ${cid}: channels.lifecycle not granted`)
+        return
+      }
+      try {
+        await this.openChannel(cid)
+        this.log(`opened ${cid}`)
+      } catch (e) {
+        this.log(`open ${cid} failed: ${e instanceof Error ? e.message : e}`)
       }
     }
   }
