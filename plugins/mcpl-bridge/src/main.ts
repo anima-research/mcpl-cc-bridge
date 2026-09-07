@@ -19,6 +19,7 @@ import { homedir } from 'os'
 import { join } from 'path'
 import { loadConfig } from './config'
 import { McplServerHandle, type IncomingDelivery } from './mcpl-host'
+import { WakeGate } from './wake'
 
 import { appendFileSync } from 'fs'
 const DEBUG_LOG = join(process.env.CLAUDE_CONFIG_DIR ?? join(homedir(), '.claude'), 'mcpl-bridge', 'debug.log')
@@ -46,7 +47,8 @@ const mcp = new Server(
       'Messages from MCPL servers arrive as <channel source="mcpl" server="..." ...> blocks:',
       '- kind="channel-message" / kind="push-event": events from the MCPL server. To reply on a channel, call mcpl_send with that server and channel_id.',
       '- kind="inference-request": the MCPL server is asking for a completion. Compose the answer and call mcpl_answer with the request_id from the message. Do this promptly — the request is held open.',
-      'Proxied MCPL tools are named <server>__<tool>. mcpl_status shows connections, grants, and channels.',
+      'A <held server="..." count="N"> block at the top of a message lists deliveries the wake policy held back since the last turn (e.g. a bot replying to you, ambient traffic) — context, not a separate ping; the same block reaches a user turn via the UserPromptSubmit hook.',
+      'Proxied MCPL tools are named <server>__<tool>. mcpl_status shows connections, grants, channels, open channels, and held count. mcpl_open / mcpl_close subscribe to or leave a registered channel\'s ambient traffic (channels/open).',
     ].join('\n'),
   },
 )
@@ -57,6 +59,7 @@ let deliverToSession: (msg: IncomingDelivery) => void = msg => {
 }
 
 const handles = new Map<string, McplServerHandle>()
+const gates = new Map<string, WakeGate>()
 let toolsChangedTimer: ReturnType<typeof setTimeout> | null = null
 
 for (const [id, serverCfg] of Object.entries(config.servers)) {
@@ -71,9 +74,10 @@ for (const [id, serverCfg] of Object.entries(config.servers)) {
     log,
   })
   handles.set(id, handle)
+  gates.set(id, new WakeGate(serverCfg.wake))
 }
 
-const BRIDGE_TOOLS = [
+const BRIDGE_TOOLS: Array<{ name: string; description: string; inputSchema: Record<string, unknown> }> = [
   {
     name: 'mcpl_status',
     description: 'Show every bridged MCPL server: connection status, effective capability grant, enabled feature sets, registered channels, proxied tool count, pending inference requests.',
@@ -90,6 +94,31 @@ const BRIDGE_TOOLS = [
         text: { type: 'string' },
       },
       required: ['server', 'channel_id', 'text'],
+    },
+  },
+  {
+    name: 'mcpl_open',
+    description: 'Open a registered channel of a bridged MCPL server (channels/open): the server then delivers that channel\'s ordinary traffic as channels/incoming, not only messages that address you. Optionally returns recent history with the open. Stays open across reconnects for this session; put the id in the server\'s openChannels config to keep it across restarts. Needs channels.lifecycle granted.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        server: { type: 'string', description: 'bridged server id' },
+        channel_id: { type: 'string', description: 'registered channel id, as listed by mcpl_status' },
+        history_limit: { type: 'number', description: 'messages of history to return with the open (default 0)' },
+      },
+      required: ['server', 'channel_id'],
+    },
+  },
+  {
+    name: 'mcpl_close',
+    description: 'Close an open channel of a bridged MCPL server (channels/close): back to addressed-only delivery for that channel. Also drops it from the session\'s desired-open set.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        server: { type: 'string' },
+        channel_id: { type: 'string' },
+      },
+      required: ['server', 'channel_id'],
     },
   },
   {
@@ -152,6 +181,8 @@ async function callToolImpl(name: string, args: Record<string, unknown>): Promis
             ` | featureSets=[${h.featureSetsEnabled.join(', ') || '—'}]` +
             ` | tools=${h.tools.length}` +
             ` | channels=[${[...h.channels.keys()].join(', ') || '—'}]` +
+            ` | open=[${[...h.openChannels].join(', ') || '—'}]` +
+            ((gates.get(id)?.heldCount ?? 0) > 0 ? ` | held=${gates.get(id)!.heldCount}` : '') +
             (h.pendingInferenceIds.length ? ` | pending inference: ${h.pendingInferenceIds.join(', ')}` : '') +
             (h.manifestRevision ? ` | rev=${h.manifestRevision.slice(0, 18)}…` : ''),
         )
@@ -163,6 +194,27 @@ async function callToolImpl(name: string, args: Record<string, unknown>): Promis
       if (!h) return text(`unknown server: ${args.server}`, true)
       const r = (await h.publish(String(args.channel_id), String(args.text))) as { delivered?: boolean; messageId?: string }
       return text(r?.delivered ? `delivered${r.messageId ? ` (${r.messageId})` : ''}` : 'not delivered')
+    }
+    if (name === 'mcpl_open') {
+      const h = handles.get(String(args.server))
+      if (!h) return text(`unknown server: ${args.server}`, true)
+      const limit = typeof args.history_limit === 'number' ? Math.max(0, Math.floor(args.history_limit)) : 0
+      const r = await h.openChannel(String(args.channel_id), limit)
+      const lines = [`opened ${args.channel_id}`]
+      if (r.history.length) {
+        lines.push(`history (${r.history.length}${r.truncated ? ', truncated' : ''}, oldest first):`)
+        for (const m of r.history) {
+          const body = typeof m.content === 'string' ? m.content : m.content.map(b => (b.type === 'text' ? b.text : `[${b.type}]`)).join(' ')
+          lines.push(`- [${m.timestamp ?? ''} id=${m.messageId}] ${m.author?.name ?? 'unknown'}: ${body}`)
+        }
+      }
+      return text(lines.join('\n'))
+    }
+    if (name === 'mcpl_close') {
+      const h = handles.get(String(args.server))
+      if (!h) return text(`unknown server: ${args.server}`, true)
+      const closed = await h.closeChannel(String(args.channel_id))
+      return text(closed ? `closed ${args.channel_id}` : `${args.channel_id} was not open (desired-open state cleared)`)
     }
     if (name === 'mcpl_answer') {
       const h = handles.get(String(args.server))
@@ -196,15 +248,29 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
 await mcp.connect(new StdioServerTransport())
 
 deliverToSession = msg => {
+  const gate = gates.get(msg.server)
+  if (gate && gate.decide(msg) === 'hold') {
+    gate.hold(msg)
+    log(`[${msg.server}] held ${msg.kind} [${msg.meta.tags ?? 'no tags'}] — ${gate.heldCount} pending for the next wake`)
+    return
+  }
   const meta: Record<string, string> = { server: msg.server, kind: msg.kind }
   for (const [k, v] of Object.entries(msg.meta)) {
     const key = k.replace(/[^a-zA-Z0-9_]/g, '_')
     if (v) meta[key] = v
   }
+  // Anything held since the last wake rides in ahead of the message that woke
+  // us — but not into an inference-request, which asks the model for a
+  // completion on the server's behalf rather than opening a conversation.
+  const folds = msg.kind !== 'inference-request'
+  const heldCount = folds ? (gate?.heldCount ?? 0) : 0
+  const held = folds ? (gate?.flush(msg.server) ?? '') : ''
+  if (heldCount) meta.held = String(heldCount)
+  const body = msg.text || '(empty message)'
   void mcp
     .notification({
       method: 'notifications/claude/channel',
-      params: { content: msg.text || '(empty message)', meta },
+      params: { content: held ? `${held}\n\n${body}` : body, meta },
     })
     .catch(e => log(`channel push failed: ${e instanceof Error ? e.message : e}`))
 }
@@ -284,6 +350,12 @@ async function handleHook(event: HookEvent): Promise<string> {
       ready.map(h => h.beforeInference(event.prompt ?? '', currentInferenceId!, conversationId, turnIndex).then(inj => ({ h, inj }))),
     )
     const parts: string[] = []
+    // Held deliveries reach the user's turn too — a user prompt is as good a
+    // wake as any, and it keeps "held" from meaning "until someone pings me".
+    for (const [id, gate] of gates) {
+      const block = gate.flush(id)
+      if (block) parts.push(block)
+    }
     for (const r of results) {
       if (r.status !== 'fulfilled') continue
       for (const inj of r.value.inj) {

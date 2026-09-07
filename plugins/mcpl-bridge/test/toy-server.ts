@@ -35,7 +35,7 @@ const MCPL_CAPS = {
   pushEvents: true,
   inferenceRequest: true,
   inferenceLifecycle: true,
-  channels: { register: true, incoming: true, publish: true },
+  channels: { register: true, lifecycle: true, incoming: true, publish: true },
   contextHooks: { beforeInference: { observe: true, inject: { beforeUser: true, system: true } } },
   featureSets: {
     toy: {
@@ -45,6 +45,7 @@ const MCPL_CAPS = {
         'inferenceRequest',
         'inferenceLifecycle',
         'channels.register',
+        'channels.lifecycle',
         'channels.incoming',
         'channels.publish',
         'contextHooks.beforeInference.observe',
@@ -91,6 +92,35 @@ async function startDemo() {
         tags: ['toy:heartbeat'],
       }).then(r => log(`push result: ${JSON.stringify(r)}`))
     }, 900)
+
+    // Wake-gate exercise: a bot replying to the agent (held under wake="chat",
+    // a plain wake under the default), then a from-human mention carrying a
+    // chat-shaped origin (wakes; folds the held reply in), then a second bot
+    // reply left held for the UserPromptSubmit hook to flush.
+    const botReply = (messageId: string, text: string) => ({
+      channelId: 'toy:lobby',
+      messageId,
+      author: { id: 'b1', name: 'otherbot' },
+      timestamp: new Date().toISOString(),
+      content: [{ type: 'text', text }],
+      tags: ['chat:reply', 'chat:from-bot'],
+    })
+    setTimeout(() => {
+      void request('channels/incoming', { messages: [botReply('toy-m2', 'bot echo')] }).then(r => log(`incoming(bot) result: ${JSON.stringify(r)}`))
+    }, 1100)
+    setTimeout(() => {
+      void request('push/event', {
+        featureSet: 'toy',
+        eventId: 'evt-2',
+        timestamp: new Date().toISOString(),
+        origin: { source: 'toy', mcplChannelId: 'toy:lobby', channelId: 'raw-lobby', messageId: 'toy-m3', authorId: 'u2', authorName: 'toyhuman' },
+        payload: { content: [{ type: 'text', text: 'toy human mention' }] },
+        tags: ['chat:mention', 'chat:from-human'],
+      }).then(r => log(`push(mention) result: ${JSON.stringify(r)}`))
+    }, 1700)
+    setTimeout(() => {
+      void request('channels/incoming', { messages: [botReply('toy-m4', 'bot echo 2')] }).then(r => log(`incoming(bot2) result: ${JSON.stringify(r)}`))
+    }, 2100)
 
     if (process.env.TOY_INFERENCE === '1') {
       setTimeout(() => {
@@ -171,6 +201,16 @@ function handle(msg: Json) {
           { namespace: 'toy', position: 'afterUser', content: 'TOY-UNGRANTED: this must not appear' },
         ],
       })
+      return
+    }
+    case 'channels/open': {
+      log(`open: ${params.channelId}`)
+      respond(id, { channel: { id: 'toy:lobby', type: 'chat', label: 'Toy Lobby', direction: 'bidirectional' } })
+      return
+    }
+    case 'channels/close': {
+      log(`close: ${params.channelId}`)
+      respond(id, { closed: true })
       return
     }
     case 'channels/publish': {

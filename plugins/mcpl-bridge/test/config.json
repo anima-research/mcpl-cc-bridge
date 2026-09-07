@@ -1,23 +1,42 @@
 {
   "servers": {
     "toy": {
-      "transport": { "command": "bun", "args": ["run", "test/toy-server.ts"] },
+      "transport": {
+        "command": "bun",
+        "args": [
+          "run",
+          "test/toy-server.ts"
+        ]
+      },
       "grant": [
         "tools",
         "pushEvents",
         "inferenceRequest",
         "inferenceLifecycle",
         "channels.register",
+        "channels.lifecycle",
         "channels.incoming",
         "channels.publish",
         "contextHooks.beforeInference.observe",
         "contextHooks.beforeInference.inject.beforeUser"
       ],
-      "enableFeatureSets": ["*"],
-      "inferenceRequest": "channel"
+      "enableFeatureSets": [
+        "*"
+      ],
+      "inferenceRequest": "channel",
+      "wake": "chat",
+      "openChannels": [
+        "toy:lobby"
+      ]
     },
     "toy2": {
-      "transport": { "command": "bun", "args": ["run", "test/toy-server.ts"] }
+      "transport": {
+        "command": "bun",
+        "args": [
+          "run",
+          "test/toy-server.ts"
+        ]
+      }
     }
   }
 }
