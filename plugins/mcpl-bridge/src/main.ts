@@ -14,10 +14,10 @@
 import { Server } from '@modelcontextprotocol/sdk/server/index.js'
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js'
-import { existsSync, mkdirSync, rmSync } from 'fs'
+import { existsSync, mkdirSync, rmSync, watch, type FSWatcher } from 'fs'
 import { homedir } from 'os'
-import { join } from 'path'
-import { loadConfig } from './config'
+import { basename, dirname, join } from 'path'
+import { loadConfig, type ServerConfig } from './config'
 import { McplServerHandle, type IncomingDelivery } from './mcpl-host'
 import { WakeGate } from './wake'
 
@@ -33,7 +33,7 @@ const log = (line: string) => {
   } catch {}
 }
 
-const { config, path: configPathUsed } = loadConfig()
+let { config, path: configPathUsed } = loadConfig()
 log(configPathUsed ? `config: ${configPathUsed}` : 'no config found — running with zero MCPL servers (create .mcpl-bridge.json)')
 
 // ── MCP server face ──
@@ -62,20 +62,119 @@ const handles = new Map<string, McplServerHandle>()
 const gates = new Map<string, WakeGate>()
 let toolsChangedTimer: ReturnType<typeof setTimeout> | null = null
 
-for (const [id, serverCfg] of Object.entries(config.servers)) {
+function scheduleToolsChanged(): void {
+  if (toolsChangedTimer) clearTimeout(toolsChangedTimer)
+  toolsChangedTimer = setTimeout(() => {
+    void mcp.notification({ method: 'notifications/tools/list_changed' }).catch(() => {})
+  }, 100)
+}
+
+function makeHandle(id: string, serverCfg: ServerConfig): McplServerHandle {
   const handle = new McplServerHandle(id, serverCfg, {
     deliver: msg => deliverToSession(msg),
-    toolsChanged: () => {
-      if (toolsChangedTimer) clearTimeout(toolsChangedTimer)
-      toolsChangedTimer = setTimeout(() => {
-        void mcp.notification({ method: 'notifications/tools/list_changed' }).catch(() => {})
-      }, 100)
-    },
+    toolsChanged: scheduleToolsChanged,
     log,
   })
   handles.set(id, handle)
   gates.set(id, new WakeGate(serverCfg.wake))
+  return handle
 }
+
+for (const [id, serverCfg] of Object.entries(config.servers)) makeHandle(id, serverCfg)
+
+// ── Config reload ──────────────────────────────────────────────────────────
+// Re-read the config and reconcile the fleet in place: added servers connect,
+// removed ones close, changed ones (any field) reconnect, unchanged ones — and
+// their held deliveries, open channels, pending inference — are untouched.
+// Triggers: the mcpl_reload tool, SIGHUP, and a watcher on the config file
+// (MCPL_BRIDGE_WATCH=0 disables). A config that fails to parse or validate is
+// rejected whole; the running fleet keeps its last good config.
+
+/** Key-order-independent JSON so a reordered file is not a "change". */
+function stableJson(v: unknown): string {
+  if (Array.isArray(v)) return `[${v.map(stableJson).join(',')}]`
+  if (v && typeof v === 'object') {
+    return `{${Object.keys(v as Record<string, unknown>)
+      .sort()
+      .map(k => `${JSON.stringify(k)}:${stableJson((v as Record<string, unknown>)[k])}`)
+      .join(',')}}`
+  }
+  return JSON.stringify(v)
+}
+
+let reloading: Promise<string> | null = null
+function reloadConfig(reason: string): Promise<string> {
+  if (reloading) return reloading
+  reloading = reloadConfigInner(reason).finally(() => {
+    reloading = null
+  })
+  return reloading
+}
+
+async function reloadConfigInner(reason: string): Promise<string> {
+  let next: ReturnType<typeof loadConfig>
+  try {
+    next = loadConfig()
+  } catch (e) {
+    const msg = `reload (${reason}) rejected: ${e instanceof Error ? e.message : e} — keeping the running config`
+    log(msg)
+    return msg
+  }
+  const prev = config.servers
+  const nextServers = next.config.servers
+  const added = Object.keys(nextServers).filter(id => !(id in prev))
+  const removed = Object.keys(prev).filter(id => !(id in nextServers))
+  const changed = Object.keys(prev).filter(id => id in nextServers && stableJson(prev[id]) !== stableJson(nextServers[id]))
+  const dropped: string[] = []
+  for (const id of [...removed, ...changed]) {
+    const held = gates.get(id)?.heldCount ?? 0
+    if (held) dropped.push(`${id}:${held}`)
+    handles.get(id)?.close()
+    handles.delete(id)
+    gates.delete(id)
+  }
+  for (const id of [...added, ...changed]) {
+    const h = makeHandle(id, nextServers[id])
+    if (handlesStarted) h.start()
+  }
+  config = next.config
+  if (next.path !== configPathUsed) {
+    configPathUsed = next.path
+    installConfigWatch()
+  }
+  if (added.length || removed.length || changed.length) scheduleToolsChanged()
+  const summary =
+    `reload (${reason}) from ${configPathUsed ?? 'no config'}: ` +
+    `added [${added.join(', ') || '—'}] removed [${removed.join(', ') || '—'}] changed [${changed.join(', ') || '—'}]` +
+    ` unchanged ${Object.keys(nextServers).length - added.length - changed.length}` +
+    (dropped.length ? ` (dropped held deliveries: ${dropped.join(', ')})` : '')
+  log(summary)
+  return summary
+}
+
+let configWatcher: FSWatcher | null = null
+let watchTimer: ReturnType<typeof setTimeout> | null = null
+/** Watch the config's directory (editors save by rename, which breaks a watch on the file itself). */
+function installConfigWatch(): void {
+  configWatcher?.close()
+  configWatcher = null
+  if (process.env.MCPL_BRIDGE_WATCH === '0' || !configPathUsed || role !== 'primary') return
+  const file = basename(configPathUsed)
+  try {
+    configWatcher = watch(dirname(configPathUsed), (_event, name) => {
+      if (name && name !== file) return
+      if (watchTimer) clearTimeout(watchTimer)
+      watchTimer = setTimeout(() => void reloadConfig('config file changed'), 300)
+    })
+    configWatcher.unref?.()
+  } catch (e) {
+    log(`config watch failed: ${e instanceof Error ? e.message : e}`)
+  }
+}
+process.on('SIGHUP', () => {
+  if (role === 'primary') void reloadConfig('SIGHUP')
+  else log('SIGHUP ignored on a replica — signal the primary or call mcpl_reload')
+})
 
 const BRIDGE_TOOLS: Array<{ name: string; description: string; inputSchema: Record<string, unknown> }> = [
   {
@@ -120,6 +219,11 @@ const BRIDGE_TOOLS: Array<{ name: string; description: string; inputSchema: Reco
       },
       required: ['server', 'channel_id'],
     },
+  },
+  {
+    name: 'mcpl_reload',
+    description: 'Re-read the bridge config and reconcile in place: servers added to the file connect, removed ones close, changed ones reconnect; unchanged servers keep their connections, open channels and held deliveries. (The bridge also reloads on SIGHUP and when the config file changes on disk.)',
+    inputSchema: { type: 'object', properties: {} },
   },
   {
     name: 'mcpl_answer',
@@ -187,8 +291,10 @@ async function callToolImpl(name: string, args: Record<string, unknown>): Promis
             (h.manifestRevision ? ` | rev=${h.manifestRevision.slice(0, 18)}…` : ''),
         )
       }
-      return text(lines.join('\n') || 'no MCPL servers configured')
+      lines.push(`config: ${configPathUsed ?? 'none'}${configWatcher ? ' (watched)' : ''}`)
+      return text(lines.join('\n'))
     }
+    if (name === 'mcpl_reload') return text(await reloadConfig('mcpl_reload'))
     if (name === 'mcpl_send') {
       const h = handles.get(String(args.server))
       if (!h) return text(`unknown server: ${args.server}`, true)
@@ -254,6 +360,7 @@ deliverToSession = msg => {
     log(`[${msg.server}] held ${msg.kind} [${msg.meta.tags ?? 'no tags'}] — ${gate.heldCount} pending for the next wake`)
     return
   }
+  log(`[${msg.server}] wake ${msg.kind} [${msg.meta.tags ?? 'no tags'}] → notifications/claude/channel`)
   const meta: Record<string, string> = { server: msg.server, kind: msg.kind }
   for (const [k, v] of Object.entries(msg.meta)) {
     const key = k.replace(/[^a-zA-Z0-9_]/g, '_')
@@ -307,6 +414,7 @@ function startHandles() {
   if (handlesStarted) return
   handlesStarted = true
   for (const h of handles.values()) h.start()
+  installConfigWatch()
 }
 
 // Sweep stale sockets: pid-keyed ones whose pid died, and any socket file
@@ -517,6 +625,7 @@ async function rpcToPrimary(op: SocketOp, timeoutMs: number): Promise<unknown> {
 }
 
 function shutdown() {
+  configWatcher?.close()
   if (sockOwned) {
     try {
       rmSync(sockPath, { force: true })

@@ -9,6 +9,8 @@
  *   push/event origin → meta, channels/open + close via config and tools.
  */
 import { spawn } from 'child_process'
+import { copyFileSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'fs'
+import { tmpdir } from 'os'
 import { join } from 'path'
 
 const ROOT = join(import.meta.dir, '..')
@@ -20,10 +22,15 @@ const ok = (cond: boolean, label: string) => {
 
 // Isolated session key so a real CC session's adapter (same env) can't collide.
 const SESSION_KEY = `smoke-${process.pid}`
+// A private copy of the config so the reload section can rewrite it.
+const TMP = mkdtempSync(join(tmpdir(), 'mcpl-smoke-'))
+const CONFIG_COPY = join(TMP, 'config.json')
+copyFileSync(join(ROOT, 'test', 'config.json'), CONFIG_COPY)
+process.on('exit', () => rmSync(TMP, { recursive: true, force: true }))
 const CHILD_ENV = {
   ...process.env,
   CLAUDE_CODE_SESSION_ID: SESSION_KEY,
-  MCPL_BRIDGE_CONFIG: join(ROOT, 'test', 'config.json'),
+  MCPL_BRIDGE_CONFIG: CONFIG_COPY,
   TOY_INFERENCE: '1',
 }
 
@@ -227,6 +234,41 @@ try {
   // ── Default grant: toy2 has no "grant" field ──
   ok(names.includes('toy2__ping'), 'default-grant server toy2 proxied its tool')
   ok(ctx.includes('server="toy2"'), 'default-grant server contributed beforeInference context')
+
+  // ── Config reload: mcpl_reload tool + file watcher ──
+  {
+    const cfg = JSON.parse(readFileSync(CONFIG_COPY, 'utf8')) as { servers: Record<string, unknown> }
+    const toy2 = cfg.servers.toy2
+    delete cfg.servers.toy2
+    cfg.servers.toy3 = { ...(toy2 as object), toolPrefix: 'three' }
+    writeFileSync(CONFIG_COPY, JSON.stringify(cfg))
+    // The watcher will also fire; the tool call must coalesce with it, not double-reconcile.
+    const r = (await request('tools/call', { name: 'mcpl_reload', arguments: {} })) as { content: Array<{ text: string }> }
+    const summary = r?.content?.[0]?.text ?? ''
+    ok(/added \[toy3\]/.test(summary) && /removed \[toy2\]/.test(summary) && /changed \[—\]/.test(summary), `mcpl_reload reported the diff: ${summary.slice(0, 120)}`)
+    await new Promise(r => setTimeout(r, 1500))
+    const after = (await request('tools/list', {})) as { tools: Array<{ name: string }> }
+    ok(after.tools.some(t => t.name === 'three__ping'), 'reload: added server proxied its tool')
+    ok(!after.tools.some(t => t.name === 'toy2__ping'), 'reload: removed server\'s tools are gone')
+    ok(after.tools.some(t => t.name === 'toy__ping'), 'reload: unchanged server untouched')
+    const p3 = (await request('tools/call', { name: 'three__ping', arguments: { echo: 'reloaded' } })) as { content: Array<{ text: string }> }
+    ok(p3?.content?.[0]?.text === 'pong reloaded', `reload: added server callable (got "${p3?.content?.[0]?.text}")`)
+    // File watcher alone: put toy2 back, drop toy3, call nothing.
+    delete cfg.servers.toy3
+    cfg.servers.toy2 = toy2
+    writeFileSync(CONFIG_COPY, JSON.stringify(cfg))
+    await new Promise(r => setTimeout(r, 2500))
+    const watched = (await request('tools/list', {})) as { tools: Array<{ name: string }> }
+    ok(watched.tools.some(t => t.name === 'toy2__ping') && !watched.tools.some(t => t.name === 'three__ping'), 'config file watcher reloaded without a tool call')
+    // A broken file is rejected whole; the fleet keeps running.
+    writeFileSync(CONFIG_COPY, '{ this is not json')
+    const bad = (await request('tools/call', { name: 'mcpl_reload', arguments: {} })) as { content: Array<{ text: string }> }
+    ok(/rejected/.test(bad?.content?.[0]?.text ?? ''), 'reload: invalid config rejected, running config kept')
+    const still = (await request('tools/list', {})) as { tools: Array<{ name: string }> }
+    ok(still.tools.some(t => t.name === 'toy__ping') && still.tools.some(t => t.name === 'toy2__ping'), 'reload: fleet intact after rejected config')
+    writeFileSync(CONFIG_COPY, JSON.stringify(cfg))
+    await new Promise(r => setTimeout(r, 1000))
+  }
 
   // ── Second instance (CC double-spawn) becomes a forwarding replica ──
   const child2 = spawn('bun', ['run', 'src/main.ts'], { cwd: ROOT, env: CHILD_ENV, stdio: ['pipe', 'pipe', 'pipe'] })

@@ -185,6 +185,26 @@ facts there. The bridge passes the common ones through as message meta
 `native_channel_id` — `message_id`, `author`, `author_id`, `thread_id`,
 `channel_name`, `guild`), so a wake is addressable without a history call.
 
+## Reloading config
+
+The bridge reads its config once at start, then reconciles on demand — no
+session restart to add a server:
+
+- `mcpl_reload` tool (from a replica it is forwarded to the primary),
+- `SIGHUP` to the primary adapter process,
+- or just save the file: the primary watches the config's directory and
+  reloads ~300 ms after a change (`MCPL_BRIDGE_WATCH=0` disables).
+
+Reconcile is per server and in place: added servers connect, removed servers
+close, servers whose entry changed in any way (key order aside) are closed and
+re-dialed; everything else keeps its connection, open channels, pending
+inference and held deliveries. Claude Code is told `tools/list_changed` when
+the proxied tool set moves. A file that fails to parse or validate is rejected
+whole and the running config stays — `mcpl_reload` returns the reason, and
+`mcpl_status` shows which file is live and whether it is watched. Held
+deliveries of a removed or changed server are dropped and counted in the
+reload summary.
+
 ## Double-spawn and state (primary/replica)
 
 Claude Code can spawn the adapter **twice** in one session — once for the
