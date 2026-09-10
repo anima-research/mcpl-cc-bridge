@@ -1,7 +1,7 @@
 {
   "name": "mcpl-bridge",
   "displayName": "MCPL Bridge",
-  "version": "0.2.6",
+  "version": "0.2.7",
   "description": "Host MCPL servers from Claude Code. Proxies MCPL tools as MCP tools, delivers push/event and channels/incoming as channel messages, fans UserPromptSubmit out to context/beforeInference, and reports inference/lifecycle from Stop/SessionEnd hooks. Grants and feature-set negotiation are enforced in the adapter per MCPL SPEC 0.5.",
   "keywords": [
     "mcpl",

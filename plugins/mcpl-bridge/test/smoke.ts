@@ -138,15 +138,21 @@ try {
   const status = (await request('tools/call', { name: 'mcpl_status', arguments: {} })) as { content: Array<{ text: string }> }
   const statusText = status?.content?.[0]?.text ?? ''
   ok(statusText.includes('toy: ready'), `mcpl_status shows ready: "${statusText.split('\n')[0]}"`)
-  ok(statusText.includes('toy:lobby'), 'mcpl_status shows registered channel toy:lobby')
+  ok(/toy: .*channels=1\b/.test(statusText), 'mcpl_status counts registered channels instead of listing ids')
   ok(statusText.includes('channels.lifecycle'), 'channels.lifecycle is in the effective grant')
-  ok(/toy: .*open=\[toy:lobby\]/.test(statusText), 'openChannels config opened toy:lobby after channels/register')
+  ok(/toy: .*open=\[Toy Lobby\]/.test(statusText), 'openChannels config opened toy:lobby after channels/register (shown by label)')
+  const chans = (await request('tools/call', { name: 'mcpl_channels', arguments: { server: 'toy' } })) as { content: Array<{ text: string }> }
+  const chansText = chans?.content?.[0]?.text ?? ''
+  ok(/^\* Toy Lobby — toy:lobby$/m.test(chansText), `mcpl_channels lists label — id with open marker: "${chansText.split('\n')[1]}"`)
+  const chansFiltered = (await request('tools/call', { name: 'mcpl_channels', arguments: { filter: 'nope' } })) as { content: Array<{ text: string }> }
+  ok(/toy: 0 of 1 channel/.test(chansFiltered?.content?.[0]?.text ?? ''), 'mcpl_channels filter narrows')
   ok(stderr1.includes('toy: open: toy:lobby'), 'toy server received channels/open')
 
   // ── Channel pushes ──
   const hello = await waitForChannel(p => meta(p).kind === 'channel-message', 'channels/incoming delivered as channel push')
   if (hello) {
     ok(String(hello.content).includes('hello from the toy lobby'), 'incoming message content intact')
+    ok(meta(hello).channel === 'Toy Lobby', `incoming message carries the registered label (channel="${meta(hello).channel}")`)
     ok((meta(hello).tags ?? '').includes('chat:addressed'), `tag closure applied (tags="${meta(hello).tags}")`)
   }
   const push = await waitForChannel(p => meta(p).kind === 'push-event', 'push/event delivered as channel push')
@@ -169,12 +175,15 @@ try {
 
   // ── channels/open + close via tools ──
   const closed = (await request('tools/call', { name: 'mcpl_close', arguments: { server: 'toy', channel_id: 'toy:lobby' } })) as { content: Array<{ text: string }> }
-  ok(closed?.content?.[0]?.text === 'closed toy:lobby', `mcpl_close → "${closed?.content?.[0]?.text}"`)
+  ok(closed?.content?.[0]?.text === 'closed Toy Lobby (toy:lobby)', `mcpl_close by id → "${closed?.content?.[0]?.text}"`)
   ok(stderr1.includes('toy: close: toy:lobby'), 'toy server received channels/close')
-  const reopened = (await request('tools/call', { name: 'mcpl_open', arguments: { server: 'toy', channel_id: 'toy:lobby' } })) as { content: Array<{ text: string }> }
-  ok(reopened?.content?.[0]?.text === 'opened toy:lobby', `mcpl_open → "${reopened?.content?.[0]?.text}"`)
+  // Label addressing: the label as printed, case-insensitively, with a leading # tolerated.
+  const reopened = (await request('tools/call', { name: 'mcpl_open', arguments: { server: 'toy', channel_id: '#toy lobby' } })) as { content: Array<{ text: string }> }
+  ok(reopened?.content?.[0]?.text === 'opened Toy Lobby (toy:lobby)', `mcpl_open by label → "${reopened?.content?.[0]?.text}"`)
   const status2 = (await request('tools/call', { name: 'mcpl_status', arguments: {} })) as { content: Array<{ text: string }> }
-  ok(/toy: .*open=\[toy:lobby\]/.test(status2?.content?.[0]?.text ?? ''), 'mcpl_status reflects the reopened channel')
+  ok(/toy: .*open=\[Toy Lobby\]/.test(status2?.content?.[0]?.text ?? ''), 'mcpl_status reflects the reopened channel')
+  const unknown = (await request('tools/call', { name: 'mcpl_send', arguments: { server: 'toy', channel_id: 'toy lobbies', text: 'x' } })) as { isError?: boolean; content: Array<{ text: string }> }
+  ok(unknown?.isError === true && /unknown channel "toy lobbies"/.test(unknown?.content?.[0]?.text ?? ''), `no fuzzy matching: "${unknown?.content?.[0]?.text}"`)
 
   // ── inference/request → mcpl_answer roundtrip ──
   const inf = await waitForChannel(p => meta(p).kind === 'inference-request' && meta(p).server === 'toy', 'inference/request delivered as channel push')
