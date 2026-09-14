@@ -270,6 +270,49 @@ try {
     await new Promise(r => setTimeout(r, 1000))
   }
 
+  // ── Socket sweep: a later adapter start must not unlink a LIVE session's socket ──
+  // A unix socket file's mtime is its creation time; the old sweep aged
+  // session-keyed sockets by it and deleted a week-old healthy primary's
+  // socket on every headless start. Age both a live socket and a corpse
+  // past the old threshold, start another session's adapter, and see which
+  // survives.
+  {
+    const { existsSync, utimesSync } = await import('fs')
+    const { homedir } = await import('os')
+    const SOCK_DIR = join(process.env.CLAUDE_CONFIG_DIR ?? join(homedir(), '.claude'), 'mcpl-bridge')
+    const live = join(SOCK_DIR, `sock-${SESSION_KEY}.sock`)
+    const corpse = join(SOCK_DIR, `sock-smoke-corpse-${process.pid}.sock`)
+    writeFileSync(corpse, '') // where a socket once was: a plain file, no listener
+    const twoDaysAgo = new Date(Date.now() - 2 * 86_400_000)
+    utimesSync(live, twoDaysAgo, twoDaysAgo)
+    utimesSync(corpse, twoDaysAgo, twoDaysAgo)
+    const child3 = spawn('bun', ['run', 'src/main.ts'], {
+      cwd: ROOT,
+      env: { ...CHILD_ENV, CLAUDE_CODE_SESSION_ID: `smoke-other-${process.pid}` },
+      stdio: ['pipe', 'pipe', 'pipe'],
+    })
+    child3.stderr.on('data', (d: Buffer) => process.stderr.write(`  3| ${d}`))
+    try {
+      await new Promise(r => setTimeout(r, 3000))
+      ok(existsSync(live), 'sweep: a live primary\'s socket survives another adapter\'s start, however old its mtime')
+      ok(!existsSync(corpse), 'sweep: a dead session socket is removed')
+      const pong = await new Promise<string>((resolve, reject) => {
+        const chunks: Buffer[] = []
+        const t = setTimeout(() => reject(new Error('ping timeout')), 3000)
+        Bun.connect({ unix: live, socket: {
+          open(s) { s.write(JSON.stringify({ kind: 'ping' }) + '\n') },
+          data(_s, d) { chunks.push(Buffer.from(d)) },
+          close() { clearTimeout(t); resolve(Buffer.concat(chunks).toString('utf8')) },
+          error(_s, e) { clearTimeout(t); reject(e) },
+        } }).catch(reject)
+      }).catch(() => '')
+      ok(/"pong"\s*:\s*true/.test(pong), 'sweep: the surviving primary still answers on its socket')
+    } finally {
+      child3.kill()
+      rmSync(corpse, { force: true })
+    }
+  }
+
   // ── Second instance (CC double-spawn) becomes a forwarding replica ──
   const child2 = spawn('bun', ['run', 'src/main.ts'], { cwd: ROOT, env: CHILD_ENV, stdio: ['pipe', 'pipe', 'pipe'] })
   let stderr2 = ''
