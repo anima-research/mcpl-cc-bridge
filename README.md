@@ -224,6 +224,13 @@ So instances coordinate over the session socket
   the socket, dials the fleet, and serves the call itself. In-flight MCPL state
   held by the dead primary (pending inference, registered channels) is lost —
   same as any host restart; servers re-register on reconnect.
+- **Sweep**: every adapter start removes stale socket files from the
+  directory — pid-keyed ones whose pid is gone, session-keyed ones that do
+  not answer a ping. Liveness is asked, never inferred from file age: a unix
+  socket file's mtime is its creation time, and a healthy week-old session
+  looks exactly like a corpse by that measure (0.2.7 — earlier versions
+  deleted live sockets on that basis, and every hook of the affected session
+  then failed open silently).
 
 Net effect: exactly one MCPL host per CC session, whichever MCP connection CC
 happens to route a call through.

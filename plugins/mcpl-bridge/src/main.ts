@@ -417,23 +417,33 @@ function startHandles() {
   installConfigWatch()
 }
 
-// Sweep stale sockets: pid-keyed ones whose pid died, and any socket file
-// older than a day (session-id-keyed ones can't be liveness-checked by name).
+// Sweep stale sockets. A pid-keyed socket is stale when its pid is gone. A
+// session-keyed one cannot be liveness-checked by name, and its mtime says
+// nothing either: a unix socket file's mtime is its creation time, so a
+// healthy primary that has served hooks for a week reads as "a day old". The
+// earlier sweep deleted on exactly that basis — every later adapter start
+// (a headless doorbell session, a pulse, a second CC window) unlinked the
+// live session's socket, and from then on every hook of that session
+// fail-opened with "socket: NOT FOUND": held deliveries never surfaced, no
+// lifecycle reached the servers, and nothing said so (found 2026-09-14: a
+// week-old session with 13 held pings and a socket directory with no socket
+// in it). So a session-keyed socket is asked, not aged: a live primary
+// answers ping; anything that does not is a corpse. Our own path is not in
+// the directory yet — this runs before bindSocket.
 try {
-  const { readdirSync, statSync } = await import('fs')
+  const { readdirSync } = await import('fs')
   for (const f of readdirSync(SOCK_DIR)) {
     const m = /^sock-(.+)\.sock$/.exec(f)
     if (!m) continue
+    const p = join(SOCK_DIR, f)
     if (/^\d+$/.test(m[1])) {
       try {
         process.kill(Number(m[1]), 0)
       } catch {
-        rmSync(join(SOCK_DIR, f), { force: true })
+        rmSync(p, { force: true })
       }
-    } else {
-      try {
-        if (Date.now() - statSync(join(SOCK_DIR, f)).mtimeMs > 86_400_000) rmSync(join(SOCK_DIR, f), { force: true })
-      } catch {}
+    } else if (!(await socketAlive(p))) {
+      rmSync(p, { force: true })
     }
   }
 } catch {}
@@ -546,12 +556,24 @@ function bindSocket(steal = false): boolean {
   }
 }
 
-function socketRoundtrip(payload: string, timeoutMs: number): Promise<string> {
+/** Is there a live primary behind this socket path? A ping answered with
+ *  pong within the timeout is the only evidence accepted; a refused connect,
+ *  a plain file, or silence all mean no. */
+async function socketAlive(path: string, timeoutMs = 1500): Promise<boolean> {
+  try {
+    const reply = await socketRoundtrip(JSON.stringify({ kind: 'ping' }) + '\n', timeoutMs, path)
+    return /"pong"\s*:\s*true/.test(reply)
+  } catch {
+    return false
+  }
+}
+
+function socketRoundtrip(payload: string, timeoutMs: number, path: string = sockPath): Promise<string> {
   return new Promise<string>((resolve, reject) => {
     const chunks: Buffer[] = []
     const timer = setTimeout(() => reject(new Error('socket timeout')), timeoutMs)
     Bun.connect({
-      unix: sockPath,
+      unix: path,
       socket: {
         open(s) {
           s.write(payload)
