@@ -393,6 +393,15 @@ export class McplServerHandle {
         const o = (p.origin && typeof p.origin === 'object' ? p.origin : {}) as Record<string, unknown>
         const s = (v: unknown) => (v == null ? '' : String(v))
         const mcplChannel = s(o.mcplChannelId)
+        // Whitelist mode: a registered channel we do not hold open is not one
+        // this session listens to — addressed or not, the push is refused
+        // (§6.6: a rejection is diagnostics for the server, nothing more).
+        const from = mcplChannel || s(o.channelId)
+        if (this.cfg.openChannelsOnly === true && from && this.channels.has(from) && !this.isOpen(from)) {
+          console.error(`${this.id}: dropped push from closed channel ${this.labelOf(from) || from} (openChannelsOnly)`)
+          respond({ accepted: false, reason: 'channel not open on this host (openChannelsOnly)' })
+          return
+        }
         this.cb.deliver({
           server: this.id,
           kind: 'push-event',
@@ -416,6 +425,23 @@ export class McplServerHandle {
           },
         })
         respond({ accepted: true })
+        // Addressed in a channel we don't follow → follow it (see config
+        // `openOnAddressed`). After the response: the open is a separate
+        // request on the same connection and must not gate this ack.
+        const addressedIn = mcplChannel || s(o.channelId)
+        if (
+          this.cfg.openOnAddressed !== false &&
+          tags.includes('chat:addressed') &&
+          addressedIn &&
+          this.channels.has(addressedIn) &&
+          !this.isOpen(addressedIn) &&
+          granted(this.grant, 'channels.lifecycle')
+        ) {
+          void this.openChannel(addressedIn).then(
+            r => console.error(`${this.id}: opened ${r.label || addressedIn} (addressed there)`),
+            err => console.error(`${this.id}: open-on-addressed failed for ${addressedIn}: ${(err as Error).message}`),
+          )
+        }
         return
       }
       case 'channels/register':
@@ -451,6 +477,10 @@ export class McplServerHandle {
         const results = (p.messages ?? []).map(m => {
           const known = this.channels.has(m.channelId)
           if (!known) return { messageId: m.messageId, accepted: false }
+          if (this.cfg.openChannelsOnly === true && !this.isOpen(m.channelId)) {
+            console.error(`${this.id}: dropped incoming from closed channel ${this.labelOf(m.channelId) || m.channelId} (openChannelsOnly)`)
+            return { messageId: m.messageId, accepted: false }
+          }
           const tags = expandTags(m.tags)
           this.cb.deliver({
             server: this.id,
@@ -559,6 +589,12 @@ export class McplServerHandle {
     this.openChannels.delete(channelId)
     const r = (await conn.sendRequest('channels/close', { channelId })) as ChannelsCloseResult
     return { channelId, label: this.labelOf(channelId) || channelId, closed: r?.closed === true }
+  }
+
+  /** Open, or meant to be: live-open this epoch, or in the desired-open set
+   *  (config `openChannels` + mcpl_open) awaiting reconcile. */
+  private isOpen(channelId: string): boolean {
+    return this.openChannels.has(channelId) || this.desiredOpen.has(channelId)
   }
 
   /** The registered label for a channel id ('' when unknown). */

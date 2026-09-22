@@ -37,6 +37,32 @@
           "test/toy-server.ts"
         ]
       }
+    },
+    "toygate": {
+      "transport": {
+        "command": "bun",
+        "args": [
+          "run",
+          "test/toy-server.ts"
+        ]
+      },
+      "grant": [
+        "tools",
+        "pushEvents",
+        "inferenceRequest",
+        "inferenceLifecycle",
+        "channels.register",
+        "channels.lifecycle",
+        "channels.incoming",
+        "channels.publish",
+        "contextHooks.beforeInference.observe",
+        "contextHooks.beforeInference.inject.beforeUser"
+      ],
+      "enableFeatureSets": [
+        "*"
+      ],
+      "inferenceRequest": "deny",
+      "openChannelsOnly": true
     }
   }
 }
