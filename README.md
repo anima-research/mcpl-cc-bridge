@@ -128,6 +128,8 @@ Notes:
   Default `"all"`.
 - `openOnAddressed` — open a closed channel when addressed there (default
   `true`); see [Opening channels](#opening-channels).
+- `openChannelsOnly` — drop pushes from channels not in the open set (default
+  `false`); see [Opening channels](#opening-channels).
 - `openChannels` — registered channel ids to hold open across restarts; see
   [Opening channels](#opening-channels).
 
@@ -187,6 +189,13 @@ session instead of only the mentions. Pair it with `"wake": "chat"` and that
 ambient traffic is held for the next wake rather than waking per message. The
 open lasts the session (it joins the desired-open set); set `"openOnAddressed":
 false` to keep the closed-until-opened behaviour.
+
+The strict form is `"openChannelsOnly": true`: the open set (`openChannels`
+plus anything opened with `mcpl_open` this session) becomes a whitelist, and a
+`push/event` or `channels/incoming` from any other registered channel is
+dropped — not delivered, not held, not opened, and the server sees
+`accepted: false`. Being addressed outside the whitelist then never wakes the
+session. Off by default.
 
 ```json
 "grant": ["tools", "pushEvents", "channels.register", "channels.lifecycle", "channels.incoming", "channels.publish"],
