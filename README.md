@@ -5,11 +5,22 @@ adapter process is simultaneously:
 
 1. **MCP server** — proxies MCPL `tools/list`/`tools/call` as `<server>__<tool>`,
    forwards `tools/list_changed`, and adds bridge tools:
-   - `mcpl_status` — connections, grants, feature sets, channels (registered
-     and open), held count, pending inference
+   - `mcpl_status` — connections, grants, feature sets, registered channel
+     count, open channels (by label), held count, pending inference
+   - `mcpl_channels` — registered channels as `label — id`, filterable
    - `mcpl_send` — `channels/publish` into a registered channel
    - `mcpl_open` / `mcpl_close` — `channels/open` / `channels/close` on a
      registered channel (subscribe to / leave its ordinary traffic)
+
+   Everywhere a channel is named (`channel_id`), the channel's registered
+   **label** is accepted as well as its id — display form == address form.
+   `mcpl_channels` and the `channel="…"` attribute on delivered messages print
+   exactly the string to pass back. Matching is exact after trimming, a leading
+   `#` optional, case-insensitive, and a label's trailing ` (qualifier)` may be
+   dropped when the rest is unique; there is no fuzzy matching, and an ambiguous
+   reference is an error quoting each match's label and id. If a channel id
+   collides with another channel's label, use `id:<channel id>` to address it
+   explicitly; the unprefixed reference is rejected.
    - `mcpl_answer` — resolve a held `inference/request`
 2. **Channel provider** (`claude/channel`) — `push/event`, `channels/incoming`,
    and `inference/request` arrive as `<channel source="mcpl" ...>` messages that
@@ -182,8 +193,9 @@ returns what the server hands back with the open, oldest first.
 `push/event` carries an opaque `origin`; chat-shaped producers put the routing
 facts there. The bridge passes the common ones through as message meta
 (`channel_id` — the MCPL id when the producer supplies one, with the raw id as
-`native_channel_id` — `message_id`, `author`, `author_id`, `thread_id`,
-`channel_name`, `guild`), so a wake is addressable without a history call.
+`native_channel_id` — `channel` (the registered label, when the id is known),
+`message_id`, `author`, `author_id`, `thread_id`, `channel_name`, `guild`), so
+a wake is addressable without a history call.
 
 ## Reloading config
 

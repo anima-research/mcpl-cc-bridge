@@ -45,10 +45,10 @@ const mcp = new Server(
     instructions: [
       'This server bridges MCPL servers into this session.',
       'Messages from MCPL servers arrive as <channel source="mcpl" server="..." ...> blocks:',
-      '- kind="channel-message" / kind="push-event": events from the MCPL server. To reply on a channel, call mcpl_send with that server and channel_id.',
+      '- kind="channel-message" / kind="push-event": events from the MCPL server. To reply on a channel, call mcpl_send with that server and the channel\'s label (the channel="…" attribute) or its channel_id — both are accepted everywhere a channel is named.',
       '- kind="inference-request": the MCPL server is asking for a completion. Compose the answer and call mcpl_answer with the request_id from the message. Do this promptly — the request is held open.',
       'A <held server="..." count="N"> block at the top of a message lists deliveries the wake policy held back since the last turn (e.g. a bot replying to you, ambient traffic) — context, not a separate ping; the same block reaches a user turn via the UserPromptSubmit hook.',
-      'Proxied MCPL tools are named <server>__<tool>. mcpl_status shows connections, grants, channels, open channels, and held count. mcpl_open / mcpl_close subscribe to or leave a registered channel\'s ambient traffic (channels/open).',
+      'Proxied MCPL tools are named <server>__<tool>. mcpl_status shows connections, grants, channel counts, open channels, and held count; mcpl_channels lists registered channels by label. mcpl_open / mcpl_close subscribe to or leave a registered channel\'s ambient traffic (channels/open).',
     ].join('\n'),
   },
 )
@@ -179,17 +179,29 @@ process.on('SIGHUP', () => {
 const BRIDGE_TOOLS: Array<{ name: string; description: string; inputSchema: Record<string, unknown> }> = [
   {
     name: 'mcpl_status',
-    description: 'Show every bridged MCPL server: connection status, effective capability grant, enabled feature sets, registered channels, proxied tool count, pending inference requests.',
+    description: 'Show every bridged MCPL server: connection status, effective capability grant, enabled feature sets, registered channel count, open channels (by label), proxied tool count, pending inference requests. Use mcpl_channels for the channel list.',
     inputSchema: { type: 'object', properties: {} },
   },
   {
+    name: 'mcpl_channels',
+    description: 'List the registered channels of a bridged MCPL server as `label — id` (open ones marked *). The label is the address form: pass it as channel_id to mcpl_send / mcpl_open / mcpl_close. Optional case-insensitive substring filter over labels and ids.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        server: { type: 'string', description: 'bridged server id (omit for all servers)' },
+        filter: { type: 'string', description: 'substring to match against label or id' },
+        open_only: { type: 'boolean', description: 'only channels currently open' },
+      },
+    },
+  },
+  {
     name: 'mcpl_send',
-    description: 'Publish a message into a registered channel of a bridged MCPL server (channels/publish). Use the server id and channel_id from a received <channel> message or from mcpl_status.',
+    description: 'Publish a message into a registered channel of a bridged MCPL server (channels/publish). channel_id accepts the channel\'s label exactly as mcpl_channels / a received <channel channel="…"> print it (case-insensitive, leading # optional, no fuzzy matching) or its registered id. If an id collides with another label, use id:<channel id>; the unprefixed reference errors.',
     inputSchema: {
       type: 'object',
       properties: {
         server: { type: 'string', description: 'bridged server id' },
-        channel_id: { type: 'string' },
+        channel_id: { type: 'string', description: 'channel label (e.g. "#lena_dev (Connectome)") or registered id' },
         text: { type: 'string' },
       },
       required: ['server', 'channel_id', 'text'],
@@ -202,7 +214,7 @@ const BRIDGE_TOOLS: Array<{ name: string; description: string; inputSchema: Reco
       type: 'object',
       properties: {
         server: { type: 'string', description: 'bridged server id' },
-        channel_id: { type: 'string', description: 'registered channel id, as listed by mcpl_status' },
+        channel_id: { type: 'string', description: 'channel label (as listed by mcpl_channels) or registered id' },
         history_limit: { type: 'number', description: 'messages of history to return with the open (default 0)' },
       },
       required: ['server', 'channel_id'],
@@ -215,7 +227,7 @@ const BRIDGE_TOOLS: Array<{ name: string; description: string; inputSchema: Reco
       type: 'object',
       properties: {
         server: { type: 'string' },
-        channel_id: { type: 'string' },
+        channel_id: { type: 'string', description: 'channel label (as listed by mcpl_channels) or registered id' },
       },
       required: ['server', 'channel_id'],
     },
@@ -279,13 +291,18 @@ async function callToolImpl(name: string, args: Record<string, unknown>): Promis
     if (name === 'mcpl_status') {
       const lines: string[] = []
       for (const [id, h] of handles) {
+        // A server can register hundreds of channels (every Discord channel a
+        // persona can see) and ids are unreadable anyway: count here, labels
+        // via mcpl_channels. Open channels are few and named by label — the
+        // address form mcpl_send/open/close accept back.
+        const open = [...h.openChannels].map(cid => h.labelOf(cid) || cid)
         lines.push(
           `${id}: ${h.status}` +
             ` | grant=[${h.grant.join(', ') || '—'}]` +
             ` | featureSets=[${h.featureSetsEnabled.join(', ') || '—'}]` +
             ` | tools=${h.tools.length}` +
-            ` | channels=[${[...h.channels.keys()].join(', ') || '—'}]` +
-            ` | open=[${[...h.openChannels].join(', ') || '—'}]` +
+            ` | channels=${h.channels.size}` +
+            ` | open=[${open.join(', ') || '—'}]` +
             ((gates.get(id)?.heldCount ?? 0) > 0 ? ` | held=${gates.get(id)!.heldCount}` : '') +
             (h.pendingInferenceIds.length ? ` | pending inference: ${h.pendingInferenceIds.join(', ')}` : '') +
             (h.manifestRevision ? ` | rev=${h.manifestRevision.slice(0, 18)}…` : ''),
@@ -295,6 +312,25 @@ async function callToolImpl(name: string, args: Record<string, unknown>): Promis
       return text(lines.join('\n'))
     }
     if (name === 'mcpl_reload') return text(await reloadConfig('mcpl_reload'))
+    if (name === 'mcpl_channels') {
+      const wanted = args.server === undefined ? [...handles.keys()] : [String(args.server)]
+      const filter = typeof args.filter === 'string' ? args.filter.toLowerCase() : ''
+      const openOnly = args.open_only === true
+      const CAP = 150
+      const lines: string[] = []
+      for (const id of wanted) {
+        const h = handles.get(id)
+        if (!h) return text(`unknown server: ${id}`, true)
+        const rows = [...h.channels.values()]
+          .filter(d => !openOnly || h.openChannels.has(d.id))
+          .filter(d => !filter || d.label.toLowerCase().includes(filter) || d.id.toLowerCase().includes(filter))
+          .sort((a, b) => a.label.localeCompare(b.label, 'en', { sensitivity: 'base' }))
+        lines.push(`${id}: ${rows.length}${rows.length !== h.channels.size ? ` of ${h.channels.size}` : ''} channel(s)${openOnly ? ', open only' : ''}${filter ? ` matching "${args.filter}"` : ''}`)
+        for (const d of rows.slice(0, CAP)) lines.push(`${h.openChannels.has(d.id) ? '*' : ' '} ${d.label} — ${d.id}`)
+        if (rows.length > CAP) lines.push(`  … ${rows.length - CAP} more; narrow with filter`)
+      }
+      return text(lines.join('\n') || 'no MCPL servers configured')
+    }
     if (name === 'mcpl_send') {
       const h = handles.get(String(args.server))
       if (!h) return text(`unknown server: ${args.server}`, true)
@@ -306,7 +342,7 @@ async function callToolImpl(name: string, args: Record<string, unknown>): Promis
       if (!h) return text(`unknown server: ${args.server}`, true)
       const limit = typeof args.history_limit === 'number' ? Math.max(0, Math.floor(args.history_limit)) : 0
       const r = await h.openChannel(String(args.channel_id), limit)
-      const lines = [`opened ${args.channel_id}`]
+      const lines = [`opened ${r.label} (${r.channelId})`]
       if (r.history.length) {
         lines.push(`history (${r.history.length}${r.truncated ? ', truncated' : ''}, oldest first):`)
         for (const m of r.history) {
@@ -319,8 +355,8 @@ async function callToolImpl(name: string, args: Record<string, unknown>): Promis
     if (name === 'mcpl_close') {
       const h = handles.get(String(args.server))
       if (!h) return text(`unknown server: ${args.server}`, true)
-      const closed = await h.closeChannel(String(args.channel_id))
-      return text(closed ? `closed ${args.channel_id}` : `${args.channel_id} was not open (desired-open state cleared)`)
+      const r = await h.closeChannel(String(args.channel_id))
+      return text(r.closed ? `closed ${r.label} (${r.channelId})` : `${r.label} (${r.channelId}) was not open (desired-open state cleared)`)
     }
     if (name === 'mcpl_answer') {
       const h = handles.get(String(args.server))

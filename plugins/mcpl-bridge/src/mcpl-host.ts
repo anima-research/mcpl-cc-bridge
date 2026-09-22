@@ -403,6 +403,9 @@ export class McplServerHandle {
             ts: String(p.timestamp ?? ''),
             channel_id: mcplChannel || s(o.channelId),
             native_channel_id: mcplChannel ? s(o.channelId) : '',
+            // The registered label (what mcpl_send/mcpl_open accept back);
+            // channel_name is whatever the producer put on origin.
+            channel: this.labelOf(mcplChannel || s(o.channelId)),
             channel_name: s(o.channelName),
             guild: s(o.guildName),
             thread_id: s(o.threadId),
@@ -455,6 +458,7 @@ export class McplServerHandle {
             text: renderContent(m.content),
             meta: {
               channel_id: m.channelId,
+              channel: this.labelOf(m.channelId),
               message_id: m.messageId,
               ...(m.threadId ? { thread_id: m.threadId } : {}),
               author: `${m.author?.name ?? 'unknown'}`,
@@ -524,12 +528,12 @@ export class McplServerHandle {
    * channels/incoming instead of only addressed pushes. Returns any history
    * the server handed back with the open (oldest first).
    */
-  async openChannel(channelId: string, historyLimit = 0): Promise<{ history: IncomingChannelMessage[]; truncated: boolean }> {
+  async openChannel(ref: string, historyLimit = 0): Promise<{ channelId: string; label: string; history: IncomingChannelMessage[]; truncated: boolean }> {
     const conn = this.conn
     if (!conn || conn.isClosed) throw new Error(`${this.id}: not connected`)
     if (!granted(this.grant, 'channels.lifecycle')) throw new Error(`${this.id}: channels.lifecycle not granted (add it to the server's grant; the server must advertise it too)`)
-    const desc = this.channels.get(channelId)
-    if (!desc) throw new Error(`${this.id}: unknown channel ${channelId} (known: ${[...this.channels.keys()].join(', ') || 'none'})`)
+    const channelId = this.resolveChannel(ref)
+    const desc = this.channels.get(channelId)!
     const params: ChannelsOpenParams = {
       channelId,
       type: desc.type,
@@ -539,19 +543,66 @@ export class McplServerHandle {
     const r = (await conn.sendRequest('channels/open', params)) as ChannelsOpenResult
     this.openChannels.add(channelId)
     this.desiredOpen.add(channelId)
-    return { history: r?.history ?? [], truncated: r?.historyTruncated === true }
+    return { channelId, label: desc.label, history: r?.history ?? [], truncated: r?.historyTruncated === true }
   }
 
-  async closeChannel(channelId: string): Promise<boolean> {
+  async closeChannel(ref: string): Promise<{ channelId: string; label: string; closed: boolean }> {
     const conn = this.conn
     if (!conn || conn.isClosed) throw new Error(`${this.id}: not connected`)
     if (!granted(this.grant, 'channels.lifecycle')) throw new Error(`${this.id}: channels.lifecycle not granted`)
+    // An id we no longer know (channel removed) may still sit in desiredOpen —
+    // let it through so the intent can be cleared; a label must resolve.
+    const channelId = !this.channels.has(ref) && this.desiredOpen.has(ref) ? ref : this.resolveChannel(ref)
     // Forget the intent first: a close that fails on the wire must not be
     // silently undone by the next reconnect's reconcile.
     this.desiredOpen.delete(channelId)
     this.openChannels.delete(channelId)
     const r = (await conn.sendRequest('channels/close', { channelId })) as ChannelsCloseResult
-    return r?.closed === true
+    return { channelId, label: this.labelOf(channelId) || channelId, closed: r?.closed === true }
+  }
+
+  /** The registered label for a channel id ('' when unknown). */
+  labelOf(channelId: string): string {
+    return this.channels.get(channelId)?.label ?? ''
+  }
+
+  /**
+   * Resolve a channel reference to a registered channel id. Accepts the exact
+   * id, or the label as mcpl_channels / <channel channel="…"> print it —
+   * display form == address form. Exact match after trimming, a leading `#`
+   * optional, case-insensitive; a label's trailing ` (qualifier)` may be
+   * omitted when the remainder is unique. NO fuzzy matching: a "did you mean"
+   * would turn a mistyped room into a silent wrong-room delivery. Ambiguity is
+   * an error that quotes label + id for each match, so the answer is pasteable.
+   */
+  resolveChannel(ref: string): string {
+    const raw = ref.trim()
+    // Explicit ids remain addressable when an id collides with another
+    // channel's label. Never guess which form an unprefixed reference meant.
+    if (raw.startsWith('id:')) {
+      const id = raw.slice(3)
+      if (this.channels.has(id)) return id
+      throw new Error(`${this.id}: unknown channel id "${id}" (${this.channels.size} registered)`)
+    }
+    const norm = (s: string) => s.trim().replace(/^#/, '').toLowerCase()
+    const want = norm(raw)
+    if (!want) throw new Error(`${this.id}: empty channel reference`)
+    const unqualified = (label: string) => norm(label.replace(/\s*\([^()]*\)\s*$/, ''))
+    let matches = [...this.channels.values()].filter(d => norm(d.label) === want)
+    if (matches.length === 0) matches = [...this.channels.values()].filter(d => unqualified(d.label) === want)
+    if (this.channels.has(raw)) {
+      const labelled = matches.find(d => d.id !== raw)
+      if (labelled) {
+        throw new Error(`${this.id}: "${ref}" matches channel id ${raw} and label "${labelled.label}" (id ${labelled.id}). Use id:${raw} or id:${labelled.id}`)
+      }
+      return raw
+    }
+    if (matches.length === 1) return matches[0].id
+    if (matches.length === 0) {
+      throw new Error(`${this.id}: unknown channel "${ref}" (${this.channels.size} registered — use mcpl_channels to list labels and ids)`)
+    }
+    const options = matches.map(d => `"${d.label}" (id ${d.id})`).join(', ')
+    throw new Error(`${this.id}: "${ref}" is ambiguous — ${matches.length} channels match. Re-send with one of: ${options}`)
   }
 
   /** Re-open desired channels after a (re)registration; failures are logged, not fatal. */
@@ -628,11 +679,11 @@ export class McplServerHandle {
     return conn.sendRequest('tools/call', { name, arguments: args ?? {} }, 120_000)
   }
 
-  async publish(channelId: string, text: string): Promise<unknown> {
+  async publish(ref: string, text: string): Promise<unknown> {
     const conn = this.conn
     if (!conn || conn.isClosed) throw new Error(`${this.id}: not connected`)
     if (!granted(this.grant, 'channels.publish')) throw new Error(`${this.id}: channels.publish not granted`)
-    if (!this.channels.has(channelId)) throw new Error(`${this.id}: unknown channel ${channelId} (known: ${[...this.channels.keys()].join(', ') || 'none'})`)
+    const channelId = this.resolveChannel(ref)
     return conn.sendRequest('channels/publish', {
       conversationId: 'claude-code',
       channelId,
