@@ -552,7 +552,7 @@ export class McplServerHandle {
     if (!granted(this.grant, 'channels.lifecycle')) throw new Error(`${this.id}: channels.lifecycle not granted`)
     // An id we no longer know (channel removed) may still sit in desiredOpen —
     // let it through so the intent can be cleared; a label must resolve.
-    const channelId = this.channels.has(ref) || this.desiredOpen.has(ref) ? ref : this.resolveChannel(ref)
+    const channelId = !this.channels.has(ref) && this.desiredOpen.has(ref) ? ref : this.resolveChannel(ref)
     // Forget the intent first: a close that fails on the wire must not be
     // silently undone by the next reconnect's reconcile.
     this.desiredOpen.delete(channelId)
@@ -577,13 +577,26 @@ export class McplServerHandle {
    */
   resolveChannel(ref: string): string {
     const raw = ref.trim()
-    if (this.channels.has(raw)) return raw
+    // Explicit ids remain addressable when an id collides with another
+    // channel's label. Never guess which form an unprefixed reference meant.
+    if (raw.startsWith('id:')) {
+      const id = raw.slice(3)
+      if (this.channels.has(id)) return id
+      throw new Error(`${this.id}: unknown channel id "${id}" (${this.channels.size} registered)`)
+    }
     const norm = (s: string) => s.trim().replace(/^#/, '').toLowerCase()
     const want = norm(raw)
     if (!want) throw new Error(`${this.id}: empty channel reference`)
     const unqualified = (label: string) => norm(label.replace(/\s*\([^()]*\)\s*$/, ''))
     let matches = [...this.channels.values()].filter(d => norm(d.label) === want)
     if (matches.length === 0) matches = [...this.channels.values()].filter(d => unqualified(d.label) === want)
+    if (this.channels.has(raw)) {
+      const labelled = matches.find(d => d.id !== raw)
+      if (labelled) {
+        throw new Error(`${this.id}: "${ref}" matches channel id ${raw} and label "${labelled.label}" (id ${labelled.id}). Use id:${raw} or id:${labelled.id}`)
+      }
+      return raw
+    }
     if (matches.length === 1) return matches[0].id
     if (matches.length === 0) {
       throw new Error(`${this.id}: unknown channel "${ref}" (${this.channels.size} registered — use mcpl_channels to list labels and ids)`)

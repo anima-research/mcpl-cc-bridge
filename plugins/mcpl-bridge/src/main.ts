@@ -196,7 +196,7 @@ const BRIDGE_TOOLS: Array<{ name: string; description: string; inputSchema: Reco
   },
   {
     name: 'mcpl_send',
-    description: 'Publish a message into a registered channel of a bridged MCPL server (channels/publish). channel_id accepts the channel\'s label exactly as mcpl_channels / a received <channel channel="…"> print it (case-insensitive, leading # optional, no fuzzy matching) or its registered id.',
+    description: 'Publish a message into a registered channel of a bridged MCPL server (channels/publish). channel_id accepts the channel\'s label exactly as mcpl_channels / a received <channel channel="…"> print it (case-insensitive, leading # optional, no fuzzy matching) or its registered id. If an id collides with another label, use id:<channel id>; the unprefixed reference errors.',
     inputSchema: {
       type: 'object',
       properties: {
