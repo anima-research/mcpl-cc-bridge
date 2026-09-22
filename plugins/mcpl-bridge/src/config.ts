@@ -84,6 +84,18 @@ export type ServerConfig = {
    * the live set; this list is what survives a restart.
    */
   openChannels?: string[]
+  /**
+   * Open a registered channel the moment a push/event tagged `chat:addressed`
+   * arrives from it while it is closed — the host-side analog of "follow the
+   * room you were just spoken to in". A closed channel delivers only what
+   * addresses the agent, so everything said between two mentions is never
+   * seen; once open, its ordinary traffic arrives as channels/incoming and the
+   * wake policy decides whether that wakes or is held (`"wake": "chat"` holds
+   * it). Default: true. Needs channels.lifecycle in the grant. The open joins
+   * the session's desired-open set (survives reconnects, not restarts — put
+   * the id in `openChannels` for that).
+   */
+  openOnAddressed?: boolean
   /** Reconnect on transport failure. Default: true for ws, false for stdio. */
   reconnect?: boolean
   reconnectIntervalMs?: number

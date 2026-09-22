@@ -126,6 +126,8 @@ Notes:
   comes back on its own; a crashed child needs a restart).
 - `wake` — when a delivery starts a turn; see [Wake policy](#wake-policy).
   Default `"all"`.
+- `openOnAddressed` — open a closed channel when addressed there (default
+  `true`); see [Opening channels](#opening-channels).
 - `openChannels` — registered channel ids to hold open across restarts; see
   [Opening channels](#opening-channels).
 
@@ -177,6 +179,14 @@ the host's (SPEC §14): the bridge keeps a per-server set seeded from
 session, and reconciled against every `channels/register` — so a reconnect
 re-opens what you had open. A server's `initiallyOpen` hint on a descriptor is
 honored only when the config carries no `openChannels` at all.
+
+Being addressed in a closed channel opens it (`openOnAddressed`, default on):
+a `push/event` tagged `chat:addressed` from a registered, closed channel
+triggers `channels/open`, so the conversation *between* mentions reaches the
+session instead of only the mentions. Pair it with `"wake": "chat"` and that
+ambient traffic is held for the next wake rather than waking per message. The
+open lasts the session (it joins the desired-open set); set `"openOnAddressed":
+false` to keep the closed-until-opened behaviour.
 
 ```json
 "grant": ["tools", "pushEvents", "channels.register", "channels.lifecycle", "channels.incoming", "channels.publish"],

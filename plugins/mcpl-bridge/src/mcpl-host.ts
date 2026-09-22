@@ -416,6 +416,23 @@ export class McplServerHandle {
           },
         })
         respond({ accepted: true })
+        // Addressed in a channel we don't follow → follow it (see config
+        // `openOnAddressed`). After the response: the open is a separate
+        // request on the same connection and must not gate this ack.
+        const addressedIn = mcplChannel || s(o.channelId)
+        if (
+          this.cfg.openOnAddressed !== false &&
+          tags.includes('chat:addressed') &&
+          addressedIn &&
+          this.channels.has(addressedIn) &&
+          !this.openChannels.has(addressedIn) &&
+          granted(this.grant, 'channels.lifecycle')
+        ) {
+          void this.openChannel(addressedIn).then(
+            r => console.error(`${this.id}: opened ${r.label || addressedIn} (addressed there)`),
+            err => console.error(`${this.id}: open-on-addressed failed for ${addressedIn}: ${(err as Error).message}`),
+          )
+        }
         return
       }
       case 'channels/register':

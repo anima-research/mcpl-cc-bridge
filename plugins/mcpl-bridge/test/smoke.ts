@@ -173,6 +173,13 @@ try {
     ok(meta(mention).native_channel_id === 'raw-lobby', 'native channel id kept beside the MCPL id')
   }
 
+  // ── open-on-addressed: toy2 has no openChannels, so its lobby starts closed;
+  //    the from-human mention push (chat:addressed) must open it. ──
+  for (let i = 0; i < 40 && !stderr1.includes('toy2: opened Toy Lobby (addressed there)'); i++) await new Promise(r => setTimeout(r, 250))
+  ok(stderr1.includes('toy2: opened Toy Lobby (addressed there)'), 'addressed push from a closed channel opened it (openOnAddressed default)')
+  const statusAuto = (await request('tools/call', { name: 'mcpl_status', arguments: {} })) as { content: Array<{ text: string }> }
+  ok(/toy2: .*open=\[Toy Lobby\]/.test(statusAuto?.content?.[0]?.text ?? ''), 'mcpl_status shows the auto-opened channel on toy2')
+
   // ── channels/open + close via tools ──
   const closed = (await request('tools/call', { name: 'mcpl_close', arguments: { server: 'toy', channel_id: 'toy:lobby' } })) as { content: Array<{ text: string }> }
   ok(closed?.content?.[0]?.text === 'closed Toy Lobby (toy:lobby)', `mcpl_close by id → "${closed?.content?.[0]?.text}"`)
