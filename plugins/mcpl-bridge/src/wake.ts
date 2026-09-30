@@ -44,7 +44,15 @@ export function resolveWakePolicy(cfg: WakeConfig | undefined): WakePolicy | nul
   return cfg
 }
 
-export type HeldDelivery = { delivery: IncomingDelivery; heldAt: string }
+export type HeldDelivery = {
+  delivery: IncomingDelivery
+  heldAt: string
+  /** Held because it fired mid-turn, not because policy chose to: the harness
+   *  drops channel notifications that land inside a live turn, so the copy in
+   *  this ledger is (probably) the only one. Marked in the render, and the
+   *  gate reports wakePending so the turn boundary re-fires. */
+  deferredWake?: true
+}
 
 const DEFAULT_HOLD_CAP = 50
 
@@ -63,6 +71,13 @@ export class WakeGate {
   get heldCount(): number {
     return this.held.length
   }
+
+  /** True while the ledger holds a delivery that WANTED to wake but fired
+   *  during a live turn; cleared by the flush that delivers it. */
+  get wakePending(): boolean {
+    return this._wakePending
+  }
+  private _wakePending = false
 
   /** Inference requests are never held: a server is blocked on the answer. */
   decide(d: IncomingDelivery): 'wake' | 'hold' {
@@ -83,8 +98,22 @@ export class WakeGate {
     }
   }
 
+  /** Mirror a wake that fired while a turn was live. The notification still
+   *  goes out (forward-compat, and it costs nothing), but the harness is
+   *  known to drop mid-turn channel pushes (2026-09-22, 2026-09-29), so this
+   *  ledger copy is what actually survives to the turn boundary. */
+  deferWake(d: IncomingDelivery): void {
+    this.held.push({ delivery: d, heldAt: new Date().toISOString(), deferredWake: true })
+    while (this.held.length > this.cap) {
+      this.held.shift()
+      this.evicted++
+    }
+    this._wakePending = true
+  }
+
   /** Drain everything held into one context block; empty string when nothing is held. */
   flush(server: string): string {
+    this._wakePending = false
     if (!this.held.length && !this.evicted) return ''
     const lines = this.held.map(renderHeldLine)
     const attrs = [`server="${server}"`, `count="${this.held.length}"`]
@@ -103,5 +132,6 @@ function renderHeldLine(h: HeldDelivery): string {
   const text = h.delivery.text.replace(/\s+/g, ' ').trim()
   const body = text.length > 300 ? `${text.slice(0, 297)}...` : text
   const tags = m.tags ? ` [${m.tags}]` : ''
-  return `- [${stamp}]${where}${who} ${body}${tags}`
+  const deferred = h.deferredWake ? ' (wake fired mid-turn; this is likely the only copy you get)' : ''
+  return `- [${stamp}]${where}${who} ${body}${tags}${deferred}`
 }
