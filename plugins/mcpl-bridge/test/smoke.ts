@@ -6,14 +6,18 @@
  *   hook socket (beforeInference → additionalContext, ungranted injection dropped),
  *   channels/publish via mcpl_send, inference/request via mcpl_answer,
  *   wake policy (held from-bot reply folded into the next wake / user turn),
- *   push/event origin → meta, channels/open + close via config and tools.
+ *   push/event origin → meta, channels/open + close via config and tools,
+ *   RFC-008 tool _meta passthrough and the bridge tools' declared classes.
  */
 import { spawn } from 'child_process'
 import { copyFileSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
+import { BRIDGE_TOOL_CLASSES, UNCLASSED_BRIDGE_TOOLS } from '../src/tool-classes'
 
 const ROOT = join(import.meta.dir, '..')
+// MCPL RFC-008 §4, written out here rather than imported so the module cannot widen it.
+const RFC008_VOCABULARY: readonly string[] = ['comms', 'memory', 'notes', 'files', 'shell', 'web', 'computer', 'media', 'body', 'control']
 let failures = 0
 const ok = (cond: boolean, label: string) => {
   console.log(`${cond ? 'PASS' : 'FAIL'}  ${label}`)
@@ -131,6 +135,39 @@ try {
   const names = tools.tools.map(t => t.name)
   ok(names.includes('toy__ping'), `proxied tool toy__ping listed (got: ${names.join(', ')})`)
   ok(names.includes('mcpl_status') && names.includes('mcpl_send') && names.includes('mcpl_answer'), 'bridge tools listed')
+
+  // ── RFC-008: _meta passthrough and bridge tool classes ──
+  {
+    const listed = (tools as { tools: Array<{ name: string; _meta?: Record<string, unknown> }> }).tools
+    const toyPing = listed.find(t => t.name === 'toy__ping')
+    ok(
+      Bun.deepEquals(toyPing?._meta, { 'mcpl/class': ['control'], 'toy/extra': { nested: [1, 'two'] } }, true),
+      `proxied tool keeps the upstream _meta, mcpl/class and unrelated keys alike (got ${JSON.stringify(toyPing?._meta)})`,
+    )
+    // Bridge tools are the unprefixed ones; proxied tools are always <prefix>__<tool>.
+    const bridge = listed.filter(t => !t.name.includes('__'))
+    const unaccounted: string[] = []
+    const wrong: string[] = []
+    for (const t of bridge) {
+      const declared = t._meta?.['mcpl/class']
+      if (Object.hasOwn(BRIDGE_TOOL_CLASSES, t.name)) {
+        const mapped = BRIDGE_TOOL_CLASSES[t.name]
+        const vocabOk = mapped.length > 0 && mapped.every(c => RFC008_VOCABULARY.includes(c))
+        if (!vocabOk || !Bun.deepEquals(declared, [...mapped], true) || UNCLASSED_BRIDGE_TOOLS.has(t.name)) wrong.push(`${t.name}=${JSON.stringify(declared)}`)
+      } else if (UNCLASSED_BRIDGE_TOOLS.has(t.name)) {
+        if (declared !== undefined) wrong.push(`${t.name} is meant to be unclassed but declares ${JSON.stringify(declared)}`)
+      } else unaccounted.push(t.name)
+    }
+    ok(bridge.length >= 6 && unaccounted.length === 0, `every bridge tool is classed or deliberately unclassed (unaccounted: ${unaccounted.join(', ') || 'none'})`)
+    ok(wrong.length === 0, `bridge tools declare their mapped classes, all from the RFC-008 vocabulary (wrong: ${wrong.join('; ') || 'none'})`)
+    const stale = [...Object.keys(BRIDGE_TOOL_CLASSES), ...UNCLASSED_BRIDGE_TOOLS].filter(n => !bridge.some(t => t.name === n))
+    ok(stale.length === 0, `class map names only tools the bridge has (stale: ${stale.join(', ') || 'none'})`)
+    // Tools that carry people's messages must say comms; any other class would let a host expose their arguments.
+    for (const n of ['mcpl_send', 'mcpl_open']) {
+      const declared = bridge.find(t => t.name === n)?._meta?.['mcpl/class']
+      ok(Array.isArray(declared) && declared.includes('comms'), `${n} carries people's messages and is classed comms (got ${JSON.stringify(declared)})`)
+    }
+  }
 
   const ping = (await request('tools/call', { name: 'toy__ping', arguments: { echo: 'x' } })) as { content: Array<{ text: string }> }
   ok(ping?.content?.[0]?.text === 'pong x', `toy__ping → "${ping?.content?.[0]?.text}"`)
@@ -354,6 +391,8 @@ try {
     ok(stderr2.includes('replica'), 'second instance detected primary and became replica')
     const tools2 = (await request2('tools/list', {})) as { tools: Array<{ name: string }> }
     ok(tools2.tools.some(t => t.name === 'toy__ping'), 'replica forwards tools/list to primary')
+    const replicaMeta = (tools2.tools as Array<{ name: string; _meta?: Record<string, unknown> }>).find(t => t.name === 'toy__ping')?._meta
+    ok(Bun.deepEquals(replicaMeta?.['mcpl/class'], ['control'], true), 'replica\'s forwarded tools/list keeps _meta')
     const ping2 = (await request2('tools/call', { name: 'toy__ping', arguments: { echo: 'via-replica' } })) as { content: Array<{ text: string }> }
     ok(ping2?.content?.[0]?.text === 'pong via-replica', `replica forwards tools/call (got "${ping2?.content?.[0]?.text}")`)
     ok(!stderr2.includes('toy MCPL server up'), 'replica dialed no MCPL servers of its own')

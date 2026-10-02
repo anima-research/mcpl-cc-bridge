@@ -11,6 +11,10 @@ adapter process is simultaneously:
    - `mcpl_open` / `mcpl_close` — `channels/open` / `channels/close` on a
      registered channel (subscribe to / leave its ordinary traffic)
    - `mcpl_answer` — resolve a held `inference/request`
+
+   A proxied tool keeps its server's `_meta` unchanged, so MCPL RFC-008 tool
+   classes (`mcpl/class`) reach the client; the bridge tools declare their own
+   (`src/tool-classes.ts`).
 2. **Channel provider** (`claude/channel`) — `push/event`, `channels/incoming`,
    and `inference/request` arrive as `<channel source="mcpl" ...>` messages that
    start a turn (wake authority included), subject to the per-server

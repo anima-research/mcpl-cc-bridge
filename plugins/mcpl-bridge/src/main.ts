@@ -19,6 +19,7 @@ import { homedir } from 'os'
 import { basename, dirname, join } from 'path'
 import { loadConfig, type ServerConfig } from './config'
 import { McplServerHandle, type IncomingDelivery } from './mcpl-host'
+import { withBridgeClass } from './tool-classes'
 import { WakeGate } from './wake'
 
 import { appendFileSync } from 'fs'
@@ -176,7 +177,10 @@ process.on('SIGHUP', () => {
   else log('SIGHUP ignored on a replica — signal the primary or call mcpl_reload')
 })
 
-const BRIDGE_TOOLS: Array<{ name: string; description: string; inputSchema: Record<string, unknown> }> = [
+type ToolDef = { name: string; description: string; inputSchema: Record<string, unknown>; _meta?: Record<string, unknown> }
+
+// Each declares its RFC-008 class in _meta (src/tool-classes.ts).
+const BRIDGE_TOOLS: ToolDef[] = [
   {
     name: 'mcpl_status',
     description: 'Show every bridged MCPL server: connection status, effective capability grant, enabled feature sets, registered channels, proxied tool count, pending inference requests.',
@@ -238,7 +242,9 @@ const BRIDGE_TOOLS: Array<{ name: string; description: string; inputSchema: Reco
       required: ['server', 'request_id', 'content'],
     },
   },
-]
+].map(withBridgeClass)
+
+const isPlainObject = (v: unknown): v is Record<string, unknown> => typeof v === 'object' && v !== null && !Array.isArray(v)
 
 function toolName(serverId: string, handle: McplServerHandle, raw: string): string {
   return `${handle.prefix}__${raw}`.replace(/[^a-zA-Z0-9_-]/g, '_')
@@ -261,6 +267,10 @@ async function listToolsImpl() {
         name: toolName(id, h, t.name),
         description: `[mcpl:${id}] ${t.description ?? t.name}`,
         inputSchema: (t.inputSchema as { type: 'object' }) ?? { type: 'object', properties: {} },
+        // The upstream tool's _meta rides through unchanged, every key — notably
+        // RFC-008's mcpl/class, which the host reads for policy. Only a non-object
+        // is dropped: it would fail the client's validation of the whole list.
+        ...(isPlainObject(t._meta) ? { _meta: t._meta } : {}),
       })
     }
   }
