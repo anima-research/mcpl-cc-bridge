@@ -188,7 +188,15 @@ triggers `channels/open`, so the conversation *between* mentions reaches the
 session instead of only the mentions. Pair it with `"wake": "chat"` and that
 ambient traffic is held for the next wake rather than waking per message. The
 open lasts the session (it joins the desired-open set); set `"openOnAddressed":
-false` to keep the closed-until-opened behaviour.
+false` to keep the closed-until-opened behaviour. Two caveats: what an open
+channel delivers is the server's choice — discord-mcpl also starts sending
+reactions, edits and deletes for it, and the `"chat"` preset holds none of
+those (reactions are tagged `chat:reaction`; edits and deletes are untagged),
+so on that server an auto-opened room wakes on them until the preset or the
+server's tagging catches up. And a push whose origin carries only the
+producer's native channel id is mapped to the registered channel through the
+descriptors' `address.channelId`; one that maps to nothing is delivered as
+before (and refused under `openChannelsOnly`).
 
 The strict form is `"openChannelsOnly": true`: the open set (`openChannels`
 plus anything opened with `mcpl_open` this session) becomes a whitelist, and a
