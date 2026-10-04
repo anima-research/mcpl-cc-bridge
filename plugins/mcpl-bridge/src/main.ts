@@ -370,12 +370,34 @@ deliverToSession = msg => {
     log(`[${msg.server}] held ${msg.kind} [${msg.meta.tags ?? 'no tags'}] — ${gate.heldCount} pending for the next wake`)
     return
   }
-  log(`[${msg.server}] wake ${msg.kind} [${msg.meta.tags ?? 'no tags'}] → notifications/claude/channel`)
   const meta: Record<string, string> = { server: msg.server, kind: msg.kind }
   for (const [k, v] of Object.entries(msg.meta)) {
     const key = k.replace(/[^a-zA-Z0-9_]/g, '_')
     if (v) meta[key] = v
   }
+  // A channel notification that lands inside a live turn is dropped by the
+  // harness (observed 2026-09-22 and 2026-09-29: `notifications/claude/channel`
+  // fired mid-turn and evaporated, and the seen-anchor then advanced over a
+  // message nobody read). So while a user turn is in flight, the wake is
+  // mirrored into the held ledger — the copy that provably survives — and the
+  // turn boundary re-fires it. The notification still goes out, marked, in
+  // case a future harness delivers mid-turn; the ledger is deliberately NOT
+  // folded into that doomed copy. Inference-requests are exempt: the server
+  // is blocked awaiting the answer, and late beats never (their mid-turn loss
+  // is a separate problem with its own shape).
+  if (currentInferenceId !== null && msg.kind !== 'inference-request' && gate) {
+    gate.deferWake(msg)
+    log(`[${msg.server}] wake ${msg.kind} [${msg.meta.tags ?? 'no tags'}] mid-turn — mirrored to the held ledger (${gate.heldCount} pending), boundary re-fires`)
+    meta.deferred = '1'
+    void mcp
+      .notification({
+        method: 'notifications/claude/channel',
+        params: { content: msg.text || '(empty message)', meta },
+      })
+      .catch(e => log(`channel push failed: ${e instanceof Error ? e.message : e}`))
+    return
+  }
+  log(`[${msg.server}] wake ${msg.kind} [${msg.meta.tags ?? 'no tags'}] → notifications/claude/channel`)
   // Anything held since the last wake rides in ahead of the message that woke
   // us — but not into an inference-request, which asks the model for a
   // completion on the server's behalf rather than opening a conversation.
@@ -462,6 +484,35 @@ let turnIndex = 0
 let currentInferenceId: string | null = null
 let conversationId = 'claude-code'
 
+// Wakes mirrored mid-turn re-fire shortly after the turn ends: by then the
+// session is idle, which is the one situation where a channel notification
+// reliably lands (and starts the turn that reads it). The delay lets a
+// user prompt racing the boundary win — its UserPromptSubmit flush already
+// carries the ledger, and the re-fire then finds wakePending cleared. If the
+// re-fire itself lands inside a wake-triggered turn (invisible here: those
+// turns run no UserPromptSubmit), the window is the same one that exists
+// today; this narrows the loss, it does not claim to end it.
+let wakeRefireTimer: ReturnType<typeof setTimeout> | null = null
+function scheduleWakeRefire(): void {
+  if (wakeRefireTimer) return
+  wakeRefireTimer = setTimeout(() => {
+    wakeRefireTimer = null
+    if (currentInferenceId !== null) return // a new user turn owns the drain
+    for (const [id, gate] of gates) {
+      if (!gate.wakePending) continue
+      const held = gate.flush(id)
+      if (!held) continue
+      log(`[${id}] re-firing deferred wake(s) at the turn boundary`)
+      void mcp
+        .notification({
+          method: 'notifications/claude/channel',
+          params: { content: held, meta: { server: id, kind: 'deferred-wake-refire' } },
+        })
+        .catch(e => log(`deferred-wake refire failed: ${e instanceof Error ? e.message : e}`))
+    }
+  }, 1_000)
+}
+
 async function handleHook(event: HookEvent): Promise<string> {
   const name = event.hook_event_name
   if (event.session_id) conversationId = event.session_id
@@ -500,6 +551,7 @@ async function handleHook(event: HookEvent): Promise<string> {
   if (name === 'Stop' && currentInferenceId) {
     for (const h of ready) h.lifecycle({ inferenceId: currentInferenceId, conversationId, turnIndex, phase: 'completed' })
     currentInferenceId = null
+    if ([...gates.values()].some(g => g.wakePending)) scheduleWakeRefire()
     return ''
   }
 
