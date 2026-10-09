@@ -95,7 +95,14 @@ export class McplServerHandle {
   /** Operator policy patterns; the effective grant is advertised ∩ this. */
   readonly policy: readonly string[]
 
-  status: 'connecting' | 'ready' | 'mcp-only' | 'disconnected' | 'closed' = 'disconnected'
+  status: 'connecting' | 'ready' | 'mcp-only' | 'disconnected' | 'disabled' | 'closed' = 'disconnected'
+  /** Why the latest connect attempt or connection failed; cleared by a good handshake. */
+  lastError: string | null = null
+  /** When the live connection finished its handshake (ms since epoch); null when not connected. */
+  connectedAt: number | null = null
+  /** The last lines a stdio server wrote to stderr since it was spawned — what
+   *  a hot reload that died on startup needs to show. */
+  stderrTail: string[] = []
   tools: McplTool[] = []
   channels = new Map<string, ChannelDescriptor>()
   /** Channels currently open on the live connection (channels/open succeeded this epoch). */
@@ -118,14 +125,23 @@ export class McplServerHandle {
   private conn: McplConnection | null = null
   private child: ChildProcess | null = null
   private epoch = 0
-  private closedByUs = false
+  /** close(): for good — the handle was replaced or its server removed. */
+  private retired = false
+  /** disable(): stopped until enable(). */
+  private paused = false
+  private reconnectTimer: ReturnType<typeof setTimeout> | null = null
+  /** enable / disable / restart take turns (see serialize). */
+  private lifecycleChain: Promise<unknown> = Promise.resolve()
+  private latestAttempt: Promise<void> = Promise.resolve()
+  /** Resolves when the latest spawned stdio child has exited and its stdio drained. */
+  private childClosed: Promise<void> = Promise.resolve()
   private backoffMs: number
   private readonly cb: HostCallbacks
   private pendingInference = new Map<string, PendingInference>()
   private manifestFetchAt = 0
   private isMcpl = false
 
-  constructor(id: string, cfg: ServerConfig, cb: HostCallbacks) {
+  constructor(id: string, cfg: ServerConfig, cb: HostCallbacks, opts: { disabled?: boolean } = {}) {
     this.id = id
     this.cfg = cfg
     this.prefix = cfg.toolPrefix ?? id
@@ -134,10 +150,44 @@ export class McplServerHandle {
     this.desiredOpen = new Set(cfg.openChannels ?? [])
     this.backoffMs = cfg.reconnectIntervalMs ?? 5000
     this.firstAttempt = new Promise<void>(r => (this.firstAttemptResolve = r))
+    if (opts.disabled) {
+      // Nothing will be attempted, so nothing should wait on an attempt.
+      this.paused = true
+      this.status = 'disabled'
+      this.firstAttemptResolve()
+    }
   }
 
   private get reconnectEnabled(): boolean {
     return this.cfg.reconnect ?? isWs(this.cfg.transport)
+  }
+
+  private get halted(): boolean {
+    return this.retired || this.paused
+  }
+
+  /** Stopped by disable() (or constructed disabled) and not since re-enabled. */
+  get disabled(): boolean {
+    return this.paused
+  }
+
+  /** The stdio server's process id; null for ws servers and when not running. */
+  get pid(): number | null {
+    return this.child?.pid ?? null
+  }
+
+  /** The most recent connect attempt — resolves once it settles, either way (status / lastError say which). */
+  get attempt(): Promise<void> {
+    return this.latestAttempt
+  }
+
+  /** A server that died on startup can close stdout before its last stderr
+   *  lines arrive: wait (bounded) for its process to finish closing so
+   *  `stderrTail` holds the whole crash report. */
+  async stderrSettled(maxMs = 1000): Promise<void> {
+    let timer: ReturnType<typeof setTimeout> | undefined
+    await Promise.race([this.childClosed, new Promise<void>(r => (timer = setTimeout(r, maxMs)))])
+    clearTimeout(timer)
   }
 
   private log(line: string) {
@@ -146,16 +196,91 @@ export class McplServerHandle {
 
   /** Non-blocking: failures schedule reconnect instead of throwing. */
   start(): void {
+    if (this.halted) {
+      this.firstAttemptResolve()
+      return
+    }
     void this.connectOnce()
   }
 
   close(): void {
-    this.closedByUs = true
+    this.retired = true
     this.teardown('closed')
   }
 
-  private teardown(status: 'disconnected' | 'closed'): void {
+  /**
+   * Run enable / disable / restart one at a time, in call order: a restart
+   * racing a disable must not interleave one's teardown with the other's dial.
+   * An op returns the connect attempt it started (if any) as `settled` instead
+   * of awaiting it, so the next op waits for a teardown, never for a handshake.
+   */
+  private serialize(op: () => Promise<{ settled?: Promise<void> } | void>): Promise<void> {
+    const run = this.lifecycleChain.then(op)
+    this.lifecycleChain = run.then(
+      () => {},
+      () => {},
+    )
+    return run.then(r => r?.settled)
+  }
+
+  /**
+   * Stop the server until enable(): connection closed, a stdio child reaped,
+   * tools withdrawn, pending inference refused, no reconnects. The host's own
+   * session state — the desired-open channel set — is kept, so enable()
+   * re-opens what was open.
+   */
+  disable(): Promise<void> {
+    return this.serialize(async () => {
+      if (this.halted) return
+      this.paused = true
+      const child = this.child
+      this.teardown('disabled')
+      await reap(child)
+    })
+  }
+
+  /** Start a disabled server. Resolves when its connect attempt settles. */
+  enable(): Promise<void> {
+    return this.serialize(async () => {
+      if (this.retired) throw new Error(`${this.id}: this handle was replaced; check mcpl_status`)
+      if (!this.paused) return
+      this.paused = false
+      this.status = 'disconnected'
+      this.backoffMs = this.cfg.reconnectIntervalMs ?? 5000
+      return { settled: this.connectOnce() }
+    })
+  }
+
+  /**
+   * Hot reload: tear the connection down and bring it back. A stdio server is
+   * killed (SIGTERM; SIGKILL after 3s) and respawned only once the old process
+   * has exited, so whatever was rebuilt on disk is what runs and a port the
+   * old one held is free again. A ws server is redialed. Full handshake, fresh
+   * grant, tools re-fetched; desired-open channels re-open when the server
+   * re-registers them. Resolves when the new connect attempt settles.
+   */
+  restart(): Promise<void> {
+    return this.serialize(async () => {
+      if (this.retired) throw new Error(`${this.id}: this handle was replaced; check mcpl_status`)
+      if (this.paused) throw new Error(`${this.id}: disabled; mcpl_enable starts it`)
+      const child = this.child
+      this.teardown('disconnected')
+      await reap(child)
+      if (this.halted) return // closed while the old process wound down
+      this.backoffMs = this.cfg.reconnectIntervalMs ?? 5000
+      return { settled: this.connectOnce() }
+    })
+  }
+
+  private teardown(status: 'disconnected' | 'disabled' | 'closed'): void {
     this.epoch++ // invalidate any in-flight handshake/loop
+    // A reconnect already scheduled must not fire into whatever comes next —
+    // it would dial a second connection beside the live one and leak it.
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer)
+      this.reconnectTimer = null
+    }
+    this.connectedAt = null
     // Transport-epoch boundary: revoke all authority from the dead epoch (SPEC §5.3).
     this.grant = []
     this.featureSetsEnabled = []
@@ -181,16 +306,21 @@ export class McplServerHandle {
   }
 
   private scheduleReconnect(): void {
-    if (this.closedByUs || !this.reconnectEnabled) return
+    if (this.halted || !this.reconnectEnabled) return
+    if (this.reconnectTimer) clearTimeout(this.reconnectTimer)
     const max = this.cfg.reconnectMaxIntervalMs ?? 300_000
     const jitter = 0.75 + Math.random() * 0.5 // ±25%
     const delay = Math.min(this.backoffMs, max) * jitter
     this.backoffMs = Math.min(this.backoffMs * 2, max)
     this.log(`reconnect in ${Math.round(delay / 1000)}s`)
-    setTimeout(() => void this.connectOnce(), delay)
+    this.reconnectTimer = setTimeout(() => {
+      this.reconnectTimer = null
+      void this.connectOnce()
+    }, delay)
   }
 
-  private async dial(): Promise<McplConnection> {
+  private async dial(): Promise<{ conn: McplConnection; child: ChildProcess | null; stderrTail: string[]; closed: Promise<void> }> {
+    const stderrTail: string[] = []
     if (isWs(this.cfg.transport)) {
       const { default: WebSocket } = await import('ws')
       const url = resolveUrl(this.cfg.transport) // credential resolved per-dial
@@ -206,7 +336,7 @@ export class McplServerHandle {
           reject(e)
         })
       })
-      return McplConnection.fromWebSocket(ws as unknown as Parameters<typeof McplConnection.fromWebSocket>[0])
+      return { conn: McplConnection.fromWebSocket(ws as unknown as Parameters<typeof McplConnection.fromWebSocket>[0]), child: null, stderrTail, closed: Promise.resolve() }
     }
     const t = this.cfg.transport as StdioTransportConfig
     const child = spawn(t.command, t.args ?? [], {
@@ -214,40 +344,78 @@ export class McplServerHandle {
       env: { ...process.env, ...t.env },
       stdio: ['pipe', 'pipe', 'pipe'],
     })
-    child.stderr?.on('data', (d: Buffer) => this.log(`stderr: ${d.toString().trimEnd()}`))
-    this.child = child
-    return McplConnection.fromStreams(child.stdout!, child.stdin!)
+    const keep = (line: string) => {
+      stderrTail.push(line)
+      if (stderrTail.length > STDERR_TAIL_LINES) stderrTail.splice(0, stderrTail.length - STDERR_TAIL_LINES)
+    }
+    child.stderr?.on('data', (d: Buffer) => {
+      const s = d.toString().trimEnd()
+      this.log(`stderr: ${s}`)
+      for (const line of s.split('\n')) keep(line)
+    })
+    const conn = McplConnection.fromStreams(child.stdout!, child.stdin!)
+    let markClosed!: () => void
+    const closed = new Promise<void>(r => (markClosed = r))
+    // A command that cannot be spawned (ENOENT, EACCES) is reported here, not
+    // thrown; unheard, the 'error' event would take the whole bridge down.
+    // Its pipes may never end, so close the connection ourselves — otherwise
+    // the handshake sits out its full request timeout before failing.
+    child.on('error', e => {
+      this.log(`spawn ${t.command}: ${e.message}`)
+      keep(`[spawn failed: ${e.message}]`)
+      if (child.pid === undefined) {
+        conn.close()
+        markClosed()
+      }
+    })
+    // Same for a write into a server that already died (EPIPE): the
+    // connection's close path reports it; the stream error must not throw.
+    child.stdin?.on('error', e => this.log(`stdin: ${e.message}`))
+    // 'close', not 'exit': it fires after stdio drains, so the marker lands after the last stderr line.
+    child.once('close', (code, signal) => {
+      keep(`[exited ${signal ?? `code ${code}`}]`)
+      markClosed()
+    })
+    return { conn, child, stderrTail, closed }
   }
 
-  private async connectOnce(): Promise<void> {
-    try {
-      await this.connectOnceInner()
-    } finally {
-      this.firstAttemptResolve()
-    }
+  private connectOnce(): Promise<void> {
+    const attempt = this.connectOnceInner().finally(() => this.firstAttemptResolve())
+    this.latestAttempt = attempt
+    return attempt
   }
 
   private async connectOnceInner(): Promise<void> {
-    if (this.closedByUs) return
+    if (this.halted) return
     const myEpoch = ++this.epoch
     this.status = 'connecting'
-    let conn: McplConnection
+    let dialed: Awaited<ReturnType<McplServerHandle['dial']>>
     try {
-      conn = await this.dial()
+      dialed = await this.dial()
     } catch (e) {
-      this.log(`connect failed: ${e instanceof Error ? e.message : e}`)
+      if (myEpoch !== this.epoch) return // superseded while dialing (restart / disable / close): not ours to report or retry
+      this.lastError = `connect failed: ${e instanceof Error ? e.message : e}`
+      this.log(this.lastError)
       this.status = 'disconnected'
       this.scheduleReconnect()
       return
     }
+    const { conn, child } = dialed
     if (myEpoch !== this.epoch) {
       conn.close()
+      try {
+        child?.kill()
+      } catch {}
       return
     }
     this.conn = conn
+    this.child = child
+    this.stderrTail = dialed.stderrTail
+    this.childClosed = dialed.closed
     conn.on('error', err => this.log(`conn error: ${err.message}`))
     conn.on('close', () => {
       if (myEpoch !== this.epoch) return
+      this.lastError = 'connection closed'
       this.log('connection closed')
       this.teardown('disconnected')
       this.scheduleReconnect()
@@ -258,11 +426,15 @@ export class McplServerHandle {
     } catch (e) {
       this.log(`handshake failed: ${e instanceof Error ? e.message : e}`)
       if (myEpoch === this.epoch) {
+        this.lastError = `handshake failed: ${e instanceof Error ? e.message : e}`
         this.teardown('disconnected')
         this.scheduleReconnect()
       }
       return
     }
+    if (myEpoch !== this.epoch) return
+    this.lastError = null
+    this.connectedAt = Date.now()
     this.backoffMs = this.cfg.reconnectIntervalMs ?? 5000
     void this.pullLoop(conn, myEpoch)
   }
@@ -331,13 +503,17 @@ export class McplServerHandle {
   }
 
   private async refreshTools(conn: McplConnection): Promise<void> {
+    let tools: McplTool[] = []
     try {
       const r = (await conn.sendRequest('tools/list', {})) as { tools?: McplTool[] }
-      this.tools = r?.tools ?? []
+      tools = r?.tools ?? []
     } catch (e) {
-      this.tools = []
       this.log(`tools/list failed: ${e instanceof Error ? e.message : e}`)
     }
+    // A connection torn down while the list was in flight (restart, disable)
+    // must not repopulate the tools of the one that replaced it.
+    if (conn !== this.conn) return
+    this.tools = tools
     this.cb.toolsChanged()
   }
 
@@ -571,8 +747,7 @@ export class McplServerHandle {
    * the server handed back with the open (oldest first).
    */
   async openChannel(ref: string, historyLimit = 0): Promise<{ channelId: string; label: string; history: IncomingChannelMessage[]; truncated: boolean; open: boolean }> {
-    const conn = this.conn
-    if (!conn || conn.isClosed) throw new Error(`${this.id}: not connected`)
+    const conn = this.liveConn()
     if (!granted(this.grant, 'channels.lifecycle')) throw new Error(`${this.id}: channels.lifecycle not granted (add it to the server's grant; the server must advertise it too)`)
     const channelId = this.resolveChannel(ref)
     const desc = this.channels.get(channelId)!
@@ -623,8 +798,7 @@ export class McplServerHandle {
   }
 
   async closeChannel(ref: string): Promise<{ channelId: string; label: string; closed: boolean }> {
-    const conn = this.conn
-    if (!conn || conn.isClosed) throw new Error(`${this.id}: not connected`)
+    const conn = this.liveConn()
     if (!granted(this.grant, 'channels.lifecycle')) throw new Error(`${this.id}: channels.lifecycle not granted`)
     // An id we no longer know (channel removed) may still sit in desiredOpen —
     // let it through so the intent can be cleared; a label must resolve.
@@ -635,6 +809,14 @@ export class McplServerHandle {
     this.openChannels.delete(channelId)
     const r = (await conn.sendRequest('channels/close', { channelId })) as ChannelsCloseResult
     return { channelId, label: this.labelOf(channelId) || channelId, closed: r?.closed === true }
+  }
+
+  /** The live connection, or an error that says why there is none. */
+  private liveConn(): McplConnection {
+    const conn = this.conn
+    if (conn && !conn.isClosed) return conn
+    if (this.paused) throw new Error(`${this.id}: disabled (mcpl_enable starts it)`)
+    throw new Error(`${this.id}: not connected (${this.status}${this.lastError ? `: ${this.lastError}` : ''})`)
   }
 
   /** Open, or meant to be: live-open this epoch, or in the desired-open set
@@ -743,14 +925,12 @@ export class McplServerHandle {
   // ── Host → Server surface ──
 
   async callTool(name: string, args: unknown): Promise<unknown> {
-    const conn = this.conn
-    if (!conn || conn.isClosed) throw new Error(`${this.id}: not connected`)
+    const conn = this.liveConn()
     return conn.sendRequest('tools/call', { name, arguments: args ?? {} }, 120_000)
   }
 
   async publish(ref: string, text: string): Promise<unknown> {
-    const conn = this.conn
-    if (!conn || conn.isClosed) throw new Error(`${this.id}: not connected`)
+    const conn = this.liveConn()
     if (!granted(this.grant, 'channels.publish')) throw new Error(`${this.id}: channels.publish not granted`)
     const channelId = this.resolveChannel(ref)
     return conn.sendRequest('channels/publish', {
@@ -804,6 +984,25 @@ export class McplServerHandle {
       conn.sendNotification('inference/lifecycle', params)
     } catch {}
   }
+}
+
+const STDERR_TAIL_LINES = 20
+
+/**
+ * Wait for a child that teardown already signalled (SIGTERM) to exit; SIGKILL
+ * it after `graceMs`. A respawn must not start beside the old process — it
+ * may still hold a port, a lock, or a store the new one needs.
+ */
+async function reap(child: ChildProcess | null, graceMs = 3000): Promise<void> {
+  // pid undefined: the spawn itself failed — there is no process to wait for.
+  if (!child || child.pid === undefined || child.exitCode !== null || child.signalCode !== null) return
+  const exited = new Promise<'exited'>(r => child.once('exit', () => r('exited')))
+  const after = (ms: number) => new Promise<'timeout'>(r => setTimeout(() => r('timeout'), ms).unref?.())
+  if ((await Promise.race([exited, after(graceMs)])) === 'exited') return
+  try {
+    child.kill('SIGKILL')
+  } catch {}
+  await Promise.race([exited, after(1000)])
 }
 
 function normalizeFeatureSets(

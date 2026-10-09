@@ -63,6 +63,32 @@
       ],
       "inferenceRequest": "deny",
       "openChannelsOnly": true
+    },
+    "toyoff": {
+      "transport": {
+        "command": "bun",
+        "args": [
+          "run",
+          "test/toy-server.ts"
+        ]
+      },
+      "disabled": true
+    },
+    "toycrash": {
+      "transport": {
+        "command": "bun",
+        "args": [
+          "-e",
+          "console.error('toycrash: cannot find module ./dist/index.js'); process.exit(3)"
+        ]
+      },
+      "disabled": true
+    },
+    "toynocmd": {
+      "transport": {
+        "command": "/nonexistent/mcpl-server-binary"
+      },
+      "disabled": true
     }
   }
 }

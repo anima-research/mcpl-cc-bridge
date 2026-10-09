@@ -55,6 +55,19 @@ const MCPL_CAPS = {
   },
 }
 
+// "Build" baked in at spawn, the way a compiled server's code is: read once at
+// startup from $TOY_BUILD_FILE, never again. Only a respawn sees a new value —
+// which is what the bridge's hot reload has to deliver.
+const BUILD = (() => {
+  const f = process.env.TOY_BUILD_FILE
+  if (!f) return null
+  try {
+    return require('fs').readFileSync(f, 'utf8').trim() as string
+  } catch {
+    return 'none'
+  }
+})()
+
 let policyReady = false
 let demoStarted = false
 
@@ -191,6 +204,9 @@ function handle(msg: Json) {
             description: 'Replies pong (toy MCPL tool).',
             inputSchema: { type: 'object', properties: { echo: { type: 'string' } } },
           },
+          ...(BUILD !== null
+            ? [{ name: 'build', description: 'The build this process started with (toy).', inputSchema: { type: 'object', properties: {} } }]
+            : []),
         ],
       })
       return
@@ -199,6 +215,8 @@ function handle(msg: Json) {
       if (name === 'ping') {
         const echo = (params.arguments as Json | undefined)?.echo
         respond(id, { content: [{ type: 'text', text: `pong${echo ? ` ${echo}` : ''}` }] })
+      } else if (name === 'build' && BUILD !== null) {
+        respond(id, { content: [{ type: 'text', text: `build ${BUILD} pid ${process.pid}` }] })
       } else respondError(id, -32602, `unknown tool ${name}`)
       return
     }

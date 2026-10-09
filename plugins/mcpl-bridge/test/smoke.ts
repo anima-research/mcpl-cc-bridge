@@ -6,7 +6,8 @@
  *   hook socket (beforeInference → additionalContext, ungranted injection dropped),
  *   channels/publish via mcpl_send, inference/request via mcpl_answer,
  *   wake policy (held from-bot reply folded into the next wake / user turn),
- *   push/event origin → meta, channels/open + close via config and tools.
+ *   push/event origin → meta, channels/open + close via config and tools,
+ *   server lifecycle (config "disabled", mcpl_enable / mcpl_disable, hot reload).
  */
 import { spawn } from 'child_process'
 import { copyFileSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'fs'
@@ -26,12 +27,16 @@ const SESSION_KEY = `smoke-${process.pid}`
 const TMP = mkdtempSync(join(tmpdir(), 'mcpl-smoke-'))
 const CONFIG_COPY = join(TMP, 'config.json')
 copyFileSync(join(ROOT, 'test', 'config.json'), CONFIG_COPY)
+// The toy servers' "build": read once at spawn, so only a respawn sees a new one.
+const BUILD_FILE = join(TMP, 'build')
+writeFileSync(BUILD_FILE, 'v1')
 process.on('exit', () => rmSync(TMP, { recursive: true, force: true }))
 const CHILD_ENV = {
   ...process.env,
   CLAUDE_CODE_SESSION_ID: SESSION_KEY,
   MCPL_BRIDGE_CONFIG: CONFIG_COPY,
   TOY_INFERENCE: '1',
+  TOY_BUILD_FILE: BUILD_FILE,
 }
 
 const child = spawn('bun', ['run', 'src/main.ts'], {
@@ -297,6 +302,102 @@ try {
     ok(still.tools.some(t => t.name === 'toy__ping') && still.tools.some(t => t.name === 'toy2__ping'), 'reload: fleet intact after rejected config')
     writeFileSync(CONFIG_COPY, JSON.stringify(cfg))
     await new Promise(r => setTimeout(r, 1000))
+  }
+
+  // ── Server lifecycle: config "disabled", mcpl_enable / mcpl_disable, hot reload ──
+  {
+    type R = { isError?: boolean; content?: Array<{ text: string }> }
+    const call = async (name: string, a: Record<string, unknown> = {}) => (await request('tools/call', { name, arguments: a })) as R
+    const out = (r: R) => r?.content?.[0]?.text ?? ''
+    const listed = async () => ((await request('tools/list', {})) as { tools: Array<{ name: string }> }).tools.map(t => t.name)
+    const statusLine = async (id: string) => out(await call('mcpl_status')).split('\n').find(l => l.startsWith(`${id}: `)) ?? ''
+    const pidOf = (line: string) => Number(/\bpid=(\d+)/.exec(line)?.[1] ?? 0)
+    const alive = (pid: number) => {
+      try {
+        process.kill(pid, 0)
+        return true
+      } catch {
+        return false
+      }
+    }
+    const waitFor = async (pred: () => Promise<boolean>, ms = 5000) => {
+      for (const end = Date.now() + ms; Date.now() < end; await new Promise(r => setTimeout(r, 200))) if (await pred()) return true
+      return false
+    }
+
+    // The watcher step above may not have landed (FSEvents can lag badly): start from the file as written.
+    await call('mcpl_reload')
+    await new Promise(r => setTimeout(r, 1500))
+
+    // Configured with "disabled": true — listed, not started.
+    ok(!(await listed()).some(n => n.startsWith('toyoff__')), 'config-disabled server proxies no tools')
+    const offLine = await statusLine('toyoff')
+    ok(/^toyoff: disabled \(config/.test(offLine), `mcpl_status lists the config-disabled server ("${offLine}")`)
+    const offCall = await call('toyoff__ping')
+    ok(offCall.isError === true && /server toyoff is disabled/.test(out(offCall)), `a call into a disabled server says so: "${out(offCall)}"`)
+
+    // mcpl_enable: a session-scoped start.
+    const en = await call('mcpl_enable', { server: 'toyoff' })
+    ok(!en.isError && /^toyoff: enabled — ready, \d+ tools?/.test(out(en)) && /this session only/.test(out(en)), `mcpl_enable started it: "${out(en)}"`)
+    ok((await listed()).includes('toyoff__ping'), "enabled server's tools listed")
+    ok(out(await call('toyoff__ping', { echo: 'on' })) === 'pong on', 'enabled server callable')
+    ok(/enabled this session \(config: disabled\)/.test(await statusLine('toyoff')), 'mcpl_status marks the session override')
+    ok(/already enabled/.test(out(await call('mcpl_enable', { server: 'toyoff' }))), 'enabling an enabled server is a no-op')
+
+    // mcpl_disable: process stopped, tools withdrawn; on a config-disabled server the override just goes.
+    const toy2Pid = pidOf(await statusLine('toy2'))
+    const dis = await call('mcpl_disable', { server: 'toy2, toyoff' })
+    ok(/^toy2: disabled — \d+ tools? withdrawn.*this session only/m.test(out(dis)), `mcpl_disable toy2: "${out(dis).split('\n')[0]}"`)
+    ok(/^toyoff: disabled — /m.test(out(dis)) && !/toyoff: .*this session only/.test(out(dis)), 'disabling a config-disabled server drops the override (back to the config)')
+    ok(!(await listed()).some(n => n.startsWith('toy2__') || n.startsWith('toyoff__')), "disabled servers' tools withdrawn")
+    ok(toy2Pid > 0 && !alive(toy2Pid), `disabled stdio server's process is gone (pid ${toy2Pid})`)
+    ok(/^toy2: disabled \(this session/.test(await statusLine('toy2')), 'mcpl_status says disabled by this session')
+    await call('mcpl_reload')
+    ok(/^toy2: disabled \(this session/.test(await statusLine('toy2')), 'a config reload does not undo a session override')
+    const en2 = await call('mcpl_enable', { server: 'toy2' })
+    ok(/^toy2: enabled — ready/.test(out(en2)) && !/this session only/.test(out(en2)), `re-enabled toy2, override cleared: "${out(en2)}"`)
+    ok((await listed()).includes('toy2__ping'), "re-enabled server's tools are back")
+
+    // Hot reload: the respawn runs the new build; a channel opened this session survives it.
+    ok(out(await call('toygate__build')).startsWith('build v1'), 'toygate runs build v1')
+    await call('mcpl_open', { server: 'toygate', channel_id: 'Toy Lobby' })
+    writeFileSync(BUILD_FILE, 'v2')
+    ok(out(await call('toygate__build')).startsWith('build v1'), 'a running server keeps its build until respawned')
+    const gatePid = pidOf(await statusLine('toygate'))
+    const hot = await call('mcpl_reload', { server: 'toygate' })
+    ok(!hot.isError && /^toygate: reloaded — ready, \d+ tools?, pid \d+ \(pid \d+ → \d+\)$/m.test(out(hot)), `mcpl_reload server=toygate: "${out(hot).split('\n').slice(1).join(' | ')}"`)
+    ok(gatePid > 0 && !alive(gatePid), `old toygate process reaped before the respawn (pid ${gatePid})`)
+    ok(out(await call('toygate__build')).startsWith('build v2'), 'hot-reloaded server runs the new build')
+    ok(await waitFor(async () => /toygate: .*open=\[Toy Lobby\]/.test(await statusLine('toygate'))), 'channel opened this session is re-opened after the hot reload')
+    const all = await call('mcpl_reload', { server: '*' })
+    const reloadedIds = out(all).split('\n').slice(1).map(l => l.split(':')[0])
+    ok(!all.isError && reloadedIds.includes('toy') && reloadedIds.includes('toy2') && reloadedIds.includes('toygate') && !reloadedIds.includes('toyoff'), `server="*" reloads every enabled server, no disabled one (${reloadedIds.join(', ')})`)
+    ok(/toyoff: disabled — not reloaded/.test(out(await call('mcpl_reload', { server: 'toyoff' }))), 'hot reload of a disabled server points at mcpl_enable')
+    const bogus = await call('mcpl_reload', { server: 'nosuch' })
+    ok(bogus.isError === true && /unknown server: nosuch \(configured: /.test(out(bogus)), `unknown server id rejected: "${out(bogus).split('\n').pop()}"`)
+
+    // A server that dies on startup: the failure and its stderr come back in the result.
+    const crash = await call('mcpl_enable', { server: 'toycrash' })
+    ok(crash.isError === true && /toycrash: enabled — disconnected/.test(out(crash)) && /cannot find module/.test(out(crash)) && /\[exited code 3\]/.test(out(crash)), `crash on startup reported with its stderr: "${out(crash).replace(/\n\s*/g, ' | ')}"`)
+    const nocmd = await call('mcpl_enable', { server: 'toynocmd' })
+    ok(nocmd.isError === true && /toynocmd: enabled — disconnected/.test(out(nocmd)), `unspawnable command reported, not fatal: "${out(nocmd).replace(/\n\s*/g, ' | ')}"`)
+    ok(/^toy: ready/m.test(out(await call('mcpl_status'))), 'bridge still serving after the failed spawns')
+    await call('mcpl_disable', { server: 'toycrash,toynocmd' })
+
+    // Flipping "disabled" in the config switches a server on or off in place.
+    const cfgL = JSON.parse(readFileSync(CONFIG_COPY, 'utf8')) as { servers: Record<string, Record<string, unknown>> }
+    delete cfgL.servers.toyoff.disabled
+    writeFileSync(CONFIG_COPY, JSON.stringify(cfgL))
+    // Named in the same call: the reload's own start is awaited and reported, not restarted on top.
+    const flipOn = out(await call('mcpl_reload', { server: 'toyoff' }))
+    ok(/ enabled \[toyoff\]/.test(flipOn) && /changed \[—\]/.test(flipOn), `"disabled" removed → enabled in place: "${flipOn.split('\n')[0].slice(flipOn.indexOf('added'))}"`)
+    ok(/^toyoff: reconnected by the config change — ready/m.test(flipOn), `hot reload named with the flip waits on the reload's own start: "${flipOn.split('\n')[1]}"`)
+    ok(await waitFor(async () => (await listed()).includes('toyoff__ping')), 'config-enabled server proxied its tools')
+    cfgL.servers.toyoff.disabled = true
+    writeFileSync(CONFIG_COPY, JSON.stringify(cfgL))
+    const flipOff = out(await call('mcpl_reload'))
+    ok(/ disabled \[toyoff\]/.test(flipOff), `"disabled": true → stopped in place: "${flipOff.slice(flipOff.indexOf('added'))}"`)
+    ok(!(await listed()).includes('toyoff__ping'), 'config-disabled server withdrew its tools')
   }
 
   // ── Second instance (CC double-spawn) becomes a forwarding replica ──
