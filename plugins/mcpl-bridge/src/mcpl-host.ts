@@ -41,7 +41,7 @@ import {
 //   Re-sync: cp <mcpl-core-ts>/src/*.ts src/vendor/mcpl-core/
 import { ERR, computeGrant, expandTags, granted, methodCapability } from './grants'
 import { DEFAULT_GRANT, isWs, resolveUrl, type ServerConfig, type StdioTransportConfig } from './config'
-import { ChannelRefError, ChannelRegistry, buildLabelView, norm, resolveChannelRef, type LabelView } from './channel-labels'
+import { ChannelRefError, ChannelRegistry, buildLabelView, isAddressableId, norm, resolveChannelRef, type LabelView } from './channel-labels'
 
 export type McplTool = { name: string; description?: string; inputSchema?: unknown; _meta?: Record<string, unknown> }
 
@@ -435,6 +435,8 @@ export class McplServerHandle {
         // Per-descriptor authorization; itemized results are mandatory (§14.5).
         const results = incoming.map(d => {
           if (!d || typeof d.id !== 'string' || !d.id) return { id: String(d?.id ?? ''), accepted: false, reason: 'invalid descriptor' }
+          // An id must read back as itself when printed (id:<id> is the escape every label falls back to).
+          if (!isAddressableId(d.id)) return { id: d.id, accepted: false, reason: 'channel id has leading/trailing whitespace or control characters' }
           this.channels.set(d.id, d)
           return { id: d.id, accepted: true }
         })

@@ -155,11 +155,16 @@ test('labels are one printable line', () => {
 })
 
 test('property: across random comings and goings, every printed label names its channel or errs — never another channel', () => {
+  // mulberry32: exact 32-bit integer math (a float LCG loses the low bits that `% n` uses).
   let seed = 7
   const rand = (n: number) => {
-    seed = (seed * 1103515245 + 12345) % 2147483648
-    return seed % n
+    seed = (seed + 0x6d2b79f5) | 0
+    let t = Math.imul(seed ^ (seed >>> 15), 1 | seed)
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t
+    return ((t ^ (t >>> 14)) >>> 0) % n
   }
+  // The run must actually reach the cases it exists for.
+  const reached = { threeChannels: false, caseOnlyIds: false, idEscapeLabel: false, printedTurnedAmbiguous: false }
   const pool = ['general', 'General', 'general (A)', 'general (a)', 'general (x:1)', 'x:1', 'id:x:1', '#general', 'lobby', 'lobby (East)', 'Lobby (east)', 'x:2']
   const idPool = ['x:1', 'x:2', 'x:3', 'X:1', 'a', 'A', 'general', 'lobby']
   for (let run = 0; run < 40; run++) {
@@ -169,9 +174,12 @@ test('property: across random comings and goings, every printed label names its 
       const id = idPool[rand(idPool.length)]
       if (h.channels.has(id) && rand(3) === 0) h.channels.delete(id)
       else h.channels.set(id, { id, type: 'chat', direction: 'bidirectional', label: pool[rand(pool.length)] })
+      if (h.channels.size >= 3) reached.threeChannels = true
+      if ((h.channels.has('x:1') && h.channels.has('X:1')) || (h.channels.has('a') && h.channels.has('A'))) reached.caseOnlyIds = true
       for (const cid of h.channels.keys()) {
         const l = h.labelOf(cid)
         expect(h.resolveChannel(l)).toBe(cid) // the current label works
+        if (l.startsWith('id:')) reached.idEscapeLabel = true
         printed.push([cid, l])
       }
       for (const [cid, l] of printed) {
@@ -181,10 +189,20 @@ test('property: across random comings and goings, every printed label names its 
           got = h.resolveChannel(l)
         } catch (e) {
           expect(String((e as Error).message)).toMatch(/ambiguous/) // a remembered form may become ambiguous…
+          reached.printedTurnedAmbiguous = true
           continue
         }
         expect(got).toBe(cid) // …but never names another channel
       }
     }
   }
+  expect(reached).toEqual({ threeChannels: true, caseOnlyIds: true, idEscapeLabel: true, printedTurnedAmbiguous: true })
+})
+
+test('ids that would not read back as themselves are refused (greptile: `a` vs `a `)', () => {
+  const h = handleWith({ id: 'a', label: 'General' })
+  for (const bad of ['a ', ' a', 'a\n', 'x\u0007y', '']) {
+    expect(() => h.channels.set(bad, { id: bad, type: 'chat', direction: 'bidirectional', label: 'General (a )' })).toThrow(/unaddressable channel id/)
+  }
+  expect(h.resolveChannel(h.labelOf('a'))).toBe('a')
 })
