@@ -42,7 +42,7 @@ import {
 import { ERR, computeGrant, expandTags, granted, methodCapability } from './grants'
 import { holdsAmbient } from './wake'
 import { DEFAULT_GRANT, isWs, resolveUrl, type ServerConfig, type StdioTransportConfig } from './config'
-import { ChannelRefError, ChannelRegistry, buildLabelView, resolveChannelRef, type LabelView } from './channel-labels'
+import { ChannelRefError, ChannelRegistry, buildLabelView, norm, resolveChannelRef, type LabelView } from './channel-labels'
 
 export type McplTool = { name: string; description?: string; inputSchema?: unknown; _meta?: Record<string, unknown> }
 
@@ -103,6 +103,10 @@ export class McplServerHandle {
   tools: McplTool[] = []
   channels = new ChannelRegistry()
   private labelCache: { version: number; view: LabelView } | null = null
+  /** Every display label (normalized) each channel id has been shown with —
+   *  kept across reconnects so a reference printed earlier never silently
+   *  names a different channel later (see channel-labels.ts). */
+  private shownLabels = new Map<string, Set<string>>()
   /** Channels currently open on the live connection (channels/open succeeded this epoch). */
   openChannels = new Set<string>()
   /** Desired-open state: config `openChannels` plus mcpl_open/mcpl_close during the session.
@@ -685,7 +689,14 @@ export class McplServerHandle {
   /** Display labels for the registered set, recomputed when it changes (see channel-labels.ts). */
   private get labelView(): LabelView {
     if (!this.labelCache || this.labelCache.version !== this.channels.version) {
-      this.labelCache = { version: this.channels.version, view: buildLabelView(this.channels) }
+      const view = buildLabelView(this.channels, this.shownLabels)
+      for (const [id, l] of view.labels) {
+        if (l.startsWith('id:')) continue // the escape needs no memory
+        let seen = this.shownLabels.get(id)
+        if (!seen) this.shownLabels.set(id, (seen = new Set()))
+        seen.add(norm(l))
+      }
+      this.labelCache = { version: this.channels.version, view }
     }
     return this.labelCache.view
   }

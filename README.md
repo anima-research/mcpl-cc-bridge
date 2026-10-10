@@ -24,14 +24,16 @@ adapter process is simultaneously:
    else.
 
    Labels are **disambiguated actively** so that rule never strands a channel:
-   the server's label is shown as-is unless the reference it prints would also
-   answer for another channel (an exact duplicate, a bare `general` beside
-   `general (Guild)`, a label equal to another channel's id), in which case the
-   channel is shown with its id appended — `general (discord:1234)`. A label
-   beginning with `id:` is shown with a leading `#`. Display labels follow the
-   registered set: a channel can gain a qualifier when a look-alike registers,
-   and the form it printed before then is an ambiguity error, never a delivery
-   to the other room.
+   the server's label is shown as-is unless it would also answer for another
+   channel (an exact duplicate, a bare `general` beside `general (Guild)`, a
+   label equal to another channel's id), in which case the channel is shown
+   with its id appended — `general (discord:1234)` — or, if even that is
+   taken (ids differing only in case), as the escape `id:<id>`. A label
+   beginning with `id:` is shown with a leading `#`; control characters and
+   line breaks collapse to spaces. Display labels follow the registered set,
+   and a channel keeps answering to every label it was ever shown with, so a
+   form printed before a look-alike registered still names its channel — or
+   is an ambiguity error — and is never a delivery to the other room.
    - `mcpl_answer` — resolve a held `inference/request`
 
    A proxied tool keeps its server's `_meta` unchanged, so MCPL RFC-008 tool
