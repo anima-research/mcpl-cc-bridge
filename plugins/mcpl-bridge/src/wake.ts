@@ -44,6 +44,19 @@ export function resolveWakePolicy(cfg: WakeConfig | undefined): WakePolicy | nul
   return cfg
 }
 
+/**
+ * Does this policy hold a channel's ordinary traffic (chat:ambient) instead of
+ * waking on it — for human, bot and untyped authors alike? Decides whether
+ * auto-opening a channel is safe by default: under a policy that wakes on
+ * ambient, one open would mean a wake per message.
+ */
+export function holdsAmbient(cfg: WakeConfig | undefined): boolean {
+  const gate = new WakeGate(cfg)
+  return [[], ['chat:from-human'], ['chat:from-bot']].every(
+    extra => gate.decide({ server: '', kind: 'channel-message', text: '', meta: { tags: ['chat:ambient', ...extra].join(' ') } }) === 'hold',
+  )
+}
+
 export type HeldDelivery = { delivery: IncomingDelivery; heldAt: string }
 
 const DEFAULT_HOLD_CAP = 50

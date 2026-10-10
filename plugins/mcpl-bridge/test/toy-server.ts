@@ -143,6 +143,18 @@ async function startDemo() {
         tags: ['chat:mention', 'chat:from-human'],
       }).then(r => log(`push(native) result: ${JSON.stringify(r)}`))
     }, 1900)
+    // A DM naming no channel (the author is the only routing fact): admitted
+    // through dmAllowlist by author id even in whitelist mode.
+    setTimeout(() => {
+      void request('push/event', {
+        featureSet: 'toy',
+        eventId: 'evt-dm',
+        timestamp: new Date().toISOString(),
+        origin: { source: 'toy', messageId: 'toy-m6', authorId: 'u2', authorName: 'toyhuman' },
+        payload: { content: [{ type: 'text', text: 'toy dm from toyhuman' }] },
+        tags: ['chat:dm', 'chat:from-human'],
+      }).then(r => log(`push(dm) result: ${JSON.stringify(r)}`))
+    }, 2000)
     setTimeout(() => {
       void request('channels/incoming', { messages: [botReply('toy-m4', 'bot echo 2')] }).then(r => log(`incoming(bot2) result: ${JSON.stringify(r)}`))
     }, 2100)
@@ -203,6 +215,8 @@ function handle(msg: Json) {
             name: 'ping',
             description: 'Replies pong (toy MCPL tool).',
             inputSchema: { type: 'object', properties: { echo: { type: 'string' } } },
+            // RFC-008 class plus an unrelated key; the bridge must pass both through.
+            _meta: { 'mcpl/class': ['control'], 'toy/extra': { nested: [1, 'two'] } },
           },
           ...(BUILD !== null
             ? [{ name: 'build', description: 'The build this process started with (toy).', inputSchema: { type: 'object', properties: {} } }]

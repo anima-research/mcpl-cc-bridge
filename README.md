@@ -15,14 +15,31 @@ adapter process is simultaneously:
      session; `mcpl_reload` — re-read the config, and with `server` hot-reload
      servers (respawn / redial). See [Managing servers](#managing-servers-from-the-session)
 
-   Everywhere a channel is named (`channel_id`), the channel's registered
-   **label** is accepted as well as its id — display form == address form.
+   Everywhere a channel is named (`channel_id`), the channel's **display
+   label** is accepted as well as its id — display form == address form.
    `mcpl_channels` and the `channel="…"` attribute on delivered messages print
-   exactly the string to pass back. Matching is exact after trimming, a leading
-   `#` optional, case-insensitive, and a label's trailing ` (qualifier)` may be
-   dropped when the rest is unique; there is no fuzzy matching, and an ambiguous
-   reference is an error quoting each match's label and id.
+   exactly the string to pass back. A reference resolves when exactly **one**
+   channel answers to it: by display label (trimmed, case-insensitive, leading
+   `#` optional), by that label minus a trailing ` (qualifier)`, or by id. Two
+   or more is an error quoting each match's label and id — no form wins over
+   another, and there is no fuzzy matching, because a best guess is a silent
+   wrong-room delivery. `id:<channel id>` always means that id and nothing
+   else.
+
+   Labels are **disambiguated actively** so that rule never strands a channel:
+   the server's label is shown as-is unless the reference it prints would also
+   answer for another channel (an exact duplicate, a bare `general` beside
+   `general (Guild)`, a label equal to another channel's id), in which case the
+   channel is shown with its id appended — `general (discord:1234)`. A label
+   beginning with `id:` is shown with a leading `#`. Display labels follow the
+   registered set: a channel can gain a qualifier when a look-alike registers,
+   and the form it printed before then is an ambiguity error, never a delivery
+   to the other room.
    - `mcpl_answer` — resolve a held `inference/request`
+
+   A proxied tool keeps its server's `_meta` unchanged, so MCPL RFC-008 tool
+   classes (`mcpl/class`) reach the client; the bridge tools declare their own
+   (`src/tool-classes.ts`).
 2. **Channel provider** (`claude/channel`) — `push/event`, `channels/incoming`,
    and `inference/request` arrive as `<channel source="mcpl" ...>` messages that
    start a turn (wake authority included), subject to the per-server
@@ -129,10 +146,13 @@ Notes:
   comes back on its own; a crashed child needs a restart).
 - `wake` — when a delivery starts a turn; see [Wake policy](#wake-policy).
   Default `"all"`.
-- `openOnAddressed` — open a closed channel when addressed there (default
-  `true`); see [Opening channels](#opening-channels).
+- `openOnAddressed` — open a closed channel when addressed there (default:
+  on when the wake policy holds `chat:ambient`, else off); see
+  [Opening channels](#opening-channels).
 - `openChannelsOnly` — drop pushes from channels not in the open set (default
   `false`); see [Opening channels](#opening-channels).
+- `dmAllowlist` — channel or author ids whose DMs are admitted; replaces the
+  open set as the DM gate when set; see [Opening channels](#opening-channels).
 - `openChannels` — registered channel ids to hold open across restarts; see
   [Opening channels](#opening-channels).
 - `disabled` — configured but not started (default `false`); `mcpl_enable`
@@ -187,19 +207,26 @@ session, and reconciled against every `channels/register` — so a reconnect
 re-opens what you had open. A server's `initiallyOpen` hint on a descriptor is
 honored only when the config carries no `openChannels` at all.
 
-Being addressed in a closed channel opens it (`openOnAddressed`, default on):
-a `push/event` tagged `chat:addressed` from a registered, closed channel
+Being addressed in a closed channel can open it (`openOnAddressed`): a
+`push/event` tagged `chat:addressed` from a registered, closed channel
 triggers `channels/open`, so the conversation *between* mentions reaches the
-session instead of only the mentions. Pair it with `"wake": "chat"` and that
-ambient traffic is held for the next wake rather than waking per message. The
-open lasts the session (it joins the desired-open set); set `"openOnAddressed":
-false` to keep the closed-until-opened behaviour. Two caveats: what an open
-channel delivers is the server's choice — discord-mcpl also starts sending
-reactions, edits and deletes for it, and the `"chat"` preset holds none of
-those (reactions are tagged `chat:reaction`; edits and deletes are untagged),
-so on that server an auto-opened room wakes on them until the preset or the
-server's tagging catches up. And a push whose origin carries only the
-producer's native channel id is mapped to the registered channel through the
+session instead of only the mentions. The default follows the wake policy:
+**on when the policy holds `chat:ambient`** (the `"chat"` preset, or a hold
+rule that catches ambient traffic from humans and bots alike), **off
+otherwise** — under `"wake": "all"` an implicit open would turn one mention
+into a wake per message for the rest of the session. Set it explicitly to
+override either way. The open lasts the session (it joins the desired-open
+set).
+
+What an open channel delivers is the server's choice — discord-mcpl also
+starts sending reactions, edits and deletes for it. The bridge treats those as
+channel traffic: `chat:reaction`, `chat:reaction-remove`, `chat:edited` and
+`chat:deleted` imply `chat:ambient` unless the producer marked the event
+addressed, so a policy that holds ambient holds them too. To wake on some of
+them anyway, name them in a `wake` rule — e.g. `["chat:reaction",
+"chat:to-self"]` for reactions to the agent's own messages, once the producer
+tags those `chat:to-self`. A push whose origin carries only the producer's
+native channel id is mapped to the registered channel through the
 descriptors' `address.channelId`; one that maps to nothing is delivered as
 before (and refused under `openChannelsOnly`).
 
@@ -209,6 +236,13 @@ plus anything opened with `mcpl_open` this session) becomes a whitelist, and a
 dropped — not delivered, not held, not opened, and the server sees
 `accepted: false`. Being addressed outside the whitelist then never wakes the
 session. Off by default.
+
+DMs (`chat:dm`) are gated too. Without further config they are judged by the
+same open set — a DM channel must be in `openChannels` or opened this session,
+and a DM that names no channel is refused. `"dmAllowlist": [...]` gives DMs
+their own gate instead: a DM is admitted when its channel id or its author id
+is listed (`[]` admits none). `dmAllowlist` applies whenever it is set, with
+or without `openChannelsOnly`.
 
 ```json
 "grant": ["tools", "pushEvents", "channels.register", "channels.lifecycle", "channels.incoming", "channels.publish"],
@@ -306,6 +340,13 @@ So instances coordinate over the session socket
   the socket, dials the fleet, and serves the call itself. In-flight MCPL state
   held by the dead primary (pending inference, registered channels) is lost —
   same as any host restart; servers re-register on reconnect.
+- **Sweep**: every adapter start removes stale socket files from the
+  directory — pid-keyed ones whose pid is gone, session-keyed ones that do
+  not answer a ping. Liveness is asked, never inferred from file age: a unix
+  socket file's mtime is its creation time, and a healthy week-old session
+  looks exactly like a corpse by that measure (0.2.7 — earlier versions
+  deleted live sockets on that basis, and every hook of the affected session
+  then failed open silently).
 
 Net effect: exactly one MCPL host per CC session, whichever MCP connection CC
 happens to route a call through.
