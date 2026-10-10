@@ -35,8 +35,10 @@ copyFileSync(join(ROOT, 'test', 'config.json'), CONFIG_COPY)
 const BUILD_FILE = join(TMP, 'build')
 writeFileSync(BUILD_FILE, 'v1')
 process.on('exit', () => rmSync(TMP, { recursive: true, force: true }))
+const EVENTS_FILE = join(TMP, 'events')
 const CHILD_ENV = {
   ...process.env,
+  TOY_EVENTS_FILE: EVENTS_FILE,
   CLAUDE_CODE_SESSION_ID: SESSION_KEY,
   MCPL_BRIDGE_CONFIG: CONFIG_COPY,
   TOY_INFERENCE: '1',
@@ -420,7 +422,8 @@ try {
 
     // A server that dies on startup: the failure and its stderr come back in the result.
     const crash = await call('mcpl_enable', { server: 'toycrash' })
-    ok(crash.isError === true && /toycrash: enabled — disconnected/.test(out(crash)) && /cannot find module/.test(out(crash)) && /\[exited code 3\]/.test(out(crash)), `crash on startup reported with its stderr: "${out(crash).replace(/\n\s*/g, ' | ')}"`)
+    ok(crash.isError === true && /toycrash: enabled — disconnected/.test(out(crash)) && /\[exited code 3\]/.test(out(crash)), `crash on startup reported with its stderr: "${out(crash).replace(/\n\s*/g, ' | ')}"`)
+    ok(/^\s*toycrash: cannot find module \.\/dist\/index\.js$/m.test(out(crash)), 'a stderr line written in two chunks is reported as one line')
     const nocmd = await call('mcpl_enable', { server: 'toynocmd' })
     ok(nocmd.isError === true && /toynocmd: enabled — disconnected/.test(out(nocmd)), `unspawnable command reported, not fatal: "${out(nocmd).replace(/\n\s*/g, ' | ')}"`)
     ok(/^toy: ready/m.test(out(await call('mcpl_status'))), 'bridge still serving after the failed spawns')
@@ -440,6 +443,40 @@ try {
     const flipOff = out(await call('mcpl_reload'))
     ok(/ disabled \[toyoff\]/.test(flipOff), `"disabled": true → stopped in place: "${flipOff.slice(flipOff.indexOf('added'))}"`)
     ok(!(await listed()).includes('toyoff__ping'), 'config-disabled server withdrew its tools')
+
+    // A session override lapses once the config agrees with it, and the server then follows the config.
+    await call('mcpl_disable', { server: 'toy2' })
+    cfgL.servers.toy2.disabled = true
+    writeFileSync(CONFIG_COPY, JSON.stringify(cfgL))
+    await call('mcpl_reload')
+    ok(/^toy2: disabled \(config/.test(await statusLine('toy2')), `override dropped once the config agrees: "${await statusLine('toy2')}"`)
+    delete cfgL.servers.toy2.disabled
+    writeFileSync(CONFIG_COPY, JSON.stringify(cfgL))
+    const follow = out(await call('mcpl_reload', { server: 'toy2' }))
+    ok(/ enabled \[toy2\]/.test(follow) && /^toy2: reconnected by the config change — ready/m.test(follow), `with the override gone, the server follows the config back on: "${follow.split('\n').join(' | ')}"`)
+
+    // Concurrent switches settle on the LAST request: reload, disable, enable fired together.
+    const [, , lastEnable] = await Promise.all([
+      call('mcpl_reload', { server: 'toy2' }),
+      call('mcpl_disable', { server: 'toy2' }),
+      call('mcpl_enable', { server: 'toy2' }),
+    ])
+    ok(await waitFor(async () => /^toy2: ready/.test(await statusLine('toy2'))), `reload + disable + enable at once ends enabled (enable said "${out(lastEnable)}"; status "${await statusLine('toy2')}")`)
+    ok((await listed()).includes('toy2__ping'), 'and its tools are listed')
+
+    // A stdio server that lingers after SIGTERM: a config change must not spawn the replacement beside it.
+    await call('mcpl_enable', { server: 'toyslow' })
+    const slowPid = pidOf(await statusLine('toyslow'))
+    ;(cfgL.servers.toyslow.transport as { env: Record<string, string> }).env.TOY_TAG = 'changed'
+    writeFileSync(CONFIG_COPY, JSON.stringify(cfgL))
+    const changedSlow = out(await call('mcpl_reload', { server: 'toyslow' }))
+    const newSlowPid = pidOf(await statusLine('toyslow'))
+    const ev = readFileSync(EVENTS_FILE, 'utf8').trim().split('\n').map(l => l.split(' '))
+    const exitAt = Number(ev.find(e => e[0] === 'exit' && Number(e[1]) === slowPid)?.[2] ?? NaN)
+    const startAt = Number(ev.find(e => e[0] === 'start' && Number(e[1]) === newSlowPid)?.[2] ?? NaN)
+    ok(/^toyslow: reconnected by the config change — ready/m.test(changedSlow) && newSlowPid > 0 && newSlowPid !== slowPid, `config change replaced the lingering server (${slowPid} → ${newSlowPid})`)
+    ok(exitAt <= startAt, `the replacement started only after the old process exited (exit ${exitAt}, start ${startAt}, Δ ${startAt - exitAt} ms)`)
+    await call('mcpl_disable', { server: 'toyslow' })
   }
 
   // ── Socket sweep: a later adapter start must not unlink a LIVE session's socket ──

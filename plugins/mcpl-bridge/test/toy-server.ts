@@ -285,5 +285,24 @@ process.stdin.on('data', (d: Buffer) => {
     }
   }
 })
-process.stdin.on('end', () => process.exit(0))
+// Lifecycle witness for the bridge's respawn ordering: TOY_EVENTS_FILE gets a
+// line at start and at exit; TOY_LINGER_MS keeps a stopped server alive that
+// long after SIGTERM / stdin end (a slow shutdown holding its resources).
+const events = process.env.TOY_EVENTS_FILE
+const note = (what: string) => {
+  if (events) require('fs').appendFileSync(events, `${what} ${process.pid} ${Date.now()}\n`)
+}
+const linger = Number(process.env.TOY_LINGER_MS ?? 0)
+let exiting = false
+const stop = () => {
+  if (exiting) return
+  exiting = true
+  setTimeout(() => {
+    note('exit')
+    process.exit(0)
+  }, linger)
+}
+process.on('SIGTERM', stop)
+process.stdin.on('end', stop)
+note('start')
 log('toy MCPL server up')

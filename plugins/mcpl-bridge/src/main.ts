@@ -85,7 +85,8 @@ function wantEnabled(id: string, s: ServerConfig | undefined = config.servers[id
   return sessionOverride.get(id) ?? configEnabled(s)
 }
 
-function makeHandle(id: string, serverCfg: ServerConfig): McplServerHandle {
+/** `predecessor`: exit of the process a replaced handle ran — the new one's first spawn waits on it. */
+function makeHandle(id: string, serverCfg: ServerConfig, predecessor?: Promise<void>): McplServerHandle {
   const handle = new McplServerHandle(
     id,
     serverCfg,
@@ -94,7 +95,7 @@ function makeHandle(id: string, serverCfg: ServerConfig): McplServerHandle {
       toolsChanged: scheduleToolsChanged,
       log,
     },
-    { disabled: !wantEnabled(id, serverCfg) },
+    { disabled: !wantEnabled(id, serverCfg), predecessor },
   )
   handles.set(id, handle)
   gates.set(id, new WakeGate(serverCfg.wake))
@@ -179,17 +180,20 @@ async function reloadConfigInner(reason: string): Promise<ReloadResult> {
     if (!(id in nextServers) || on === configEnabled(nextServers[id])) sessionOverride.delete(id)
   }
   const dropped: string[] = []
+  const exiting = new Map<string, Promise<void>>()
   for (const id of [...removed, ...changed]) {
     const held = gates.get(id)?.heldCount ?? 0
     if (held) dropped.push(`${id}:${held}`)
-    handles.get(id)?.close()
+    const gone = handles.get(id)?.close()
+    if (gone) exiting.set(id, gone)
     handles.delete(id)
     gates.delete(id)
   }
   config = next.config
   const fresh = new Map<string, Promise<void>>()
   for (const id of [...added, ...changed]) {
-    const h = makeHandle(id, nextServers[id])
+    // A changed stdio server is respawned only after its old process exits.
+    const h = makeHandle(id, nextServers[id], exiting.get(id))
     if (!handlesStarted || h.disabled) continue
     h.start()
     fresh.set(id, h.attempt)
@@ -528,7 +532,9 @@ async function callToolImpl(name: string, args: Record<string, unknown>): Promis
         const toolsBefore = h.tools.length
         const pendingBefore = h.pendingInferenceIds.length
         const op = applyEnabled(id, want)
-        const settled = op ? await settle(op) : true
+        // Report the connection the server ends up with: when an earlier queued
+        // op (a hot reload) is what is connecting, wait on that attempt too.
+        const settled = op ? await settle(want ? op.then(() => handles.get(id)!.idle()) : op) : true
         const now = handles.get(id)!
         if (want && settled && !isUp(now)) await now.stderrSettled()
         if (want) return { ok: isUp(now) || !settled, line: `${id}: enabled — ${describe(now, settled)}${scope}` }

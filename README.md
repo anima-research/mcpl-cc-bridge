@@ -304,7 +304,8 @@ servers on and off as the work needs them:
   session re-open when the server re-registers them, held deliveries stay. The
   result shows the pid change and, on failure, the stderr tail. A server the
   same re-read already reconnected (its config changed) is not restarted
-  twice. Use it after rebuilding an MCPL server — e.g. `npm run build` then
+  twice. The wait-for-exit rule holds on every path that replaces a stdio
+  process — hot reload, a config change, a reconnect after a crash. Use it after rebuilding an MCPL server — e.g. `npm run build` then
   `mcpl_reload server=discord` — instead of restarting Claude Code.
 
 `server` is an id, several comma-separated, or `"*"` (every configured

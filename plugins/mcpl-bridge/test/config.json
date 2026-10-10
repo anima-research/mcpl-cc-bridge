@@ -83,7 +83,7 @@
         "command": "bun",
         "args": [
           "-e",
-          "console.error('toycrash: cannot find module ./dist/index.js'); process.exit(3)"
+          "process.stderr.write('toycrash: cannot find'); setTimeout(() => { process.stderr.write(' module ./dist/index.js\\n'); process.exit(3) }, 50)"
         ]
       },
       "disabled": true
@@ -92,6 +92,20 @@
       "transport": {
         "command": "/nonexistent/mcpl-server-binary"
       },
+      "disabled": true
+    },
+    "toyslow": {
+      "transport": {
+        "command": "bun",
+        "args": [
+          "run",
+          "test/toy-server.ts"
+        ],
+        "env": {
+          "TOY_LINGER_MS": "1500"
+        }
+      },
+      "inferenceRequest": "deny",
       "disabled": true
     }
   }

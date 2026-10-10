@@ -134,6 +134,15 @@ export class McplServerHandle {
   private retired = false
   /** disable(): stopped until enable(). */
   private paused = false
+  /** The latest REQUESTED on/off state, set when enable()/disable() is called
+   *  rather than when its queued op runs — so a check made while ops are
+   *  queued sees where the server is headed, and a queued op that a later
+   *  request superseded does nothing. */
+  private wantOff = false
+  /** Resolves once every stdio child this handle has stopped has really
+   *  exited (SIGKILL after a grace period). Each spawn waits on it: a new
+   *  process must never start beside an old one still holding a port or lock. */
+  private childGone: Promise<void> = Promise.resolve()
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null
   /** enable / disable / restart take turns (see serialize). */
   private lifecycleChain: Promise<unknown> = Promise.resolve()
@@ -146,7 +155,11 @@ export class McplServerHandle {
   private manifestFetchAt = 0
   private isMcpl = false
 
-  constructor(id: string, cfg: ServerConfig, cb: HostCallbacks, opts: { disabled?: boolean } = {}) {
+  /**
+   * `opts.predecessor`: the exit of the process a replaced handle for this
+   * server was running (its close() result); the first spawn waits on it.
+   */
+  constructor(id: string, cfg: ServerConfig, cb: HostCallbacks, opts: { disabled?: boolean; predecessor?: Promise<void> } = {}) {
     this.id = id
     this.cfg = cfg
     this.prefix = cfg.toolPrefix ?? id
@@ -156,9 +169,11 @@ export class McplServerHandle {
     this.desiredOpen = new Set(cfg.openChannels ?? [])
     this.backoffMs = cfg.reconnectIntervalMs ?? 5000
     this.firstAttempt = new Promise<void>(r => (this.firstAttemptResolve = r))
+    if (opts.predecessor) this.childGone = opts.predecessor
     if (opts.disabled) {
       // Nothing will be attempted, so nothing should wait on an attempt.
       this.paused = true
+      this.wantOff = true
       this.status = 'disabled'
       this.firstAttemptResolve()
     }
@@ -172,9 +187,9 @@ export class McplServerHandle {
     return this.retired || this.paused
   }
 
-  /** Stopped by disable() (or constructed disabled) and not since re-enabled. */
+  /** Off, or headed there: the latest request was disable() (or it was constructed disabled). */
   get disabled(): boolean {
-    return this.paused
+    return this.wantOff
   }
 
   /** The stdio server's process id; null for ws servers and when not running. */
@@ -185,6 +200,18 @@ export class McplServerHandle {
   /** The most recent connect attempt — resolves once it settles, either way (status / lastError say which). */
   get attempt(): Promise<void> {
     return this.latestAttempt
+  }
+
+  /** Resolves once no lifecycle op is queued and the latest connect attempt
+   *  has settled — what a report of "where did this server end up" waits on
+   *  when other ops (a hot reload) are in flight around it. */
+  async idle(): Promise<void> {
+    for (let i = 0; i < 10; i++) {
+      const chain = this.lifecycleChain
+      await chain
+      await this.latestAttempt
+      if (chain === this.lifecycleChain) return
+    }
   }
 
   /** A server that died on startup can close stdout before its last stderr
@@ -209,9 +236,11 @@ export class McplServerHandle {
     void this.connectOnce()
   }
 
-  close(): void {
+  /** Retire the handle for good. Resolves when its stdio child (if any) has exited. */
+  close(): Promise<void> {
     this.retired = true
     this.teardown('closed')
+    return this.childGone
   }
 
   /**
@@ -236,19 +265,21 @@ export class McplServerHandle {
    * re-opens what was open.
    */
   disable(): Promise<void> {
+    this.wantOff = true
     return this.serialize(async () => {
-      if (this.halted) return
+      if (!this.wantOff || this.halted) return // superseded by a later enable(), or already stopped
       this.paused = true
-      const child = this.child
       this.teardown('disabled')
-      await reap(child)
+      await this.childGone
     })
   }
 
   /** Start a disabled server. Resolves when its connect attempt settles. */
   enable(): Promise<void> {
+    if (this.retired) return Promise.reject(new Error(`${this.id}: this handle was replaced; check mcpl_status`))
+    this.wantOff = false
     return this.serialize(async () => {
-      if (this.retired) throw new Error(`${this.id}: this handle was replaced; check mcpl_status`)
+      if (this.wantOff || this.retired) return // superseded by a later disable(), or replaced
       if (!this.paused) return
       this.paused = false
       this.status = 'disconnected'
@@ -268,11 +299,10 @@ export class McplServerHandle {
   restart(): Promise<void> {
     return this.serialize(async () => {
       if (this.retired) throw new Error(`${this.id}: this handle was replaced; check mcpl_status`)
-      if (this.paused) throw new Error(`${this.id}: disabled; mcpl_enable starts it`)
-      const child = this.child
+      if (this.wantOff || this.paused) throw new Error(`${this.id}: disabled; mcpl_enable starts it`)
       this.teardown('disconnected')
-      await reap(child)
-      if (this.halted) return // closed while the old process wound down
+      await this.childGone
+      if (this.halted || this.wantOff) return // closed or disabled while the old process wound down
       this.backoffMs = this.cfg.reconnectIntervalMs ?? 5000
       return { settled: this.connectOnce() }
     })
@@ -300,15 +330,24 @@ export class McplServerHandle {
     try {
       conn?.close()
     } catch {}
-    try {
-      this.child?.kill()
-    } catch {}
+    this.stopChild(this.child)
     this.child = null
     if (this.tools.length) {
       this.tools = []
       this.cb.toolsChanged()
     }
     this.status = status
+  }
+
+  /** SIGTERM a child and track its exit (SIGKILL after the grace period) in childGone. */
+  private stopChild(child: ChildProcess | null): void {
+    if (!child) return
+    try {
+      child.kill()
+    } catch {}
+    const gone = reap(child)
+    const prev = this.childGone
+    this.childGone = Promise.all([prev, gone]).then(() => {})
   }
 
   private scheduleReconnect(): void {
@@ -354,10 +393,23 @@ export class McplServerHandle {
       stderrTail.push(line)
       if (stderrTail.length > STDERR_TAIL_LINES) stderrTail.splice(0, stderrTail.length - STDERR_TAIL_LINES)
     }
+    // Line-buffered: one line can arrive split across chunks, and the tail
+    // must hold whole lines. A partial line is flushed at exit (or past 4 KB).
+    let partial = ''
+    const flushLine = (line: string) => {
+      const l = line.replace(/\r$/, '')
+      this.log(`stderr: ${l}`)
+      keep(l)
+    }
     child.stderr?.on('data', (d: Buffer) => {
-      const s = d.toString().trimEnd()
-      this.log(`stderr: ${s}`)
-      for (const line of s.split('\n')) keep(line)
+      partial += d.toString()
+      const lines = partial.split('\n')
+      partial = lines.pop() ?? ''
+      for (const line of lines) flushLine(line)
+      if (partial.length > 4096) {
+        flushLine(partial)
+        partial = ''
+      }
     })
     const conn = McplConnection.fromStreams(child.stdout!, child.stdin!)
     let markClosed!: () => void
@@ -379,6 +431,8 @@ export class McplServerHandle {
     child.stdin?.on('error', e => this.log(`stdin: ${e.message}`))
     // 'close', not 'exit': it fires after stdio drains, so the marker lands after the last stderr line.
     child.once('close', (code, signal) => {
+      if (partial) flushLine(partial)
+      partial = ''
       keep(`[exited ${signal ?? `code ${code}`}]`)
       markClosed()
     })
@@ -395,6 +449,13 @@ export class McplServerHandle {
     if (this.halted) return
     const myEpoch = ++this.epoch
     this.status = 'connecting'
+    // Every stdio spawn waits for the processes this handle (or the one it
+    // replaced) stopped to have exited — after a crash, a failed handshake, a
+    // restart or a config change alike. Bounded by reap's SIGKILL.
+    if (!isWs(this.cfg.transport)) {
+      await this.childGone
+      if (myEpoch !== this.epoch || this.halted) return
+    }
     let dialed: Awaited<ReturnType<McplServerHandle['dial']>>
     try {
       dialed = await this.dial()
@@ -409,9 +470,7 @@ export class McplServerHandle {
     const { conn, child } = dialed
     if (myEpoch !== this.epoch) {
       conn.close()
-      try {
-        child?.kill()
-      } catch {}
+      this.stopChild(child)
       return
     }
     this.conn = conn
