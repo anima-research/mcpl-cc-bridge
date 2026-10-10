@@ -210,10 +210,15 @@ try {
     ok(meta(mention).native_channel_id === 'raw-lobby', 'native channel id kept beside the MCPL id')
   }
 
+  // ── DMs: toygate is in whitelist mode with dmAllowlist [u2] — a DM from u2 that names no channel is admitted ──
+  await waitForChannel(p => meta(p).server === 'toygate' && String(p.content).includes('toy dm from toyhuman'), 'dmAllowlist admitted a DM by author under openChannelsOnly')
+  await waitForChannel(p => meta(p).server === 'toy2' && String(p.content).includes('toy dm from toyhuman'), 'DM delivered where no whitelist applies')
+
   // ── open-on-addressed: toy2 has no openChannels, so its lobby starts closed;
-  //    the from-human mention push (chat:addressed) must open it. ──
+  //    the from-human mention push (chat:addressed) must open it. toy2 runs
+  //    wake "all", where the default is OFF — its config opts in explicitly. ──
   for (let i = 0; i < 40 && !stderr1.includes('toy2: opened Toy Lobby (addressed there)'); i++) await new Promise(r => setTimeout(r, 250))
-  ok(stderr1.includes('toy2: opened Toy Lobby (addressed there)'), 'addressed push from a closed channel opened it (openOnAddressed default)')
+  ok(stderr1.includes('toy2: opened Toy Lobby (addressed there)'), 'addressed push from a closed channel opened it (openOnAddressed: true)')
   const statusAuto = (await request('tools/call', { name: 'mcpl_status', arguments: {} })) as { content: Array<{ text: string }> }
   ok(/toy2: .*open=\[Toy Lobby\]/.test(statusAuto?.content?.[0]?.text ?? ''), 'mcpl_status shows the auto-opened channel on toy2')
   const nativePush = await waitForChannel(p => meta(p).server === 'toy2' && String(p.content).includes('toy native-id mention'), 'native-id-only push delivered on toy2')

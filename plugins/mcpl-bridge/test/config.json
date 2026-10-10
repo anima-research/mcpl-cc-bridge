@@ -36,7 +36,8 @@
           "run",
           "test/toy-server.ts"
         ]
-      }
+      },
+      "openOnAddressed": true
     },
     "toygate": {
       "transport": {
@@ -62,7 +63,10 @@
         "*"
       ],
       "inferenceRequest": "deny",
-      "openChannelsOnly": true
+      "openChannelsOnly": true,
+      "dmAllowlist": [
+        "u2"
+      ]
     }
   }
 }

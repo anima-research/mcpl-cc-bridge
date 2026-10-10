@@ -40,6 +40,7 @@ import {
 //   is a stale publish missing the grant/manifest helpers).
 //   Re-sync: cp <mcpl-core-ts>/src/*.ts src/vendor/mcpl-core/
 import { ERR, computeGrant, expandTags, granted, methodCapability } from './grants'
+import { holdsAmbient } from './wake'
 import { DEFAULT_GRANT, isWs, resolveUrl, type ServerConfig, type StdioTransportConfig } from './config'
 import { ChannelRefError, ChannelRegistry, buildLabelView, resolveChannelRef, type LabelView } from './channel-labels'
 
@@ -95,6 +96,8 @@ export class McplServerHandle {
   readonly prefix: string
   /** Operator policy patterns; the effective grant is advertised ∩ this. */
   readonly policy: readonly string[]
+  /** Effective openOnAddressed: the config's, else on exactly when the wake policy holds chat:ambient. */
+  readonly openOnAddressed: boolean
 
   status: 'connecting' | 'ready' | 'mcp-only' | 'disconnected' | 'closed' = 'disconnected'
   tools: McplTool[] = []
@@ -133,6 +136,7 @@ export class McplServerHandle {
     this.prefix = cfg.toolPrefix ?? id
     this.cb = cb
     this.policy = cfg.grant ?? DEFAULT_GRANT
+    this.openOnAddressed = cfg.openOnAddressed ?? holdsAmbient(cfg.wake)
     this.desiredOpen = new Set(cfg.openChannels ?? [])
     this.backoffMs = cfg.reconnectIntervalMs ?? 5000
     this.firstAttempt = new Promise<void>(r => (this.firstAttemptResolve = r))
@@ -403,15 +407,12 @@ export class McplServerHandle {
         // producer's native id through the descriptors' address (discord-mcpl
         // sends several pushes with only the native id). '' when nothing maps.
         const from = this.channelFromOrigin(mcplChannel, native)
-        // Whitelist mode: only a channel this host holds open is one this
-        // session listens to — addressed or not, anything else is refused
-        // (§6.6: a rejection is diagnostics for the server, nothing more).
-        // Fail closed on a channel id that maps to nothing: an unregistered
-        // room is not a whitelisted one.
-        if (this.cfg.openChannelsOnly === true && (mcplChannel || native) && (!from || !this.isOpen(from))) {
-          const why = from ? `closed channel ${this.labelOf(from) || from}` : `unregistered channel ${mcplChannel || native}`
-          console.error(`${this.id}: dropped push from ${why} (openChannelsOnly)`)
-          respond({ accepted: false, reason: `channel not open on this host (openChannelsOnly): ${why}` })
+        // Whitelist admission (openChannelsOnly / dmAllowlist) — §6.6: a
+        // rejection is diagnostics for the server, nothing more.
+        const refused = this.refusal({ channelId: from, rawChannel: mcplChannel || native, isDm: tags.includes('chat:dm'), authorId: s(o.authorId) })
+        if (refused) {
+          console.error(`${this.id}: dropped push from ${refused}`)
+          respond({ accepted: false, reason: `not admitted on this host: ${refused}` })
           return
         }
         this.cb.deliver({
@@ -443,7 +444,7 @@ export class McplServerHandle {
         // Live-open or already being opened is the test — not desired-open:
         // a configured channel whose open failed must be retried, not skipped.
         const addressedIn = from
-        if (this.cfg.openOnAddressed !== false && tags.includes('chat:addressed') && addressedIn && !this.openChannels.has(addressedIn) && !this.opening.has(addressedIn)) {
+        if (this.openOnAddressed && tags.includes('chat:addressed') && addressedIn && !this.openChannels.has(addressedIn) && !this.opening.has(addressedIn)) {
           if (!granted(this.grant, 'channels.lifecycle')) {
             if (!this.warnedNoLifecycle) {
               this.warnedNoLifecycle = true
@@ -491,11 +492,12 @@ export class McplServerHandle {
         const results = (p.messages ?? []).map(m => {
           const known = this.channels.has(m.channelId)
           if (!known) return { messageId: m.messageId, accepted: false }
-          if (this.cfg.openChannelsOnly === true && !this.isOpen(m.channelId)) {
-            console.error(`${this.id}: dropped incoming from closed channel ${this.labelOf(m.channelId) || m.channelId} (openChannelsOnly)`)
+          const tags = expandTags(m.tags)
+          const refused = this.refusal({ channelId: m.channelId, rawChannel: m.channelId, isDm: tags.includes('chat:dm'), authorId: String(m.author?.id ?? '') })
+          if (refused) {
+            console.error(`${this.id}: dropped incoming from ${refused}`)
             return { messageId: m.messageId, accepted: false }
           }
-          const tags = expandTags(m.tags)
           this.cb.deliver({
             server: this.id,
             kind: 'channel-message',
@@ -650,6 +652,28 @@ export class McplServerHandle {
     this.openChannels.delete(channelId)
     const r = (await conn.sendRequest('channels/close', { channelId })) as ChannelsCloseResult
     return { channelId, label: this.labelOf(channelId) || channelId, closed: r?.closed === true }
+  }
+
+  /**
+   * Whitelist admission for one delivery; null when admitted, else why not.
+   *  - A DM (chat:dm), when `dmAllowlist` is set: its channel id (registered
+   *    or raw) or author id must be listed — the open set does not apply.
+   *  - Otherwise, under `openChannelsOnly`: the delivery's channel must be
+   *    registered and open (or meant to be). Fail closed on a channel id
+   *    that maps to nothing, and on a DM that names no channel at all.
+   *    Non-DM pushes with no channel (heartbeats) are not channel traffic.
+   */
+  refusal(d: { channelId: string; rawChannel: string; isDm: boolean; authorId: string }): string | null {
+    const allow = this.cfg.dmAllowlist
+    if (d.isDm && allow) {
+      const listed = [d.channelId, d.rawChannel, d.authorId].some(x => x && allow.includes(x))
+      return listed ? null : `DM ${d.channelId ? this.labelOf(d.channelId) || d.channelId : d.rawChannel || `from ${d.authorId || 'unknown author'}`} (not in dmAllowlist)`
+    }
+    if (this.cfg.openChannelsOnly !== true) return null
+    if (!d.rawChannel && !d.isDm) return null
+    if (!d.channelId) return `${d.isDm ? 'DM in ' : ''}unregistered channel ${d.rawChannel || '(none named)'} (openChannelsOnly)`
+    if (!this.isOpen(d.channelId)) return `${d.isDm ? 'DM in ' : ''}closed channel ${this.labelOf(d.channelId) || d.channelId} (openChannelsOnly)`
+    return null
   }
 
   /** Open, or meant to be: live-open this epoch, or in the desired-open set

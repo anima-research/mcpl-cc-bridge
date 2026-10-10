@@ -47,6 +47,15 @@ export function expandTags(tags: readonly string[] | undefined): string[] {
     set.add('chat:private')
   }
   if (set.has('chat:addressed')) set.delete('chat:ambient')
+  // Host rule (not §16): a reaction, edit or delete is channel traffic like
+  // any message — ambient unless the producer itself marked it addressed —
+  // so a policy that holds ambient holds these too instead of waking on them
+  // for matching no rule. A policy can still single some out to wake, e.g.
+  // ["chat:reaction", "chat:to-self"] for reactions to the agent's own
+  // messages (once the producer tags them chat:to-self).
+  if (!set.has('chat:addressed') && ['chat:reaction', 'chat:reaction-remove', 'chat:edited', 'chat:deleted'].some(t => set.has(t))) {
+    set.add('chat:ambient')
+  }
   return [...set]
 }
 
