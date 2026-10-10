@@ -41,8 +41,9 @@ import {
 //   Re-sync: cp <mcpl-core-ts>/src/*.ts src/vendor/mcpl-core/
 import { ERR, computeGrant, expandTags, granted, methodCapability } from './grants'
 import { DEFAULT_GRANT, isWs, resolveUrl, type ServerConfig, type StdioTransportConfig } from './config'
+import { ChannelRefError, ChannelRegistry, buildLabelView, resolveChannelRef, type LabelView } from './channel-labels'
 
-export type McplTool = { name: string; description?: string; inputSchema?: unknown }
+export type McplTool = { name: string; description?: string; inputSchema?: unknown; _meta?: Record<string, unknown> }
 
 export type IncomingDelivery = {
   server: string
@@ -97,7 +98,8 @@ export class McplServerHandle {
 
   status: 'connecting' | 'ready' | 'mcp-only' | 'disconnected' | 'closed' = 'disconnected'
   tools: McplTool[] = []
-  channels = new Map<string, ChannelDescriptor>()
+  channels = new ChannelRegistry()
+  private labelCache: { version: number; view: LabelView } | null = null
   /** Channels currently open on the live connection (channels/open succeeded this epoch). */
   openChannels = new Set<string>()
   /** Desired-open state: config `openChannels` plus mcpl_open/mcpl_close during the session.
@@ -448,7 +450,7 @@ export class McplServerHandle {
               console.error(`${this.id}: addressed in ${this.labelOf(addressedIn) || addressedIn} but cannot open it: channels.lifecycle not granted (openOnAddressed is inert)`)
             }
           } else {
-            void this.openChannel(addressedIn).then(
+            void this.openChannel(addressedIn, 0, { byId: true }).then(
               r => { if (r.open) console.error(`${this.id}: opened ${r.label || addressedIn} (addressed there)`) },
               err => console.error(`${this.id}: open-on-addressed failed for ${addressedIn}: ${(err as Error).message}`),
             )
@@ -570,11 +572,15 @@ export class McplServerHandle {
    * channels/incoming instead of only addressed pushes. Returns any history
    * the server handed back with the open (oldest first).
    */
-  async openChannel(ref: string, historyLimit = 0): Promise<{ channelId: string; label: string; history: IncomingChannelMessage[]; truncated: boolean; open: boolean }> {
+  async openChannel(ref: string, historyLimit = 0, opts: { byId?: boolean } = {}): Promise<{ channelId: string; label: string; history: IncomingChannelMessage[]; truncated: boolean; open: boolean }> {
     const conn = this.conn
     if (!conn || conn.isClosed) throw new Error(`${this.id}: not connected`)
     if (!granted(this.grant, 'channels.lifecycle')) throw new Error(`${this.id}: channels.lifecycle not granted (add it to the server's grant; the server must advertise it too)`)
-    const channelId = this.resolveChannel(ref)
+    // The host's own opens (reconcile, config) name a registered id: never
+    // route those through label resolution, where an id that also reads as
+    // another channel's label is (rightly) ambiguous.
+    if (opts.byId && !this.channels.has(ref)) throw new Error(`${this.id}: channel ${ref} is not registered`)
+    const channelId = opts.byId ? ref : this.resolveChannel(ref)
     const desc = this.channels.get(channelId)!
     const params: ChannelsOpenParams = {
       channelId,
@@ -598,10 +604,10 @@ export class McplServerHandle {
       // mcpl_close landed while the open was in flight: the explicit close
       // wins. The server now has it open, so close it there too.
       void conn.sendRequest('channels/close', { channelId }).catch(() => {})
-      return { channelId, label: desc.label, history: [], truncated: false, open: false }
+      return { channelId, label: this.labelOf(channelId), history: [], truncated: false, open: false }
     }
     this.openChannels.add(channelId)
-    return { channelId, label: desc.label, history: r?.history ?? [], truncated: r?.historyTruncated === true, open: true }
+    return { channelId, label: this.labelOf(channelId), history: r?.history ?? [], truncated: r?.historyTruncated === true, open: true }
   }
 
   /**
@@ -626,9 +632,18 @@ export class McplServerHandle {
     const conn = this.conn
     if (!conn || conn.isClosed) throw new Error(`${this.id}: not connected`)
     if (!granted(this.grant, 'channels.lifecycle')) throw new Error(`${this.id}: channels.lifecycle not granted`)
-    // An id we no longer know (channel removed) may still sit in desiredOpen —
-    // let it through so the intent can be cleared; a label must resolve.
-    const channelId = this.channels.has(ref) || this.desiredOpen.has(ref) ? ref : this.resolveChannel(ref)
+    // An id we no longer know (channel removed) may still sit in desiredOpen;
+    // closing it clears that intent. Only when nothing registered answers to
+    // the reference, though: a current channel's label always wins over a
+    // stale id that happens to read the same.
+    let channelId: string
+    try {
+      channelId = this.resolveChannel(ref)
+    } catch (e) {
+      const stale = ref.trim().replace(/^id:/, '')
+      if (!(e instanceof ChannelRefError && e.kind === 'unknown' && this.desiredOpen.has(stale))) throw e
+      channelId = stale
+    }
     // Forget the intent first: a close that fails on the wire must not be
     // silently undone by the next reconnect's reconcile.
     this.desiredOpen.delete(channelId)
@@ -643,35 +658,27 @@ export class McplServerHandle {
     return this.openChannels.has(channelId) || this.desiredOpen.has(channelId)
   }
 
-  /** The registered label for a channel id ('' when unknown). */
+  /** Display labels for the registered set, recomputed when it changes (see channel-labels.ts). */
+  private get labelView(): LabelView {
+    if (!this.labelCache || this.labelCache.version !== this.channels.version) {
+      this.labelCache = { version: this.channels.version, view: buildLabelView(this.channels) }
+    }
+    return this.labelCache.view
+  }
+
+  /** The display label for a channel id — the form mcpl_send/open/close accept back ('' when unknown). */
   labelOf(channelId: string): string {
-    return this.channels.get(channelId)?.label ?? ''
+    return this.labelView.labels.get(channelId) ?? ''
   }
 
   /**
-   * Resolve a channel reference to a registered channel id. Accepts the exact
-   * id, or the label as mcpl_channels / <channel channel="…"> print it —
-   * display form == address form. Exact match after trimming, a leading `#`
-   * optional, case-insensitive; a label's trailing ` (qualifier)` may be
-   * omitted when the remainder is unique. NO fuzzy matching: a "did you mean"
-   * would turn a mistyped room into a silent wrong-room delivery. Ambiguity is
-   * an error that quotes label + id for each match, so the answer is pasteable.
+   * Resolve a channel reference to a registered id: `id:<id>`, or anything
+   * exactly one channel answers to — its display label (case-insensitive,
+   * leading `#` optional), that label minus a trailing ` (qualifier)`, or its
+   * id. More than one is an error naming each; never a guess.
    */
   resolveChannel(ref: string): string {
-    const raw = ref.trim()
-    if (this.channels.has(raw)) return raw
-    const norm = (s: string) => s.trim().replace(/^#/, '').toLowerCase()
-    const want = norm(raw)
-    if (!want) throw new Error(`${this.id}: empty channel reference`)
-    const unqualified = (label: string) => norm(label.replace(/\s*\([^()]*\)\s*$/, ''))
-    let matches = [...this.channels.values()].filter(d => norm(d.label) === want)
-    if (matches.length === 0) matches = [...this.channels.values()].filter(d => unqualified(d.label) === want)
-    if (matches.length === 1) return matches[0].id
-    if (matches.length === 0) {
-      throw new Error(`${this.id}: unknown channel "${ref}" (${this.channels.size} registered — use mcpl_channels to list labels and ids)`)
-    }
-    const options = matches.map(d => `"${d.label}" (id ${d.id})`).join(', ')
-    throw new Error(`${this.id}: "${ref}" is ambiguous — ${matches.length} channels match. Re-send with one of: ${options}`)
+    return resolveChannelRef(ref, this.channels, this.labelView, this.id)
   }
 
   /** Re-open desired channels after a (re)registration; failures are logged, not fatal. */
@@ -684,7 +691,7 @@ export class McplServerHandle {
         return
       }
       try {
-        const r = await this.openChannel(cid)
+        const r = await this.openChannel(cid, 0, { byId: true })
         if (r.open) this.log(`opened ${cid}`)
       } catch (e) {
         this.log(`open ${cid} failed: ${e instanceof Error ? e.message : e}`)

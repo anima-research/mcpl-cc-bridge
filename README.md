@@ -12,14 +12,31 @@ adapter process is simultaneously:
    - `mcpl_open` / `mcpl_close` — `channels/open` / `channels/close` on a
      registered channel (subscribe to / leave its ordinary traffic)
 
-   Everywhere a channel is named (`channel_id`), the channel's registered
-   **label** is accepted as well as its id — display form == address form.
+   Everywhere a channel is named (`channel_id`), the channel's **display
+   label** is accepted as well as its id — display form == address form.
    `mcpl_channels` and the `channel="…"` attribute on delivered messages print
-   exactly the string to pass back. Matching is exact after trimming, a leading
-   `#` optional, case-insensitive, and a label's trailing ` (qualifier)` may be
-   dropped when the rest is unique; there is no fuzzy matching, and an ambiguous
-   reference is an error quoting each match's label and id.
+   exactly the string to pass back. A reference resolves when exactly **one**
+   channel answers to it: by display label (trimmed, case-insensitive, leading
+   `#` optional), by that label minus a trailing ` (qualifier)`, or by id. Two
+   or more is an error quoting each match's label and id — no form wins over
+   another, and there is no fuzzy matching, because a best guess is a silent
+   wrong-room delivery. `id:<channel id>` always means that id and nothing
+   else.
+
+   Labels are **disambiguated actively** so that rule never strands a channel:
+   the server's label is shown as-is unless the reference it prints would also
+   answer for another channel (an exact duplicate, a bare `general` beside
+   `general (Guild)`, a label equal to another channel's id), in which case the
+   channel is shown with its id appended — `general (discord:1234)`. A label
+   beginning with `id:` is shown with a leading `#`. Display labels follow the
+   registered set: a channel can gain a qualifier when a look-alike registers,
+   and the form it printed before then is an ambiguity error, never a delivery
+   to the other room.
    - `mcpl_answer` — resolve a held `inference/request`
+
+   A proxied tool keeps its server's `_meta` unchanged, so MCPL RFC-008 tool
+   classes (`mcpl/class`) reach the client; the bridge tools declare their own
+   (`src/tool-classes.ts`).
 2. **Channel provider** (`claude/channel`) — `push/event`, `channels/incoming`,
    and `inference/request` arrive as `<channel source="mcpl" ...>` messages that
    start a turn (wake authority included), subject to the per-server
@@ -261,6 +278,13 @@ So instances coordinate over the session socket
   the socket, dials the fleet, and serves the call itself. In-flight MCPL state
   held by the dead primary (pending inference, registered channels) is lost —
   same as any host restart; servers re-register on reconnect.
+- **Sweep**: every adapter start removes stale socket files from the
+  directory — pid-keyed ones whose pid is gone, session-keyed ones that do
+  not answer a ping. Liveness is asked, never inferred from file age: a unix
+  socket file's mtime is its creation time, and a healthy week-old session
+  looks exactly like a corpse by that measure (0.2.7 — earlier versions
+  deleted live sockets on that basis, and every hook of the affected session
+  then failed open silently).
 
 Net effect: exactly one MCPL host per CC session, whichever MCP connection CC
 happens to route a call through.
