@@ -614,9 +614,16 @@ async function callToolImpl(name: string, args: Record<string, unknown>): Promis
         }
       }
     }
-    // A stale call into a server that is off or down: say which, not just "unknown".
+    // A stale call into a server that is off or down: say which, not just
+    // "unknown". The owner is the LONGEST matching prefix — `foo__bar__ping`
+    // belongs to server `foo__bar`, not `foo`.
+    let owner: [string, McplServerHandle] | null = null
     for (const [id, h] of handles) {
-      if (!name.startsWith(toolName(id, h, ''))) continue
+      const prefix = toolName(id, h, '')
+      if (name.startsWith(prefix) && (!owner || prefix.length > toolName(owner[0], owner[1], '').length)) owner = [id, h]
+    }
+    if (owner) {
+      const [id, h] = owner
       if (h.disabled) return text(`${name}: server ${id} is disabled — mcpl_enable starts it`, true)
       if (!isUp(h)) return text(`${name}: server ${id} is ${h.status}${h.lastError ? ` (${h.lastError})` : ''} — its tools come back when it reconnects (mcpl_reload server=${id} forces that)`, true)
     }

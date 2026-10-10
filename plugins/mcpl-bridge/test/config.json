@@ -78,6 +78,16 @@
       },
       "disabled": true
     },
+    "toyoff__deep": {
+      "transport": {
+        "command": "bun",
+        "args": [
+          "run",
+          "test/toy-server.ts"
+        ]
+      },
+      "disabled": true
+    },
     "toycrash": {
       "transport": {
         "command": "bun",

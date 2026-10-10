@@ -379,6 +379,8 @@ try {
     ok(/^toyoff: disabled \(config/.test(offLine), `mcpl_status lists the config-disabled server ("${offLine}")`)
     const offCall = await call('toyoff__ping')
     ok(offCall.isError === true && /server toyoff is disabled/.test(out(offCall)), `a call into a disabled server says so: "${out(offCall)}"`)
+    const deepCall = await call('toyoff__deep__ping')
+    ok(/server toyoff__deep is disabled/.test(out(deepCall)), `the hint names the longest matching server prefix, not toyoff: "${out(deepCall)}"`)
 
     // mcpl_enable: a session-scoped start.
     const en = await call('mcpl_enable', { server: 'toyoff' })
