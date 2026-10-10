@@ -63,7 +63,7 @@ async function startDemo() {
   demoStarted = true
   try {
     const reg = (await request('channels/register', {
-      channels: [{ id: 'toy:lobby', type: 'chat', label: 'Toy Lobby', direction: 'bidirectional' }],
+      channels: [{ id: 'toy:lobby', type: 'chat', label: 'Toy Lobby', direction: 'bidirectional', address: { channelId: 'raw-lobby' } }],
     })) as { results?: Array<{ id: string; accepted: boolean }> }
     log(`register: ${JSON.stringify(reg?.results)}`)
     if (!reg?.results?.some(r => r.id === 'toy:lobby' && r.accepted)) return
@@ -118,6 +118,30 @@ async function startDemo() {
         tags: ['chat:mention', 'chat:from-human'],
       }).then(r => log(`push(mention) result: ${JSON.stringify(r)}`))
     }, 1700)
+    // A push naming the channel only by its NATIVE id (what discord-mcpl's
+    // sweep/edit/delete/reaction pushes look like): must map via address.
+    setTimeout(() => {
+      void request('push/event', {
+        featureSet: 'toy',
+        eventId: 'evt-3',
+        timestamp: new Date().toISOString(),
+        origin: { source: 'toy', channelId: 'raw-lobby', messageId: 'toy-m5', authorId: 'u2', authorName: 'toyhuman' },
+        payload: { content: [{ type: 'text', text: 'toy native-id mention' }] },
+        tags: ['chat:mention', 'chat:from-human'],
+      }).then(r => log(`push(native) result: ${JSON.stringify(r)}`))
+    }, 1900)
+    // A DM naming no channel (the author is the only routing fact): admitted
+    // through dmAllowlist by author id even in whitelist mode.
+    setTimeout(() => {
+      void request('push/event', {
+        featureSet: 'toy',
+        eventId: 'evt-dm',
+        timestamp: new Date().toISOString(),
+        origin: { source: 'toy', messageId: 'toy-m6', authorId: 'u2', authorName: 'toyhuman' },
+        payload: { content: [{ type: 'text', text: 'toy dm from toyhuman' }] },
+        tags: ['chat:dm', 'chat:from-human'],
+      }).then(r => log(`push(dm) result: ${JSON.stringify(r)}`))
+    }, 2000)
     setTimeout(() => {
       void request('channels/incoming', { messages: [botReply('toy-m4', 'bot echo 2')] }).then(r => log(`incoming(bot2) result: ${JSON.stringify(r)}`))
     }, 2100)

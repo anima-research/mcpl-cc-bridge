@@ -40,6 +40,7 @@ import {
 //   is a stale publish missing the grant/manifest helpers).
 //   Re-sync: cp <mcpl-core-ts>/src/*.ts src/vendor/mcpl-core/
 import { ERR, computeGrant, expandTags, granted, methodCapability } from './grants'
+import { holdsAmbient } from './wake'
 import { DEFAULT_GRANT, isWs, resolveUrl, type ServerConfig, type StdioTransportConfig } from './config'
 import { ChannelRefError, ChannelRegistry, buildLabelView, isAddressableId, norm, resolveChannelRef, type LabelView } from './channel-labels'
 
@@ -95,6 +96,8 @@ export class McplServerHandle {
   readonly prefix: string
   /** Operator policy patterns; the effective grant is advertised ∩ this. */
   readonly policy: readonly string[]
+  /** Effective openOnAddressed: the config's, else on exactly when the wake policy holds chat:ambient. */
+  readonly openOnAddressed: boolean
 
   status: 'connecting' | 'ready' | 'mcp-only' | 'disconnected' | 'closed' = 'disconnected'
   tools: McplTool[] = []
@@ -109,6 +112,9 @@ export class McplServerHandle {
   /** Desired-open state: config `openChannels` plus mcpl_open/mcpl_close during the session.
    *  Survives reconnects — reconciled against each channels/register. */
   private desiredOpen: Set<string>
+  /** channels/open requests in flight (auto-open must not double-send). */
+  private opening = new Set<string>()
+  private warnedNoLifecycle = false
   grant: CapabilityPath[] = []
   featureSetsEnabled: string[] = []
   manifestRevision: string | null = null
@@ -134,6 +140,7 @@ export class McplServerHandle {
     this.prefix = cfg.toolPrefix ?? id
     this.cb = cb
     this.policy = cfg.grant ?? DEFAULT_GRANT
+    this.openOnAddressed = cfg.openOnAddressed ?? holdsAmbient(cfg.wake)
     this.desiredOpen = new Set(cfg.openChannels ?? [])
     this.backoffMs = cfg.reconnectIntervalMs ?? 5000
     this.firstAttempt = new Promise<void>(r => (this.firstAttemptResolve = r))
@@ -399,6 +406,19 @@ export class McplServerHandle {
         const o = (p.origin && typeof p.origin === 'object' ? p.origin : {}) as Record<string, unknown>
         const s = (v: unknown) => (v == null ? '' : String(v))
         const mcplChannel = s(o.mcplChannelId)
+        const native = s(o.channelId)
+        // The registered channel this push is from — by MCPL id, or by the
+        // producer's native id through the descriptors' address (discord-mcpl
+        // sends several pushes with only the native id). '' when nothing maps.
+        const from = this.channelFromOrigin(mcplChannel, native)
+        // Whitelist admission (openChannelsOnly / dmAllowlist) — §6.6: a
+        // rejection is diagnostics for the server, nothing more.
+        const refused = this.refusal({ channelId: from, refs: [mcplChannel, native], isDm: tags.includes('chat:dm'), authorId: s(o.authorId) })
+        if (refused) {
+          console.error(`${this.id}: dropped push from ${refused}`)
+          respond({ accepted: false, reason: `not admitted on this host: ${refused}` })
+          return
+        }
         this.cb.deliver({
           server: this.id,
           kind: 'push-event',
@@ -407,11 +427,11 @@ export class McplServerHandle {
             event_id: String(p.eventId ?? ''),
             feature_set: String(p.featureSet ?? ''),
             ts: String(p.timestamp ?? ''),
-            channel_id: mcplChannel || s(o.channelId),
-            native_channel_id: mcplChannel ? s(o.channelId) : '',
+            channel_id: from || mcplChannel || native,
+            native_channel_id: from && from !== native ? native : mcplChannel ? native : '',
             // The registered label (what mcpl_send/mcpl_open accept back);
             // channel_name is whatever the producer put on origin.
-            channel: this.labelOf(mcplChannel || s(o.channelId)),
+            channel: this.labelOf(from || mcplChannel || native),
             channel_name: s(o.channelName),
             guild: s(o.guildName),
             thread_id: s(o.threadId),
@@ -422,6 +442,25 @@ export class McplServerHandle {
           },
         })
         respond({ accepted: true })
+        // Addressed in a channel we don't follow → follow it (see config
+        // `openOnAddressed`). After the response: the open is a separate
+        // request on the same connection and must not gate this ack.
+        // Live-open or already being opened is the test — not desired-open:
+        // a configured channel whose open failed must be retried, not skipped.
+        const addressedIn = from
+        if (this.openOnAddressed && tags.includes('chat:addressed') && addressedIn && !this.openChannels.has(addressedIn) && !this.opening.has(addressedIn)) {
+          if (!granted(this.grant, 'channels.lifecycle')) {
+            if (!this.warnedNoLifecycle) {
+              this.warnedNoLifecycle = true
+              console.error(`${this.id}: addressed in ${this.labelOf(addressedIn) || addressedIn} but cannot open it: channels.lifecycle not granted (openOnAddressed is inert)`)
+            }
+          } else {
+            void this.openChannel(addressedIn, 0, { byId: true }).then(
+              r => { if (r.open) console.error(`${this.id}: opened ${r.label || addressedIn} (addressed there)`) },
+              err => console.error(`${this.id}: open-on-addressed failed for ${addressedIn}: ${(err as Error).message}`),
+            )
+          }
+        }
         return
       }
       case 'channels/register':
@@ -446,7 +485,7 @@ export class McplServerHandle {
         const toOpen = results
           .filter(r => r.accepted)
           .map(r => r.id)
-          .filter(cid => this.desiredOpen.has(cid) || (this.cfg.openChannels === undefined && this.channels.get(cid)?.initiallyOpen === true))
+          .filter(cid => this.desiredOpen.has(cid) || (this.cfg.openChannels === undefined && this.cfg.openChannelsOnly !== true && this.channels.get(cid)?.initiallyOpen === true))
         if (toOpen.length) void this.reconcileOpen(toOpen, myEpoch)
         return
       }
@@ -460,6 +499,12 @@ export class McplServerHandle {
           const known = this.channels.has(m.channelId)
           if (!known) return { messageId: m.messageId, accepted: false }
           const tags = expandTags(m.tags)
+          const native = (this.channels.get(m.channelId)?.address as { channelId?: unknown } | undefined)?.channelId
+          const refused = this.refusal({ channelId: m.channelId, refs: [m.channelId, native == null ? '' : String(native)], isDm: tags.includes('chat:dm'), authorId: String(m.author?.id ?? '') })
+          if (refused) {
+            console.error(`${this.id}: dropped incoming from ${refused}`)
+            return { messageId: m.messageId, accepted: false }
+          }
           this.cb.deliver({
             server: this.id,
             kind: 'channel-message',
@@ -536,7 +581,7 @@ export class McplServerHandle {
    * channels/incoming instead of only addressed pushes. Returns any history
    * the server handed back with the open (oldest first).
    */
-  async openChannel(ref: string, historyLimit = 0, opts: { byId?: boolean } = {}): Promise<{ channelId: string; label: string; history: IncomingChannelMessage[]; truncated: boolean }> {
+  async openChannel(ref: string, historyLimit = 0, opts: { byId?: boolean } = {}): Promise<{ channelId: string; label: string; history: IncomingChannelMessage[]; truncated: boolean; open: boolean }> {
     const conn = this.conn
     if (!conn || conn.isClosed) throw new Error(`${this.id}: not connected`)
     if (!granted(this.grant, 'channels.lifecycle')) throw new Error(`${this.id}: channels.lifecycle not granted (add it to the server's grant; the server must advertise it too)`)
@@ -552,10 +597,44 @@ export class McplServerHandle {
       address: desc.address ?? {},
       ...(historyLimit > 0 ? { history: { limit: historyLimit } } : {}),
     }
-    const r = (await conn.sendRequest('channels/open', params)) as ChannelsOpenResult
-    this.openChannels.add(channelId)
+    // Intent first, mirroring closeChannel: a transport drop between the
+    // request and its answer must not lose the open — the next reconcile
+    // re-sends it. The in-flight set stops a second addressed push from
+    // opening the same channel twice.
     this.desiredOpen.add(channelId)
-    return { channelId, label: this.labelOf(channelId), history: r?.history ?? [], truncated: r?.historyTruncated === true }
+    this.opening.add(channelId)
+    let r: ChannelsOpenResult
+    try {
+      r = (await conn.sendRequest('channels/open', params)) as ChannelsOpenResult
+    } finally {
+      this.opening.delete(channelId)
+    }
+    if (!this.desiredOpen.has(channelId)) {
+      // mcpl_close landed while the open was in flight: the explicit close
+      // wins. The server now has it open, so close it there too.
+      void conn.sendRequest('channels/close', { channelId }).catch(() => {})
+      return { channelId, label: this.labelOf(channelId), history: [], truncated: false, open: false }
+    }
+    this.openChannels.add(channelId)
+    return { channelId, label: this.labelOf(channelId), history: r?.history ?? [], truncated: r?.historyTruncated === true, open: true }
+  }
+
+  /**
+   * The registered channel a push/event's origin names: its MCPL id when the
+   * producer set `mcplChannelId`, else its native `channelId` mapped through
+   * the descriptors' `address.channelId` (discord-mcpl's reconnect sweep,
+   * edits, deletes and reactions carry only the native id), else a native id
+   * that happens to be a registered id. '' when nothing maps.
+   */
+  private channelFromOrigin(mcplId: string, native: string): string {
+    if (mcplId && this.channels.has(mcplId)) return mcplId
+    if (!native) return ''
+    if (this.channels.has(native)) return native
+    for (const d of this.channels.values()) {
+      const addr = d.address as { channelId?: unknown } | undefined
+      if (addr && typeof addr === 'object' && String(addr.channelId ?? '') === native) return d.id
+    }
+    return ''
   }
 
   async closeChannel(ref: string): Promise<{ channelId: string; label: string; closed: boolean }> {
@@ -580,6 +659,38 @@ export class McplServerHandle {
     this.openChannels.delete(channelId)
     const r = (await conn.sendRequest('channels/close', { channelId })) as ChannelsCloseResult
     return { channelId, label: this.labelOf(channelId) || channelId, closed: r?.closed === true }
+  }
+
+  /**
+   * Whitelist admission for one delivery; null when admitted, else why not.
+   *  - A DM (chat:dm), when `dmAllowlist` is set: its channel id (registered
+   *    or raw) or author id must be listed — the open set does not apply.
+   *  - Otherwise, under `openChannelsOnly`: the delivery's channel must be
+   *    registered and open (or meant to be). Fail closed on a channel id
+   *    that maps to nothing, and on a DM that names no channel at all.
+   *    Non-DM pushes with no channel (heartbeats) are not channel traffic.
+   */
+  refusal(d: { channelId: string; refs: string[]; isDm: boolean; authorId: string }): string | null {
+    // `refs`: every id the delivery names its channel by — the MCPL id and
+    // the producer's native id alike — so an allowlist entry in either form
+    // matches.
+    const named = d.refs.find(Boolean) ?? ''
+    const allow = this.cfg.dmAllowlist
+    if (d.isDm && allow) {
+      const listed = [d.channelId, ...d.refs, d.authorId].some(x => x && allow.includes(x))
+      return listed ? null : `DM ${d.channelId ? this.labelOf(d.channelId) || d.channelId : named || `from ${d.authorId || 'unknown author'}`} (not in dmAllowlist)`
+    }
+    if (this.cfg.openChannelsOnly !== true) return null
+    if (!named && !d.channelId && !d.isDm) return null
+    if (!d.channelId) return `${d.isDm ? 'DM in ' : ''}unregistered channel ${named || '(none named)'} (openChannelsOnly)`
+    if (!this.isOpen(d.channelId)) return `${d.isDm ? 'DM in ' : ''}closed channel ${this.labelOf(d.channelId) || d.channelId} (openChannelsOnly)`
+    return null
+  }
+
+  /** Open, or meant to be: live-open this epoch, or in the desired-open set
+   *  (config `openChannels` + mcpl_open) awaiting reconcile. */
+  private isOpen(channelId: string): boolean {
+    return this.openChannels.has(channelId) || this.desiredOpen.has(channelId)
   }
 
   /** Display labels for the registered set, recomputed when it changes (see channel-labels.ts). */
@@ -622,8 +733,8 @@ export class McplServerHandle {
         return
       }
       try {
-        await this.openChannel(cid, 0, { byId: true })
-        this.log(`opened ${cid}`)
+        const r = await this.openChannel(cid, 0, { byId: true })
+        if (r.open) this.log(`opened ${cid}`)
       } catch (e) {
         this.log(`open ${cid} failed: ${e instanceof Error ? e.message : e}`)
       }

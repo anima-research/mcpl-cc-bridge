@@ -84,6 +84,41 @@ export type ServerConfig = {
    * the live set; this list is what survives a restart.
    */
   openChannels?: string[]
+  /**
+   * Open a registered channel the moment a push/event tagged `chat:addressed`
+   * arrives from it while it is closed — the host-side analog of "follow the
+   * room you were just spoken to in". A closed channel delivers only what
+   * addresses the agent, so everything said between two mentions is never
+   * seen; once open, its ordinary traffic arrives as channels/incoming and the
+   * wake policy decides whether that wakes or is held (`"wake": "chat"` holds
+   * it). Default: on when the server's wake policy HOLDS chat:ambient (the
+   * "chat" preset, or a hold rule matching it), off otherwise — under
+   * `"wake": "all"` an implicit open would turn one mention into a wake per
+   * message for the rest of the session. Set explicitly to override. Needs
+   * channels.lifecycle in the grant. The open joins the session's desired-open
+   * set (survives reconnects, not restarts — put the id in `openChannels` for
+   * that).
+   */
+  openOnAddressed?: boolean
+  /**
+   * Treat the open set as a whitelist: a push/event or channels/incoming from
+   * a registered channel that is NOT open (neither in `openChannels` nor opened
+   * with mcpl_open this session) is dropped — not delivered, not held, not
+   * opened — and the server is told so (accepted: false). Being addressed in
+   * such a channel therefore never wakes the session. DMs (`chat:dm`) are
+   * judged the same way — by the open set — unless `dmAllowlist` is set.
+   * Default: false (any addressed push is accepted and, with
+   * `openOnAddressed`, opens its channel).
+   */
+  openChannelsOnly?: boolean
+  /**
+   * The gate for DMs (deliveries tagged `chat:dm`), replacing the open set for
+   * them: a DM is admitted only when its channel id or its author id is
+   * listed. Applies whenever present, with or without `openChannelsOnly`;
+   * `[]` admits no DMs. Absent: DMs are gated by `openChannelsOnly` like any
+   * channel (and not at all without it).
+   */
+  dmAllowlist?: string[]
   /** Reconnect on transport failure. Default: true for ws, false for stdio. */
   reconnect?: boolean
   reconnectIntervalMs?: number
@@ -135,6 +170,12 @@ export function loadConfig(): { config: BridgeConfig; path: string | null } {
     }
     if (s.openChannels !== undefined && !(Array.isArray(s.openChannels) && s.openChannels.every(c => typeof c === 'string'))) {
       throw new Error(`${path}: servers.${id}: openChannels must be an array of channel ids`)
+    }
+    if (s.dmAllowlist !== undefined && !(Array.isArray(s.dmAllowlist) && s.dmAllowlist.every(c => typeof c === 'string'))) {
+      throw new Error(`${path}: servers.${id}: dmAllowlist must be an array of channel or author ids`)
+    }
+    for (const k of ['openOnAddressed', 'openChannelsOnly'] as const) {
+      if (s[k] !== undefined && typeof s[k] !== 'boolean') throw new Error(`${path}: servers.${id}: ${k} must be a boolean`)
     }
   }
   return { config: raw, path }

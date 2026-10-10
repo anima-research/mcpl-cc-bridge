@@ -210,6 +210,31 @@ try {
     ok(meta(mention).native_channel_id === 'raw-lobby', 'native channel id kept beside the MCPL id')
   }
 
+  // ── DMs: toygate is in whitelist mode with dmAllowlist [u2] — a DM from u2 that names no channel is admitted ──
+  await waitForChannel(p => meta(p).server === 'toygate' && String(p.content).includes('toy dm from toyhuman'), 'dmAllowlist admitted a DM by author under openChannelsOnly')
+  await waitForChannel(p => meta(p).server === 'toy2' && String(p.content).includes('toy dm from toyhuman'), 'DM delivered where no whitelist applies')
+
+  // ── open-on-addressed: toy2 has no openChannels, so its lobby starts closed;
+  //    the from-human mention push (chat:addressed) must open it. toy2 runs
+  //    wake "all", where the default is OFF — its config opts in explicitly. ──
+  for (let i = 0; i < 40 && !stderr1.includes('toy2: opened Toy Lobby (addressed there)'); i++) await new Promise(r => setTimeout(r, 250))
+  ok(stderr1.includes('toy2: opened Toy Lobby (addressed there)'), 'addressed push from a closed channel opened it (openOnAddressed: true)')
+  const statusAuto = (await request('tools/call', { name: 'mcpl_status', arguments: {} })) as { content: Array<{ text: string }> }
+  ok(/toy2: .*open=\[Toy Lobby\]/.test(statusAuto?.content?.[0]?.text ?? ''), 'mcpl_status shows the auto-opened channel on toy2')
+  const nativePush = await waitForChannel(p => meta(p).server === 'toy2' && String(p.content).includes('toy native-id mention'), 'native-id-only push delivered on toy2')
+  if (nativePush) ok(meta(nativePush).channel_id === 'toy:lobby' && meta(nativePush).native_channel_id === 'raw-lobby', `native id mapped to the registered channel (channel_id=${meta(nativePush).channel_id} native=${meta(nativePush).native_channel_id})`)
+  ok((stderr1.match(/toy2: opened Toy Lobby \(addressed there\)/g) ?? []).length === 1, 'the second addressed push did not open the channel again')
+
+  // ── openChannelsOnly: toygate holds nothing open, so everything from its lobby is refused ──
+  for (let i = 0; i < 40 && !stderr1.includes('toygate: dropped push from closed channel Toy Lobby (openChannelsOnly)'); i++) await new Promise(r => setTimeout(r, 250))
+  ok(stderr1.includes('toygate: dropped push from closed channel Toy Lobby (openChannelsOnly)'), 'openChannelsOnly refused the addressed push from a closed channel')
+  ok(stderr1.includes('toygate: dropped incoming from closed channel Toy Lobby (openChannelsOnly)'), 'openChannelsOnly refused channels/incoming from a closed channel')
+  ok(!stderr1.includes('toygate: opened'), 'openChannelsOnly never auto-opens')
+  ok(!notifications.some(n => n.method === 'notifications/claude/channel' && meta(n.params).server === 'toygate' && String(n.params.content).includes('toy native-id mention')), 'native-id-only push from the gated channel was refused too')
+  ok(!notifications.some(n => n.method === 'notifications/claude/channel' && meta(n.params).server === 'toygate' && /toy human mention|hello from the toy lobby|bot echo/.test(String(n.params.content))), 'nothing from the gated channel reached the session')
+  const statusGate = (await request('tools/call', { name: 'mcpl_status', arguments: {} })) as { content: Array<{ text: string }> }
+  ok(/toygate: .*open=\[—\]/.test(statusGate?.content?.[0]?.text ?? ''), 'toygate still holds nothing open')
+
   // ── channels/open + close via tools ──
   const closed = (await request('tools/call', { name: 'mcpl_close', arguments: { server: 'toy', channel_id: 'toy:lobby' } })) as { content: Array<{ text: string }> }
   ok(closed?.content?.[0]?.text === 'closed Toy Lobby (toy:lobby)', `mcpl_close by id → "${closed?.content?.[0]?.text}"`)
