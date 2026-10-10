@@ -19,6 +19,7 @@ import { homedir } from 'os'
 import { basename, dirname, join } from 'path'
 import { loadConfig, type ServerConfig } from './config'
 import { McplServerHandle, type IncomingDelivery } from './mcpl-host'
+import { withBridgeClass } from './tool-classes'
 import { WakeGate } from './wake'
 
 import { appendFileSync } from 'fs'
@@ -176,7 +177,10 @@ process.on('SIGHUP', () => {
   else log('SIGHUP ignored on a replica — signal the primary or call mcpl_reload')
 })
 
-const BRIDGE_TOOLS: Array<{ name: string; description: string; inputSchema: Record<string, unknown> }> = [
+type ToolDef = { name: string; description: string; inputSchema: Record<string, unknown>; _meta?: Record<string, unknown> }
+
+// Each declares its RFC-008 class in _meta (src/tool-classes.ts).
+const BRIDGE_TOOLS: ToolDef[] = [
   {
     name: 'mcpl_status',
     description: 'Show every bridged MCPL server: connection status, effective capability grant, enabled feature sets, registered channel count, open channels (by label), proxied tool count, pending inference requests. Use mcpl_channels for the channel list.',
@@ -250,7 +254,9 @@ const BRIDGE_TOOLS: Array<{ name: string; description: string; inputSchema: Reco
       required: ['server', 'request_id', 'content'],
     },
   },
-]
+].map(withBridgeClass)
+
+const isPlainObject = (v: unknown): v is Record<string, unknown> => typeof v === 'object' && v !== null && !Array.isArray(v)
 
 function toolName(serverId: string, handle: McplServerHandle, raw: string): string {
   return `${handle.prefix}__${raw}`.replace(/[^a-zA-Z0-9_-]/g, '_')
@@ -273,6 +279,10 @@ async function listToolsImpl() {
         name: toolName(id, h, t.name),
         description: `[mcpl:${id}] ${t.description ?? t.name}`,
         inputSchema: (t.inputSchema as { type: 'object' }) ?? { type: 'object', properties: {} },
+        // The upstream tool's _meta rides through unchanged, every key — notably
+        // RFC-008's mcpl/class, which the host reads for policy. Only a non-object
+        // is dropped: it would fail the client's validation of the whole list.
+        ...(isPlainObject(t._meta) ? { _meta: t._meta } : {}),
       })
     }
   }
@@ -453,23 +463,33 @@ function startHandles() {
   installConfigWatch()
 }
 
-// Sweep stale sockets: pid-keyed ones whose pid died, and any socket file
-// older than a day (session-id-keyed ones can't be liveness-checked by name).
+// Sweep stale sockets. A pid-keyed socket is stale when its pid is gone. A
+// session-keyed one cannot be liveness-checked by name, and its mtime says
+// nothing either: a unix socket file's mtime is its creation time, so a
+// healthy primary that has served hooks for a week reads as "a day old". The
+// earlier sweep deleted on exactly that basis — every later adapter start
+// (a headless doorbell session, a pulse, a second CC window) unlinked the
+// live session's socket, and from then on every hook of that session
+// fail-opened with "socket: NOT FOUND": held deliveries never surfaced, no
+// lifecycle reached the servers, and nothing said so (found 2026-09-14: a
+// week-old session with 13 held pings and a socket directory with no socket
+// in it). So a session-keyed socket is asked, not aged: a live primary
+// answers ping; anything that does not is a corpse. Our own path is not in
+// the directory yet — this runs before bindSocket.
 try {
-  const { readdirSync, statSync } = await import('fs')
+  const { readdirSync } = await import('fs')
   for (const f of readdirSync(SOCK_DIR)) {
     const m = /^sock-(.+)\.sock$/.exec(f)
     if (!m) continue
+    const p = join(SOCK_DIR, f)
     if (/^\d+$/.test(m[1])) {
       try {
         process.kill(Number(m[1]), 0)
       } catch {
-        rmSync(join(SOCK_DIR, f), { force: true })
+        rmSync(p, { force: true })
       }
-    } else {
-      try {
-        if (Date.now() - statSync(join(SOCK_DIR, f)).mtimeMs > 86_400_000) rmSync(join(SOCK_DIR, f), { force: true })
-      } catch {}
+    } else if (!(await socketAlive(p))) {
+      rmSync(p, { force: true })
     }
   }
 } catch {}
@@ -582,12 +602,24 @@ function bindSocket(steal = false): boolean {
   }
 }
 
-function socketRoundtrip(payload: string, timeoutMs: number): Promise<string> {
+/** Is there a live primary behind this socket path? A ping answered with
+ *  pong within the timeout is the only evidence accepted; a refused connect,
+ *  a plain file, or silence all mean no. */
+async function socketAlive(path: string, timeoutMs = 1500): Promise<boolean> {
+  try {
+    const reply = await socketRoundtrip(JSON.stringify({ kind: 'ping' }) + '\n', timeoutMs, path)
+    return /"pong"\s*:\s*true/.test(reply)
+  } catch {
+    return false
+  }
+}
+
+function socketRoundtrip(payload: string, timeoutMs: number, path: string = sockPath): Promise<string> {
   return new Promise<string>((resolve, reject) => {
     const chunks: Buffer[] = []
     const timer = setTimeout(() => reject(new Error('socket timeout')), timeoutMs)
     Bun.connect({
-      unix: sockPath,
+      unix: path,
       socket: {
         open(s) {
           s.write(payload)

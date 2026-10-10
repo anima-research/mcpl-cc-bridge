@@ -178,6 +178,8 @@ function handle(msg: Json) {
             name: 'ping',
             description: 'Replies pong (toy MCPL tool).',
             inputSchema: { type: 'object', properties: { echo: { type: 'string' } } },
+            // RFC-008 class plus an unrelated key; the bridge must pass both through.
+            _meta: { 'mcpl/class': ['control'], 'toy/extra': { nested: [1, 'two'] } },
           },
         ],
       })

@@ -42,7 +42,7 @@ import {
 import { ERR, computeGrant, expandTags, granted, methodCapability } from './grants'
 import { DEFAULT_GRANT, isWs, resolveUrl, type ServerConfig, type StdioTransportConfig } from './config'
 
-export type McplTool = { name: string; description?: string; inputSchema?: unknown }
+export type McplTool = { name: string; description?: string; inputSchema?: unknown; _meta?: Record<string, unknown> }
 
 export type IncomingDelivery = {
   server: string
