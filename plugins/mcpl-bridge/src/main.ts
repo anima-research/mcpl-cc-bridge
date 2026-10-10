@@ -580,6 +580,8 @@ async function callToolImpl(name: string, args: Record<string, unknown>): Promis
       if (!h) return text(`unknown server: ${args.server}`, true)
       const limit = typeof args.history_limit === 'number' ? Math.max(0, Math.floor(args.history_limit)) : 0
       const r = await h.openChannel(String(args.channel_id), limit)
+      // A close issued while this open was in flight wins; say so instead of "opened".
+      if (!r.open) return text(`${r.label} (${r.channelId}) was not opened: a close for it landed while the open was in flight, and the close wins. Call mcpl_open again to open it.`, true)
       const lines = [`opened ${r.label} (${r.channelId})`]
       if (r.history.length) {
         lines.push(`history (${r.history.length}${r.truncated ? ', truncated' : ''}, oldest first):`)

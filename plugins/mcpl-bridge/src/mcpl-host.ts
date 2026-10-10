@@ -42,7 +42,7 @@ import {
 import { ERR, computeGrant, expandTags, granted, methodCapability } from './grants'
 import { holdsAmbient } from './wake'
 import { DEFAULT_GRANT, isWs, resolveUrl, type ServerConfig, type StdioTransportConfig } from './config'
-import { ChannelRefError, ChannelRegistry, buildLabelView, resolveChannelRef, type LabelView } from './channel-labels'
+import { ChannelRefError, ChannelRegistry, buildLabelView, norm, resolveChannelRef, type LabelView } from './channel-labels'
 
 export type McplTool = { name: string; description?: string; inputSchema?: unknown; _meta?: Record<string, unknown> }
 
@@ -110,6 +110,10 @@ export class McplServerHandle {
   tools: McplTool[] = []
   channels = new ChannelRegistry()
   private labelCache: { version: number; view: LabelView } | null = null
+  /** Every display label (normalized) each channel id has been shown with —
+   *  kept across reconnects so a reference printed earlier never silently
+   *  names a different channel later (see channel-labels.ts). */
+  private shownLabels = new Map<string, Set<string>>()
   /** Channels currently open on the live connection (channels/open succeeded this epoch). */
   openChannels = new Set<string>()
   /** Desired-open state: config `openChannels` plus mcpl_open/mcpl_close during the session.
@@ -644,7 +648,7 @@ export class McplServerHandle {
         const from = this.channelFromOrigin(mcplChannel, native)
         // Whitelist admission (openChannelsOnly / dmAllowlist) — §6.6: a
         // rejection is diagnostics for the server, nothing more.
-        const refused = this.refusal({ channelId: from, rawChannel: mcplChannel || native, isDm: tags.includes('chat:dm'), authorId: s(o.authorId) })
+        const refused = this.refusal({ channelId: from, refs: [mcplChannel, native], isDm: tags.includes('chat:dm'), authorId: s(o.authorId) })
         if (refused) {
           console.error(`${this.id}: dropped push from ${refused}`)
           respond({ accepted: false, reason: `not admitted on this host: ${refused}` })
@@ -728,7 +732,8 @@ export class McplServerHandle {
           const known = this.channels.has(m.channelId)
           if (!known) return { messageId: m.messageId, accepted: false }
           const tags = expandTags(m.tags)
-          const refused = this.refusal({ channelId: m.channelId, rawChannel: m.channelId, isDm: tags.includes('chat:dm'), authorId: String(m.author?.id ?? '') })
+          const native = (this.channels.get(m.channelId)?.address as { channelId?: unknown } | undefined)?.channelId
+          const refused = this.refusal({ channelId: m.channelId, refs: [m.channelId, native == null ? '' : String(native)], isDm: tags.includes('chat:dm'), authorId: String(m.author?.id ?? '') })
           if (refused) {
             console.error(`${this.id}: dropped incoming from ${refused}`)
             return { messageId: m.messageId, accepted: false }
@@ -896,15 +901,19 @@ export class McplServerHandle {
    *    that maps to nothing, and on a DM that names no channel at all.
    *    Non-DM pushes with no channel (heartbeats) are not channel traffic.
    */
-  refusal(d: { channelId: string; rawChannel: string; isDm: boolean; authorId: string }): string | null {
+  refusal(d: { channelId: string; refs: string[]; isDm: boolean; authorId: string }): string | null {
+    // `refs`: every id the delivery names its channel by — the MCPL id and
+    // the producer's native id alike — so an allowlist entry in either form
+    // matches.
+    const named = d.refs.find(Boolean) ?? ''
     const allow = this.cfg.dmAllowlist
     if (d.isDm && allow) {
-      const listed = [d.channelId, d.rawChannel, d.authorId].some(x => x && allow.includes(x))
-      return listed ? null : `DM ${d.channelId ? this.labelOf(d.channelId) || d.channelId : d.rawChannel || `from ${d.authorId || 'unknown author'}`} (not in dmAllowlist)`
+      const listed = [d.channelId, ...d.refs, d.authorId].some(x => x && allow.includes(x))
+      return listed ? null : `DM ${d.channelId ? this.labelOf(d.channelId) || d.channelId : named || `from ${d.authorId || 'unknown author'}`} (not in dmAllowlist)`
     }
     if (this.cfg.openChannelsOnly !== true) return null
-    if (!d.rawChannel && !d.isDm) return null
-    if (!d.channelId) return `${d.isDm ? 'DM in ' : ''}unregistered channel ${d.rawChannel || '(none named)'} (openChannelsOnly)`
+    if (!named && !d.channelId && !d.isDm) return null
+    if (!d.channelId) return `${d.isDm ? 'DM in ' : ''}unregistered channel ${named || '(none named)'} (openChannelsOnly)`
     if (!this.isOpen(d.channelId)) return `${d.isDm ? 'DM in ' : ''}closed channel ${this.labelOf(d.channelId) || d.channelId} (openChannelsOnly)`
     return null
   }
@@ -926,7 +935,14 @@ export class McplServerHandle {
   /** Display labels for the registered set, recomputed when it changes (see channel-labels.ts). */
   private get labelView(): LabelView {
     if (!this.labelCache || this.labelCache.version !== this.channels.version) {
-      this.labelCache = { version: this.channels.version, view: buildLabelView(this.channels) }
+      const view = buildLabelView(this.channels, this.shownLabels)
+      for (const [id, l] of view.labels) {
+        if (l.startsWith('id:')) continue // the escape needs no memory
+        let seen = this.shownLabels.get(id)
+        if (!seen) this.shownLabels.set(id, (seen = new Set()))
+        seen.add(norm(l))
+      }
+      this.labelCache = { version: this.channels.version, view }
     }
     return this.labelCache.view
   }
