@@ -124,3 +124,67 @@ test('every display label resolves to its own channel across a dense collision s
     expect(h.resolveChannel(`id:${id}`)).toBe(id)
   }
 })
+
+// ── Review round 2 (greptile): saved references across label shifts; case-only id differences ──
+
+test('a form printed earlier never silently names another channel after labels shift', () => {
+  const h = handleWith({ id: 'a', label: 'general' })
+  expect(h.labelOf('a')).toBe('general') // printed — remembered
+  h.channels.set('b', { id: 'b', type: 'chat', direction: 'bidirectional', label: 'general (Guild)' })
+  expect(h.labelOf('a')).toBe('general (a)') // printed — remembered
+  h.channels.set('c', { id: 'c', type: 'chat', direction: 'bidirectional', label: 'general (a)' })
+  // c's server label is a's earlier display label: neither may claim it alone now
+  expect(() => h.resolveChannel('general (a)')).toThrow(/ambiguous/)
+  expect(() => h.resolveChannel('general')).toThrow(/ambiguous/)
+  for (const id of ['a', 'b', 'c']) expect(h.resolveChannel(h.labelOf(id))).toBe(id)
+  expect(h.labelOf('a')).toBe('id:a')
+})
+
+test('ids differing only in case get the exact id: escape, which tells them apart', () => {
+  const h = handleWith({ id: 'room:a', label: 'General' }, { id: 'room:A', label: 'General' })
+  expect(h.labelOf('room:a')).toBe('id:room:a')
+  expect(h.labelOf('room:A')).toBe('id:room:A')
+  expect(h.resolveChannel(h.labelOf('room:a'))).toBe('room:a')
+  expect(h.resolveChannel(h.labelOf('room:A'))).toBe('room:A')
+})
+
+test('labels are one printable line', () => {
+  const h = handleWith({ id: 'd:1', label: 'line one\nline\ttwo\u0007' })
+  expect(h.labelOf('d:1')).toBe('line one line two')
+  expect(h.resolveChannel('line one line two')).toBe('d:1')
+})
+
+test('property: across random comings and goings, every printed label names its channel or errs — never another channel', () => {
+  let seed = 7
+  const rand = (n: number) => {
+    seed = (seed * 1103515245 + 12345) % 2147483648
+    return seed % n
+  }
+  const pool = ['general', 'General', 'general (A)', 'general (a)', 'general (x:1)', 'x:1', 'id:x:1', '#general', 'lobby', 'lobby (East)', 'Lobby (east)', 'x:2']
+  const idPool = ['x:1', 'x:2', 'x:3', 'X:1', 'a', 'A', 'general', 'lobby']
+  for (let run = 0; run < 40; run++) {
+    const h = handleWith()
+    const printed: Array<[string, string]> = []
+    for (let step = 0; step < 25; step++) {
+      const id = idPool[rand(idPool.length)]
+      if (h.channels.has(id) && rand(3) === 0) h.channels.delete(id)
+      else h.channels.set(id, { id, type: 'chat', direction: 'bidirectional', label: pool[rand(pool.length)] })
+      for (const cid of h.channels.keys()) {
+        const l = h.labelOf(cid)
+        expect(h.resolveChannel(l)).toBe(cid) // the current label works
+        printed.push([cid, l])
+      }
+      for (const [cid, l] of printed) {
+        if (!h.channels.has(cid)) continue
+        let got: string | null = null
+        try {
+          got = h.resolveChannel(l)
+        } catch (e) {
+          expect(String((e as Error).message)).toMatch(/ambiguous/) // a remembered form may become ambiguous…
+          continue
+        }
+        expect(got).toBe(cid) // …but never names another channel
+      }
+    }
+  }
+})

@@ -7,25 +7,27 @@
  * against the same display labels. Two rules keep that safe:
  *
  *  1. Ambiguity is an error. A reference resolves when exactly one channel
- *     answers to it — by display label, by display label minus a trailing
- *     ` (qualifier)`, or by id. Two or more is an error naming each match; no
- *     form ever wins over another, because a "best guess" is a silent
- *     wrong-room delivery.
+ *     answers to it. A channel answers to its server label, its display
+ *     label, either minus a trailing ` (qualifier)`, every display label it
+ *     was ever shown with, and its id. Two or more is an error naming each
+ *     match; no form ever wins over another, because a "best guess" is a
+ *     silent wrong-room delivery.
  *  2. Labels are disambiguated actively, so (1) never strands a channel. A
- *     server's label is used as-is unless the reference it prints would also
- *     answer for another channel — an exact duplicate, a bare label beside a
- *     qualified sibling (`general` / `general (Guild)`), a label equal to
- *     another channel's id. Each such channel is shown with its id appended
- *     (`general (discord:1234)`), which no other channel answers to. A
- *     label that begins with `id:` is shown with a leading `#` so it never
- *     reads as the id escape.
+ *     server's label is shown as-is unless it would also answer for another
+ *     channel — an exact duplicate, a bare label beside a qualified sibling
+ *     (`general` / `general (Guild)`), a label equal to another channel's id.
+ *     Such a channel is shown with its id appended (`general (discord:1234)`)
+ *     and, if even that is taken (ids differing only in case, a look-alike
+ *     label), as `id:<id>`. A label beginning with `id:` is shown with a
+ *     leading `#` so it never reads as the escape.
  *
- * `id:<id>` is the escape: it means the id and nothing else.
+ * `id:<id>` is the escape: it means that exact id and nothing else.
  *
  * Display labels are recomputed whenever the registered set changes, so a
- * label can gain a qualifier when a look-alike registers. A reference printed
- * before then either still resolves to its channel or is an ambiguity error
- * listing the current forms — never a delivery to the other room.
+ * label can gain a qualifier when a look-alike registers. Because a channel
+ * keeps answering to every form it was shown with, a reference printed before
+ * then still names its channel — alone, or as an ambiguity error listing the
+ * current forms. Never a delivery to the other room.
  */
 import type { ChannelDescriptor } from './vendor/mcpl-core/index.js'
 
@@ -50,66 +52,88 @@ export const norm = (s: string) => s.trim().replace(/^#/, '').toLowerCase()
 /** A label minus one trailing ` (qualifier)`, normalized. */
 export const unqualified = (label: string) => norm(label.replace(/\s*\([^()]*\)\s*$/, ''))
 
-/** What the server called it; a missing or non-string label falls back to the id. */
+/**
+ * What the server called it, as one printable line: control characters and
+ * runs of whitespace collapse to a space (a label is printed inside list rows
+ * and a channel="…" attribute). Missing, non-string or empty falls back to
+ * the id.
+ */
 export function baseLabel(d: ChannelDescriptor): string {
-  const l = typeof (d as { label?: unknown }).label === 'string' ? d.label.trim() : ''
+  const raw = typeof (d as { label?: unknown }).label === 'string' ? d.label : ''
+  const l = raw.replace(/[\u0000-\u001f\u007f]+/g, ' ').replace(/\s+/g, ' ').trim()
   return l || d.id
 }
 
 export type LabelView = {
   /** channel id → display label */
   labels: Map<string, string>
-  /** normalized display label → ids */
-  full: Map<string, Set<string>>
-  /** normalized display label minus its trailing qualifier → ids */
-  unq: Map<string, Set<string>>
+  /** normalized form → ids of the channels that answer to it */
+  keys: Map<string, Set<string>>
 }
 
-function indexLabels(labels: Map<string, string>): LabelView {
-  const full = new Map<string, Set<string>>()
-  const unq = new Map<string, Set<string>>()
-  const add = (m: Map<string, Set<string>>, k: string, id: string) => {
-    let s = m.get(k)
-    if (!s) m.set(k, (s = new Set()))
-    s.add(id)
-  }
-  for (const [id, l] of labels) {
-    add(full, norm(l), id)
-    add(unq, unqualified(l), id)
-  }
-  return { labels, full, unq }
-}
-
-/** Every channel an (unprefixed) reference could mean: by label, by label minus qualifier, or by id. */
-function candidates(ref: string, view: LabelView, channels: ReadonlyMap<string, unknown>): Set<string> {
+/** Every channel an unprefixed reference could mean: by any form it answers to, or by exact id. */
+function candidates(ref: string, keys: Map<string, Set<string>>, channels: ReadonlyMap<string, unknown>): Set<string> {
   const raw = ref.trim()
-  const want = norm(raw)
-  const out = new Set<string>()
-  for (const id of view.full.get(want) ?? []) out.add(id)
-  for (const id of view.unq.get(want) ?? []) out.add(id)
+  const out = new Set(keys.get(norm(raw)) ?? [])
   if (channels.has(raw)) out.add(raw)
   return out
 }
 
-/** Display labels for the registered set: each one resolves to its own channel and nothing else. */
-export function buildLabelView(channels: ReadonlyMap<string, ChannelDescriptor>): LabelView {
-  const labels = new Map<string, string>()
-  for (const [id, d] of channels) {
-    const l = baseLabel(d)
-    labels.set(id, l.startsWith('id:') ? `#${l}` : l)
+/**
+ * Display labels for the registered set.
+ *
+ * A channel answers to: its server label and that label minus a qualifier,
+ * its display label and that minus a qualifier, and — via `shown` — every
+ * display label it was ever printed with. Keeping the old forms is what makes
+ * a saved reference safe: when labels shift as channels come and go, a form
+ * printed earlier still names its channel, so if it now also names another it
+ * is an ambiguity error instead of a delivery to the other room.
+ *
+ * Each channel's display label escalates only as far as it must to answer for
+ * that channel alone: the server label; else `label (id)`; else `id:<id>` —
+ * the exact, case-sensitive escape, which always resolves to exactly one
+ * channel (ids differing only in case can't be told apart by the
+ * case-insensitive label match). A label beginning with `id:` is shown with a
+ * leading `#` so it never reads as the escape.
+ */
+export function buildLabelView(channels: ReadonlyMap<string, ChannelDescriptor>, shown: ReadonlyMap<string, ReadonlySet<string>> = new Map()): LabelView {
+  const ids = [...channels.keys()]
+  const base = new Map(ids.map(id => [id, baseLabel(channels.get(id)!)] as const))
+  const plain = (id: string) => {
+    const b = base.get(id)!
+    return b.startsWith('id:') ? `#${b}` : b
   }
-  // One round settles every realistic case (ids are unique, so "label (id)"
-  // collides with nothing); the cap only bounds pathological label/id mixes.
-  for (let round = 0; round < 4; round++) {
-    const view = indexLabels(labels)
-    const clashing = [...labels].filter(([id, l]) => {
-      const c = candidates(l, view, channels)
+  const stage = new Map(ids.map(id => [id, 0] as const))
+  const labelAt = (id: string) => (stage.get(id) === 0 ? plain(id) : stage.get(id) === 1 ? `${plain(id)} (${id})` : `id:${id}`)
+
+  // Each round escalates every channel whose label still answers for another;
+  // stages only rise and stop at 2, so this ends within 2n+1 rounds.
+  for (let round = 0; ; round++) {
+    const labels = new Map(ids.map(id => [id, labelAt(id)] as const))
+    const keys = new Map<string, Set<string>>()
+    const add = (k: string, id: string) => {
+      let set = keys.get(k)
+      if (!set) keys.set(k, (set = new Set()))
+      set.add(id)
+    }
+    for (const id of ids) {
+      add(norm(base.get(id)!), id)
+      add(unqualified(base.get(id)!), id)
+      const l = labels.get(id)!
+      if (!l.startsWith('id:')) {
+        add(norm(l), id)
+        add(unqualified(l), id)
+      }
+      for (const k of shown.get(id) ?? []) add(k, id)
+    }
+    const clashing = ids.filter(id => {
+      if (stage.get(id) === 2) return false
+      const c = candidates(labels.get(id)!, keys, channels)
       return c.size !== 1 || !c.has(id)
     })
-    if (!clashing.length) return view
-    for (const [id, l] of clashing) labels.set(id, `${l} (${id})`)
+    if (!clashing.length || round > 2 * ids.length) return { labels, keys }
+    for (const id of clashing) stage.set(id, stage.get(id)! + 1)
   }
-  return indexLabels(labels)
 }
 
 export class ChannelRefError extends Error {
@@ -130,7 +154,7 @@ export function resolveChannelRef(ref: string, channels: ReadonlyMap<string, Cha
     if (channels.has(id)) return id
     throw new ChannelRefError(`${serverId}: unknown channel id "${id}" (${channels.size} registered — use mcpl_channels to list labels and ids)`, 'unknown')
   }
-  const c = [...candidates(raw, view, channels)]
+  const c = [...candidates(raw, view.keys, channels)]
   if (c.length === 1) return c[0]
   if (c.length === 0) {
     throw new ChannelRefError(`${serverId}: unknown channel "${ref}" (${channels.size} registered — use mcpl_channels to list labels and ids)`, 'unknown')
