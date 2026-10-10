@@ -41,6 +41,7 @@ import {
 //   Re-sync: cp <mcpl-core-ts>/src/*.ts src/vendor/mcpl-core/
 import { ERR, computeGrant, expandTags, granted, methodCapability } from './grants'
 import { DEFAULT_GRANT, isWs, resolveUrl, type ServerConfig, type StdioTransportConfig } from './config'
+import { ChannelRefError, ChannelRegistry, buildLabelView, isAddressableId, norm, resolveChannelRef, type LabelView } from './channel-labels'
 
 export type McplTool = { name: string; description?: string; inputSchema?: unknown; _meta?: Record<string, unknown> }
 
@@ -97,7 +98,12 @@ export class McplServerHandle {
 
   status: 'connecting' | 'ready' | 'mcp-only' | 'disconnected' | 'closed' = 'disconnected'
   tools: McplTool[] = []
-  channels = new Map<string, ChannelDescriptor>()
+  channels = new ChannelRegistry()
+  private labelCache: { version: number; view: LabelView } | null = null
+  /** Every display label (normalized) each channel id has been shown with —
+   *  kept across reconnects so a reference printed earlier never silently
+   *  names a different channel later (see channel-labels.ts). */
+  private shownLabels = new Map<string, Set<string>>()
   /** Channels currently open on the live connection (channels/open succeeded this epoch). */
   openChannels = new Set<string>()
   /** Desired-open state: config `openChannels` plus mcpl_open/mcpl_close during the session.
@@ -403,6 +409,9 @@ export class McplServerHandle {
             ts: String(p.timestamp ?? ''),
             channel_id: mcplChannel || s(o.channelId),
             native_channel_id: mcplChannel ? s(o.channelId) : '',
+            // The registered label (what mcpl_send/mcpl_open accept back);
+            // channel_name is whatever the producer put on origin.
+            channel: this.labelOf(mcplChannel || s(o.channelId)),
             channel_name: s(o.channelName),
             guild: s(o.guildName),
             thread_id: s(o.threadId),
@@ -426,6 +435,8 @@ export class McplServerHandle {
         // Per-descriptor authorization; itemized results are mandatory (§14.5).
         const results = incoming.map(d => {
           if (!d || typeof d.id !== 'string' || !d.id) return { id: String(d?.id ?? ''), accepted: false, reason: 'invalid descriptor' }
+          // An id must read back as itself when printed (id:<id> is the escape every label falls back to).
+          if (!isAddressableId(d.id)) return { id: d.id, accepted: false, reason: 'channel id has leading/trailing whitespace or control characters' }
           this.channels.set(d.id, d)
           return { id: d.id, accepted: true }
         })
@@ -455,6 +466,7 @@ export class McplServerHandle {
             text: renderContent(m.content),
             meta: {
               channel_id: m.channelId,
+              channel: this.labelOf(m.channelId),
               message_id: m.messageId,
               ...(m.threadId ? { thread_id: m.threadId } : {}),
               author: `${m.author?.name ?? 'unknown'}`,
@@ -524,12 +536,16 @@ export class McplServerHandle {
    * channels/incoming instead of only addressed pushes. Returns any history
    * the server handed back with the open (oldest first).
    */
-  async openChannel(channelId: string, historyLimit = 0): Promise<{ history: IncomingChannelMessage[]; truncated: boolean }> {
+  async openChannel(ref: string, historyLimit = 0, opts: { byId?: boolean } = {}): Promise<{ channelId: string; label: string; history: IncomingChannelMessage[]; truncated: boolean }> {
     const conn = this.conn
     if (!conn || conn.isClosed) throw new Error(`${this.id}: not connected`)
     if (!granted(this.grant, 'channels.lifecycle')) throw new Error(`${this.id}: channels.lifecycle not granted (add it to the server's grant; the server must advertise it too)`)
-    const desc = this.channels.get(channelId)
-    if (!desc) throw new Error(`${this.id}: unknown channel ${channelId} (known: ${[...this.channels.keys()].join(', ') || 'none'})`)
+    // The host's own opens (reconcile, config) name a registered id: never
+    // route those through label resolution, where an id that also reads as
+    // another channel's label is (rightly) ambiguous.
+    if (opts.byId && !this.channels.has(ref)) throw new Error(`${this.id}: channel ${ref} is not registered`)
+    const channelId = opts.byId ? ref : this.resolveChannel(ref)
+    const desc = this.channels.get(channelId)!
     const params: ChannelsOpenParams = {
       channelId,
       type: desc.type,
@@ -539,19 +555,61 @@ export class McplServerHandle {
     const r = (await conn.sendRequest('channels/open', params)) as ChannelsOpenResult
     this.openChannels.add(channelId)
     this.desiredOpen.add(channelId)
-    return { history: r?.history ?? [], truncated: r?.historyTruncated === true }
+    return { channelId, label: this.labelOf(channelId), history: r?.history ?? [], truncated: r?.historyTruncated === true }
   }
 
-  async closeChannel(channelId: string): Promise<boolean> {
+  async closeChannel(ref: string): Promise<{ channelId: string; label: string; closed: boolean }> {
     const conn = this.conn
     if (!conn || conn.isClosed) throw new Error(`${this.id}: not connected`)
     if (!granted(this.grant, 'channels.lifecycle')) throw new Error(`${this.id}: channels.lifecycle not granted`)
+    // An id we no longer know (channel removed) may still sit in desiredOpen;
+    // closing it clears that intent. Only when nothing registered answers to
+    // the reference, though: a current channel's label always wins over a
+    // stale id that happens to read the same.
+    let channelId: string
+    try {
+      channelId = this.resolveChannel(ref)
+    } catch (e) {
+      const stale = ref.trim().replace(/^id:/, '')
+      if (!(e instanceof ChannelRefError && e.kind === 'unknown' && this.desiredOpen.has(stale))) throw e
+      channelId = stale
+    }
     // Forget the intent first: a close that fails on the wire must not be
     // silently undone by the next reconnect's reconcile.
     this.desiredOpen.delete(channelId)
     this.openChannels.delete(channelId)
     const r = (await conn.sendRequest('channels/close', { channelId })) as ChannelsCloseResult
-    return r?.closed === true
+    return { channelId, label: this.labelOf(channelId) || channelId, closed: r?.closed === true }
+  }
+
+  /** Display labels for the registered set, recomputed when it changes (see channel-labels.ts). */
+  private get labelView(): LabelView {
+    if (!this.labelCache || this.labelCache.version !== this.channels.version) {
+      const view = buildLabelView(this.channels, this.shownLabels)
+      for (const [id, l] of view.labels) {
+        if (l.startsWith('id:')) continue // the escape needs no memory
+        let seen = this.shownLabels.get(id)
+        if (!seen) this.shownLabels.set(id, (seen = new Set()))
+        seen.add(norm(l))
+      }
+      this.labelCache = { version: this.channels.version, view }
+    }
+    return this.labelCache.view
+  }
+
+  /** The display label for a channel id — the form mcpl_send/open/close accept back ('' when unknown). */
+  labelOf(channelId: string): string {
+    return this.labelView.labels.get(channelId) ?? ''
+  }
+
+  /**
+   * Resolve a channel reference to a registered id: `id:<id>`, or anything
+   * exactly one channel answers to — its display label (case-insensitive,
+   * leading `#` optional), that label minus a trailing ` (qualifier)`, or its
+   * id. More than one is an error naming each; never a guess.
+   */
+  resolveChannel(ref: string): string {
+    return resolveChannelRef(ref, this.channels, this.labelView, this.id)
   }
 
   /** Re-open desired channels after a (re)registration; failures are logged, not fatal. */
@@ -564,7 +622,7 @@ export class McplServerHandle {
         return
       }
       try {
-        await this.openChannel(cid)
+        await this.openChannel(cid, 0, { byId: true })
         this.log(`opened ${cid}`)
       } catch (e) {
         this.log(`open ${cid} failed: ${e instanceof Error ? e.message : e}`)
@@ -628,11 +686,11 @@ export class McplServerHandle {
     return conn.sendRequest('tools/call', { name, arguments: args ?? {} }, 120_000)
   }
 
-  async publish(channelId: string, text: string): Promise<unknown> {
+  async publish(ref: string, text: string): Promise<unknown> {
     const conn = this.conn
     if (!conn || conn.isClosed) throw new Error(`${this.id}: not connected`)
     if (!granted(this.grant, 'channels.publish')) throw new Error(`${this.id}: channels.publish not granted`)
-    if (!this.channels.has(channelId)) throw new Error(`${this.id}: unknown channel ${channelId} (known: ${[...this.channels.keys()].join(', ') || 'none'})`)
+    const channelId = this.resolveChannel(ref)
     return conn.sendRequest('channels/publish', {
       conversationId: 'claude-code',
       channelId,

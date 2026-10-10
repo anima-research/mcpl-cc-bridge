@@ -5,11 +5,35 @@ adapter process is simultaneously:
 
 1. **MCP server** — proxies MCPL `tools/list`/`tools/call` as `<server>__<tool>`,
    forwards `tools/list_changed`, and adds bridge tools:
-   - `mcpl_status` — connections, grants, feature sets, channels (registered
-     and open), held count, pending inference
+   - `mcpl_status` — connections, grants, feature sets, registered channel
+     count, open channels (by label), held count, pending inference
+   - `mcpl_channels` — registered channels as `label — id`, filterable
    - `mcpl_send` — `channels/publish` into a registered channel
    - `mcpl_open` / `mcpl_close` — `channels/open` / `channels/close` on a
      registered channel (subscribe to / leave its ordinary traffic)
+
+   Everywhere a channel is named (`channel_id`), the channel's **display
+   label** is accepted as well as its id — display form == address form.
+   `mcpl_channels` and the `channel="…"` attribute on delivered messages print
+   exactly the string to pass back. A reference resolves when exactly **one**
+   channel answers to it: by display label (trimmed, case-insensitive, leading
+   `#` optional), by that label minus a trailing ` (qualifier)`, or by id. Two
+   or more is an error quoting each match's label and id — no form wins over
+   another, and there is no fuzzy matching, because a best guess is a silent
+   wrong-room delivery. `id:<channel id>` always means that id and nothing
+   else.
+
+   Labels are **disambiguated actively** so that rule never strands a channel:
+   the server's label is shown as-is unless it would also answer for another
+   channel (an exact duplicate, a bare `general` beside `general (Guild)`, a
+   label equal to another channel's id), in which case the channel is shown
+   with its id appended — `general (discord:1234)` — or, if even that is
+   taken (ids differing only in case), as the escape `id:<id>`. A label
+   beginning with `id:` is shown with a leading `#`; control characters and
+   line breaks collapse to spaces. Display labels follow the registered set,
+   and a channel keeps answering to every label it was ever shown with, so a
+   form printed before a look-alike registered still names its channel — or
+   is an ambiguity error — and is never a delivery to the other room.
    - `mcpl_answer` — resolve a held `inference/request`
 
    A proxied tool keeps its server's `_meta` unchanged, so MCPL RFC-008 tool
@@ -186,8 +210,9 @@ returns what the server hands back with the open, oldest first.
 `push/event` carries an opaque `origin`; chat-shaped producers put the routing
 facts there. The bridge passes the common ones through as message meta
 (`channel_id` — the MCPL id when the producer supplies one, with the raw id as
-`native_channel_id` — `message_id`, `author`, `author_id`, `thread_id`,
-`channel_name`, `guild`), so a wake is addressable without a history call.
+`native_channel_id` — `channel` (the registered label, when the id is known),
+`message_id`, `author`, `author_id`, `thread_id`, `channel_name`, `guild`), so
+a wake is addressable without a history call.
 
 ## Reloading config
 
