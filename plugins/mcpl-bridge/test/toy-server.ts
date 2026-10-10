@@ -55,6 +55,19 @@ const MCPL_CAPS = {
   },
 }
 
+// "Build" baked in at spawn, the way a compiled server's code is: read once at
+// startup from $TOY_BUILD_FILE, never again. Only a respawn sees a new value —
+// which is what the bridge's hot reload has to deliver.
+const BUILD = (() => {
+  const f = process.env.TOY_BUILD_FILE
+  if (!f) return null
+  try {
+    return require('fs').readFileSync(f, 'utf8').trim() as string
+  } catch {
+    return 'none'
+  }
+})()
+
 let policyReady = false
 let demoStarted = false
 
@@ -205,6 +218,9 @@ function handle(msg: Json) {
             // RFC-008 class plus an unrelated key; the bridge must pass both through.
             _meta: { 'mcpl/class': ['control'], 'toy/extra': { nested: [1, 'two'] } },
           },
+          ...(BUILD !== null
+            ? [{ name: 'build', description: 'The build this process started with (toy).', inputSchema: { type: 'object', properties: {} } }]
+            : []),
         ],
       })
       return
@@ -213,6 +229,8 @@ function handle(msg: Json) {
       if (name === 'ping') {
         const echo = (params.arguments as Json | undefined)?.echo
         respond(id, { content: [{ type: 'text', text: `pong${echo ? ` ${echo}` : ''}` }] })
+      } else if (name === 'build' && BUILD !== null) {
+        respond(id, { content: [{ type: 'text', text: `build ${BUILD} pid ${process.pid}` }] })
       } else respondError(id, -32602, `unknown tool ${name}`)
       return
     }
@@ -267,5 +285,24 @@ process.stdin.on('data', (d: Buffer) => {
     }
   }
 })
-process.stdin.on('end', () => process.exit(0))
+// Lifecycle witness for the bridge's respawn ordering: TOY_EVENTS_FILE gets a
+// line at start and at exit; TOY_LINGER_MS keeps a stopped server alive that
+// long after SIGTERM / stdin end (a slow shutdown holding its resources).
+const events = process.env.TOY_EVENTS_FILE
+const note = (what: string) => {
+  if (events) require('fs').appendFileSync(events, `${what} ${process.pid} ${Date.now()}\n`)
+}
+const linger = Number(process.env.TOY_LINGER_MS ?? 0)
+let exiting = false
+const stop = () => {
+  if (exiting) return
+  exiting = true
+  setTimeout(() => {
+    note('exit')
+    process.exit(0)
+  }, linger)
+}
+process.on('SIGTERM', stop)
+process.stdin.on('end', stop)
+note('start')
 log('toy MCPL server up')

@@ -119,6 +119,15 @@ export type ServerConfig = {
    * channel (and not at all without it).
    */
   dmAllowlist?: string[]
+  /**
+   * Configured but not started: nothing is spawned or dialed and no tools are
+   * proxied, but the server is listed by mcpl_status and `mcpl_enable` starts
+   * it for the session. Lets one config carry a whole roster of servers with
+   * only the everyday ones live. Default: false. mcpl_enable / mcpl_disable
+   * override this per session; editing it here applies on reload to every
+   * session that has not overridden it.
+   */
+  disabled?: boolean
   /** Reconnect on transport failure. Default: true for ws, false for stdio. */
   reconnect?: boolean
   reconnectIntervalMs?: number
@@ -174,7 +183,7 @@ export function loadConfig(): { config: BridgeConfig; path: string | null } {
     if (s.dmAllowlist !== undefined && !(Array.isArray(s.dmAllowlist) && s.dmAllowlist.every(c => typeof c === 'string'))) {
       throw new Error(`${path}: servers.${id}: dmAllowlist must be an array of channel or author ids`)
     }
-    for (const k of ['openOnAddressed', 'openChannelsOnly'] as const) {
+    for (const k of ['openOnAddressed', 'openChannelsOnly', 'disabled'] as const) {
       if (s[k] !== undefined && typeof s[k] !== 'boolean') throw new Error(`${path}: servers.${id}: ${k} must be a boolean`)
     }
   }

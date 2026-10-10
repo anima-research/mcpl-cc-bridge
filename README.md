@@ -11,6 +11,9 @@ adapter process is simultaneously:
    - `mcpl_send` — `channels/publish` into a registered channel
    - `mcpl_open` / `mcpl_close` — `channels/open` / `channels/close` on a
      registered channel (subscribe to / leave its ordinary traffic)
+   - `mcpl_enable` / `mcpl_disable` — start / stop configured servers for the
+     session; `mcpl_reload` — re-read the config, and with `server` hot-reload
+     servers (respawn / redial). See [Managing servers](#managing-servers-from-the-session)
 
    Everywhere a channel is named (`channel_id`), the channel's **display
    label** is accepted as well as its id — display form == address form.
@@ -154,6 +157,8 @@ Notes:
   open set as the DM gate when set; see [Opening channels](#opening-channels).
 - `openChannels` — registered channel ids to hold open across restarts; see
   [Opening channels](#opening-channels).
+- `disabled` — configured but not started (default `false`); `mcpl_enable`
+  starts it for a session. See [Managing servers](#managing-servers-from-the-session).
 
 ## Wake policy
 
@@ -270,13 +275,54 @@ session restart to add a server:
 
 Reconcile is per server and in place: added servers connect, removed servers
 close, servers whose entry changed in any way (key order aside) are closed and
-re-dialed; everything else keeps its connection, open channels, pending
-inference and held deliveries. Claude Code is told `tools/list_changed` when
+re-dialed; a server whose only change is its `disabled` flag is started or
+stopped in place (unless this session overrode it — see below); everything else
+keeps its connection, open channels, pending inference and held deliveries. Claude Code is told `tools/list_changed` when
 the proxied tool set moves. A file that fails to parse or validate is rejected
 whole and the running config stays — `mcpl_reload` returns the reason, and
 `mcpl_status` shows which file is live and whether it is watched. Held
 deliveries of a removed or changed server are dropped and counted in the
 reload summary.
+
+## Managing servers from the session
+
+A config can carry the whole roster of MCPL servers with only the everyday
+ones running — `"disabled": true` keeps a server listed (`mcpl_status`) but
+unspawned and undialed, with no tools proxied — and the session switches
+servers on and off as the work needs them:
+
+- `mcpl_enable` `{server}` — start disabled servers. Waits up to 20 s for the
+  handshake and reports status and tool count; on failure, the error and the
+  server's last stderr lines (a server that crashes on startup says why).
+- `mcpl_disable` `{server}` — stop servers: connection closed, a stdio child
+  stopped (SIGTERM, SIGKILL after 3 s), tools withdrawn, pending inference
+  refused, no reconnects. Held deliveries are kept for the next turn, and
+  channels opened this session re-open on `mcpl_enable`.
+- `mcpl_reload` `{server}` — **hot reload**: after re-reading the config, tear
+  each named server's connection down and bring it back. A stdio server is
+  respawned only once the old process has exited (it may hold a port or a
+  lock), so a rebuilt server's new code is what runs; a ws server is
+  redialed. Full handshake, fresh grant, tools re-fetched; channels opened this
+  session re-open when the server re-registers them, held deliveries stay. The
+  result shows the pid change and, on failure, the stderr tail. A server the
+  same re-read already reconnected (its config changed) is not restarted
+  twice. The wait-for-exit rule holds on every path that replaces a stdio
+  process — hot reload, a config change, a reconnect after a crash. Use it after rebuilding an MCPL server — e.g. `npm run build` then
+  `mcpl_reload server=discord` — instead of restarting Claude Code.
+
+`server` is an id, several comma-separated, or `"*"` (every configured
+server; for `mcpl_reload`, every enabled one). Calling a proxied tool of a
+disabled or downed server returns an error that names the server and what to
+do, rather than `unknown tool`.
+
+Enable / disable are **session-scoped**: the config file is shared by every
+session that resolves it, so the tools never write it. A session's choice
+overrides the config's `disabled` flag for that session only — across config
+reloads too — and the override lapses once the config agrees with it. To
+change a server for every session, edit `disabled` in the config (the watcher
+or `mcpl_reload` applies it). `mcpl_status` says which: `disabled (config …)`,
+`disabled (this session …)`, or `enabled this session (config: disabled)`, and
+shows each running stdio server's `pid` and every connection's uptime.
 
 ## Double-spawn and state (primary/replica)
 
@@ -321,7 +367,7 @@ happens to route a call through.
 ```bash
 cd plugins/mcpl-bridge
 bun install
-bun run test/smoke.ts     # full-surface smoke test against test/toy-server.ts (wake policy, open/close included)
+bun run test/smoke.ts     # full-surface smoke test against test/toy-server.ts (wake policy, open/close, enable/disable, hot reload included)
 ```
 
 `src/vendor/mcpl-core/` is vendored from

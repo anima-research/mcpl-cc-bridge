@@ -28,6 +28,9 @@ export const BRIDGE_TOOL_CLASSES: Readonly<Record<string, readonly ToolClass[]>>
   // Lists channel labels and ids — names of rooms, never their messages.
   mcpl_channels: ['control'],
   mcpl_reload: ['control'],
+  // Start / stop configured servers for the session.
+  mcpl_enable: ['control'],
+  mcpl_disable: ['control'],
 }
 
 /** Deliberately unclassed: hosts handle these as the most restrictive class. */

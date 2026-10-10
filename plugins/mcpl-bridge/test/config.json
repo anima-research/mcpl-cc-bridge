@@ -67,6 +67,56 @@
       "dmAllowlist": [
         "u2"
       ]
+    },
+    "toyoff": {
+      "transport": {
+        "command": "bun",
+        "args": [
+          "run",
+          "test/toy-server.ts"
+        ]
+      },
+      "disabled": true
+    },
+    "toyoff__deep": {
+      "transport": {
+        "command": "bun",
+        "args": [
+          "run",
+          "test/toy-server.ts"
+        ]
+      },
+      "disabled": true
+    },
+    "toycrash": {
+      "transport": {
+        "command": "bun",
+        "args": [
+          "-e",
+          "process.stderr.write('toycrash: cannot find'); setTimeout(() => { process.stderr.write(' module ./dist/index.js\\n'); process.exit(3) }, 50)"
+        ]
+      },
+      "disabled": true
+    },
+    "toynocmd": {
+      "transport": {
+        "command": "/nonexistent/mcpl-server-binary"
+      },
+      "disabled": true
+    },
+    "toyslow": {
+      "transport": {
+        "command": "bun",
+        "args": [
+          "run",
+          "test/toy-server.ts"
+        ],
+        "env": {
+          "TOY_LINGER_MS": "1500"
+        }
+      },
+      "inferenceRequest": "deny",
+      "disabled": true
     }
   }
 }
