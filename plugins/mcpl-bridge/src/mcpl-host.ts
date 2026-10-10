@@ -41,6 +41,7 @@ import {
 //   Re-sync: cp <mcpl-core-ts>/src/*.ts src/vendor/mcpl-core/
 import { ERR, computeGrant, expandTags, granted, methodCapability } from './grants'
 import { DEFAULT_GRANT, isWs, resolveUrl, type ServerConfig, type StdioTransportConfig } from './config'
+import { ChannelRefError, ChannelRegistry, buildLabelView, resolveChannelRef, type LabelView } from './channel-labels'
 
 export type McplTool = { name: string; description?: string; inputSchema?: unknown; _meta?: Record<string, unknown> }
 
@@ -97,7 +98,8 @@ export class McplServerHandle {
 
   status: 'connecting' | 'ready' | 'mcp-only' | 'disconnected' | 'closed' = 'disconnected'
   tools: McplTool[] = []
-  channels = new Map<string, ChannelDescriptor>()
+  channels = new ChannelRegistry()
+  private labelCache: { version: number; view: LabelView } | null = null
   /** Channels currently open on the live connection (channels/open succeeded this epoch). */
   openChannels = new Set<string>()
   /** Desired-open state: config `openChannels` plus mcpl_open/mcpl_close during the session.
@@ -528,11 +530,15 @@ export class McplServerHandle {
    * channels/incoming instead of only addressed pushes. Returns any history
    * the server handed back with the open (oldest first).
    */
-  async openChannel(ref: string, historyLimit = 0): Promise<{ channelId: string; label: string; history: IncomingChannelMessage[]; truncated: boolean }> {
+  async openChannel(ref: string, historyLimit = 0, opts: { byId?: boolean } = {}): Promise<{ channelId: string; label: string; history: IncomingChannelMessage[]; truncated: boolean }> {
     const conn = this.conn
     if (!conn || conn.isClosed) throw new Error(`${this.id}: not connected`)
     if (!granted(this.grant, 'channels.lifecycle')) throw new Error(`${this.id}: channels.lifecycle not granted (add it to the server's grant; the server must advertise it too)`)
-    const channelId = this.resolveChannel(ref)
+    // The host's own opens (reconcile, config) name a registered id: never
+    // route those through label resolution, where an id that also reads as
+    // another channel's label is (rightly) ambiguous.
+    if (opts.byId && !this.channels.has(ref)) throw new Error(`${this.id}: channel ${ref} is not registered`)
+    const channelId = opts.byId ? ref : this.resolveChannel(ref)
     const desc = this.channels.get(channelId)!
     const params: ChannelsOpenParams = {
       channelId,
@@ -543,16 +549,25 @@ export class McplServerHandle {
     const r = (await conn.sendRequest('channels/open', params)) as ChannelsOpenResult
     this.openChannels.add(channelId)
     this.desiredOpen.add(channelId)
-    return { channelId, label: desc.label, history: r?.history ?? [], truncated: r?.historyTruncated === true }
+    return { channelId, label: this.labelOf(channelId), history: r?.history ?? [], truncated: r?.historyTruncated === true }
   }
 
   async closeChannel(ref: string): Promise<{ channelId: string; label: string; closed: boolean }> {
     const conn = this.conn
     if (!conn || conn.isClosed) throw new Error(`${this.id}: not connected`)
     if (!granted(this.grant, 'channels.lifecycle')) throw new Error(`${this.id}: channels.lifecycle not granted`)
-    // An id we no longer know (channel removed) may still sit in desiredOpen —
-    // let it through so the intent can be cleared; a label must resolve.
-    const channelId = !this.channels.has(ref) && this.desiredOpen.has(ref) ? ref : this.resolveChannel(ref)
+    // An id we no longer know (channel removed) may still sit in desiredOpen;
+    // closing it clears that intent. Only when nothing registered answers to
+    // the reference, though: a current channel's label always wins over a
+    // stale id that happens to read the same.
+    let channelId: string
+    try {
+      channelId = this.resolveChannel(ref)
+    } catch (e) {
+      const stale = ref.trim().replace(/^id:/, '')
+      if (!(e instanceof ChannelRefError && e.kind === 'unknown' && this.desiredOpen.has(stale))) throw e
+      channelId = stale
+    }
     // Forget the intent first: a close that fails on the wire must not be
     // silently undone by the next reconnect's reconcile.
     this.desiredOpen.delete(channelId)
@@ -561,48 +576,27 @@ export class McplServerHandle {
     return { channelId, label: this.labelOf(channelId) || channelId, closed: r?.closed === true }
   }
 
-  /** The registered label for a channel id ('' when unknown). */
+  /** Display labels for the registered set, recomputed when it changes (see channel-labels.ts). */
+  private get labelView(): LabelView {
+    if (!this.labelCache || this.labelCache.version !== this.channels.version) {
+      this.labelCache = { version: this.channels.version, view: buildLabelView(this.channels) }
+    }
+    return this.labelCache.view
+  }
+
+  /** The display label for a channel id — the form mcpl_send/open/close accept back ('' when unknown). */
   labelOf(channelId: string): string {
-    return this.channels.get(channelId)?.label ?? ''
+    return this.labelView.labels.get(channelId) ?? ''
   }
 
   /**
-   * Resolve a channel reference to a registered channel id. Accepts the exact
-   * id, or the label as mcpl_channels / <channel channel="…"> print it —
-   * display form == address form. Exact match after trimming, a leading `#`
-   * optional, case-insensitive; a label's trailing ` (qualifier)` may be
-   * omitted when the remainder is unique. NO fuzzy matching: a "did you mean"
-   * would turn a mistyped room into a silent wrong-room delivery. Ambiguity is
-   * an error that quotes label + id for each match, so the answer is pasteable.
+   * Resolve a channel reference to a registered id: `id:<id>`, or anything
+   * exactly one channel answers to — its display label (case-insensitive,
+   * leading `#` optional), that label minus a trailing ` (qualifier)`, or its
+   * id. More than one is an error naming each; never a guess.
    */
   resolveChannel(ref: string): string {
-    const raw = ref.trim()
-    // Explicit ids remain addressable when an id collides with another
-    // channel's label. Never guess which form an unprefixed reference meant.
-    if (raw.startsWith('id:')) {
-      const id = raw.slice(3)
-      if (this.channels.has(id)) return id
-      throw new Error(`${this.id}: unknown channel id "${id}" (${this.channels.size} registered)`)
-    }
-    const norm = (s: string) => s.trim().replace(/^#/, '').toLowerCase()
-    const want = norm(raw)
-    if (!want) throw new Error(`${this.id}: empty channel reference`)
-    const unqualified = (label: string) => norm(label.replace(/\s*\([^()]*\)\s*$/, ''))
-    let matches = [...this.channels.values()].filter(d => norm(d.label) === want)
-    if (matches.length === 0) matches = [...this.channels.values()].filter(d => unqualified(d.label) === want)
-    if (this.channels.has(raw)) {
-      const labelled = matches.find(d => d.id !== raw)
-      if (labelled) {
-        throw new Error(`${this.id}: "${ref}" matches channel id ${raw} and label "${labelled.label}" (id ${labelled.id}). Use id:${raw} or id:${labelled.id}`)
-      }
-      return raw
-    }
-    if (matches.length === 1) return matches[0].id
-    if (matches.length === 0) {
-      throw new Error(`${this.id}: unknown channel "${ref}" (${this.channels.size} registered — use mcpl_channels to list labels and ids)`)
-    }
-    const options = matches.map(d => `"${d.label}" (id ${d.id})`).join(', ')
-    throw new Error(`${this.id}: "${ref}" is ambiguous — ${matches.length} channels match. Re-send with one of: ${options}`)
+    return resolveChannelRef(ref, this.channels, this.labelView, this.id)
   }
 
   /** Re-open desired channels after a (re)registration; failures are logged, not fatal. */
@@ -615,7 +609,7 @@ export class McplServerHandle {
         return
       }
       try {
-        await this.openChannel(cid)
+        await this.openChannel(cid, 0, { byId: true })
         this.log(`opened ${cid}`)
       } catch (e) {
         this.log(`open ${cid} failed: ${e instanceof Error ? e.message : e}`)

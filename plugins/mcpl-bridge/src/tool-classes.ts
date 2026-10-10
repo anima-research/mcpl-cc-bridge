@@ -25,6 +25,8 @@ export const BRIDGE_TOOL_CLASSES: Readonly<Record<string, readonly ToolClass[]>>
   mcpl_open: ['comms', 'control'],
   mcpl_close: ['control'],
   mcpl_status: ['control'],
+  // Lists channel labels and ids — names of rooms, never their messages.
+  mcpl_channels: ['control'],
   mcpl_reload: ['control'],
 }
 

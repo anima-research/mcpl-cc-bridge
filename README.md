@@ -12,15 +12,26 @@ adapter process is simultaneously:
    - `mcpl_open` / `mcpl_close` — `channels/open` / `channels/close` on a
      registered channel (subscribe to / leave its ordinary traffic)
 
-   Everywhere a channel is named (`channel_id`), the channel's registered
-   **label** is accepted as well as its id — display form == address form.
+   Everywhere a channel is named (`channel_id`), the channel's **display
+   label** is accepted as well as its id — display form == address form.
    `mcpl_channels` and the `channel="…"` attribute on delivered messages print
-   exactly the string to pass back. Matching is exact after trimming, a leading
-   `#` optional, case-insensitive, and a label's trailing ` (qualifier)` may be
-   dropped when the rest is unique; there is no fuzzy matching, and an ambiguous
-   reference is an error quoting each match's label and id. If a channel id
-   collides with another channel's label, use `id:<channel id>` to address it
-   explicitly; the unprefixed reference is rejected.
+   exactly the string to pass back. A reference resolves when exactly **one**
+   channel answers to it: by display label (trimmed, case-insensitive, leading
+   `#` optional), by that label minus a trailing ` (qualifier)`, or by id. Two
+   or more is an error quoting each match's label and id — no form wins over
+   another, and there is no fuzzy matching, because a best guess is a silent
+   wrong-room delivery. `id:<channel id>` always means that id and nothing
+   else.
+
+   Labels are **disambiguated actively** so that rule never strands a channel:
+   the server's label is shown as-is unless the reference it prints would also
+   answer for another channel (an exact duplicate, a bare `general` beside
+   `general (Guild)`, a label equal to another channel's id), in which case the
+   channel is shown with its id appended — `general (discord:1234)`. A label
+   beginning with `id:` is shown with a leading `#`. Display labels follow the
+   registered set: a channel can gain a qualifier when a look-alike registers,
+   and the form it printed before then is an ambiguity error, never a delivery
+   to the other room.
    - `mcpl_answer` — resolve a held `inference/request`
 
    A proxied tool keeps its server's `_meta` unchanged, so MCPL RFC-008 tool

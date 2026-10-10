@@ -333,10 +333,10 @@ async function callToolImpl(name: string, args: Record<string, unknown>): Promis
         if (!h) return text(`unknown server: ${id}`, true)
         const rows = [...h.channels.values()]
           .filter(d => !openOnly || h.openChannels.has(d.id))
-          .filter(d => !filter || d.label.toLowerCase().includes(filter) || d.id.toLowerCase().includes(filter))
-          .sort((a, b) => a.label.localeCompare(b.label, 'en', { sensitivity: 'base' }))
+          .filter(d => !filter || h.labelOf(d.id).toLowerCase().includes(filter) || d.id.toLowerCase().includes(filter))
+          .sort((a, b) => h.labelOf(a.id).localeCompare(h.labelOf(b.id), 'en', { sensitivity: 'base' }))
         lines.push(`${id}: ${rows.length}${rows.length !== h.channels.size ? ` of ${h.channels.size}` : ''} channel(s)${openOnly ? ', open only' : ''}${filter ? ` matching "${args.filter}"` : ''}`)
-        for (const d of rows.slice(0, CAP)) lines.push(`${h.openChannels.has(d.id) ? '*' : ' '} ${d.label} — ${d.id}`)
+        for (const d of rows.slice(0, CAP)) lines.push(`${h.openChannels.has(d.id) ? '*' : ' '} ${h.labelOf(d.id)} — ${d.id}`)
         if (rows.length > CAP) lines.push(`  … ${rows.length - CAP} more; narrow with filter`)
       }
       return text(lines.join('\n') || 'no MCPL servers configured')
