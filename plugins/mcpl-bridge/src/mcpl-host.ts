@@ -413,7 +413,7 @@ export class McplServerHandle {
         const from = this.channelFromOrigin(mcplChannel, native)
         // Whitelist admission (openChannelsOnly / dmAllowlist) — §6.6: a
         // rejection is diagnostics for the server, nothing more.
-        const refused = this.refusal({ channelId: from, rawChannel: mcplChannel || native, isDm: tags.includes('chat:dm'), authorId: s(o.authorId) })
+        const refused = this.refusal({ channelId: from, refs: [mcplChannel, native], isDm: tags.includes('chat:dm'), authorId: s(o.authorId) })
         if (refused) {
           console.error(`${this.id}: dropped push from ${refused}`)
           respond({ accepted: false, reason: `not admitted on this host: ${refused}` })
@@ -497,7 +497,8 @@ export class McplServerHandle {
           const known = this.channels.has(m.channelId)
           if (!known) return { messageId: m.messageId, accepted: false }
           const tags = expandTags(m.tags)
-          const refused = this.refusal({ channelId: m.channelId, rawChannel: m.channelId, isDm: tags.includes('chat:dm'), authorId: String(m.author?.id ?? '') })
+          const native = (this.channels.get(m.channelId)?.address as { channelId?: unknown } | undefined)?.channelId
+          const refused = this.refusal({ channelId: m.channelId, refs: [m.channelId, native == null ? '' : String(native)], isDm: tags.includes('chat:dm'), authorId: String(m.author?.id ?? '') })
           if (refused) {
             console.error(`${this.id}: dropped incoming from ${refused}`)
             return { messageId: m.messageId, accepted: false }
@@ -667,15 +668,19 @@ export class McplServerHandle {
    *    that maps to nothing, and on a DM that names no channel at all.
    *    Non-DM pushes with no channel (heartbeats) are not channel traffic.
    */
-  refusal(d: { channelId: string; rawChannel: string; isDm: boolean; authorId: string }): string | null {
+  refusal(d: { channelId: string; refs: string[]; isDm: boolean; authorId: string }): string | null {
+    // `refs`: every id the delivery names its channel by — the MCPL id and
+    // the producer's native id alike — so an allowlist entry in either form
+    // matches.
+    const named = d.refs.find(Boolean) ?? ''
     const allow = this.cfg.dmAllowlist
     if (d.isDm && allow) {
-      const listed = [d.channelId, d.rawChannel, d.authorId].some(x => x && allow.includes(x))
-      return listed ? null : `DM ${d.channelId ? this.labelOf(d.channelId) || d.channelId : d.rawChannel || `from ${d.authorId || 'unknown author'}`} (not in dmAllowlist)`
+      const listed = [d.channelId, ...d.refs, d.authorId].some(x => x && allow.includes(x))
+      return listed ? null : `DM ${d.channelId ? this.labelOf(d.channelId) || d.channelId : named || `from ${d.authorId || 'unknown author'}`} (not in dmAllowlist)`
     }
     if (this.cfg.openChannelsOnly !== true) return null
-    if (!d.rawChannel && !d.isDm) return null
-    if (!d.channelId) return `${d.isDm ? 'DM in ' : ''}unregistered channel ${d.rawChannel || '(none named)'} (openChannelsOnly)`
+    if (!named && !d.channelId && !d.isDm) return null
+    if (!d.channelId) return `${d.isDm ? 'DM in ' : ''}unregistered channel ${named || '(none named)'} (openChannelsOnly)`
     if (!this.isOpen(d.channelId)) return `${d.isDm ? 'DM in ' : ''}closed channel ${this.labelOf(d.channelId) || d.channelId} (openChannelsOnly)`
     return null
   }
