@@ -31,10 +31,20 @@
  */
 import type { ChannelDescriptor } from './vendor/mcpl-core/index.js'
 
+/**
+ * An id the bridge can print and read back unchanged: non-empty, no leading or
+ * trailing whitespace (references are trimmed, so `id:a ` would read as
+ * `id:a`), no control characters. Registration refuses any other id.
+ */
+export function isAddressableId(id: unknown): id is string {
+  return typeof id === 'string' && id.length > 0 && id === id.trim() && !/[\u0000-\u001f\u007f]/.test(id)
+}
+
 /** Map of registered channels that counts its own mutations, so derived views can be cached. */
 export class ChannelRegistry extends Map<string, ChannelDescriptor> {
   version = 0
   override set(key: string, value: ChannelDescriptor): this {
+    if (!isAddressableId(key)) throw new Error(`unaddressable channel id ${JSON.stringify(key)}`)
     this.version++
     return super.set(key, value)
   }
