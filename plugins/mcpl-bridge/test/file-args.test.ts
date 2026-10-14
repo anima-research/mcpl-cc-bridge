@@ -36,3 +36,17 @@ test('outside the roots, relative, missing, and over the cap are refused', async
   await expect(resolveFileArgs({ a: `$file:${join(root, 'nope.txt')}` }, opts)).rejects.toBeInstanceOf(FileArgError)
   await expect(resolveFileArgs({ a: `$file:${join(root, 'sub', 'page.html')}` }, { roots: [root], maxBytes: 4 })).rejects.toBeInstanceOf(FileArgError)
 })
+
+test('a "__proto__" key survives the copy as data', async () => {
+  const args = JSON.parse(`{"a": "$file:${join(root, 'sub', 'page.html')}", "payload": {"__proto__": {"x": 1}, "k": 2}}`)
+  const out = (await resolveFileArgs(args, opts)) as any
+  expect(JSON.stringify(out.payload)).toBe('{"__proto__":{"x":1},"k":2}')
+  expect(out.payload.x).toBeUndefined()
+})
+
+test('the cap counts bytes actually read, and a file at exactly the cap passes', async () => {
+  const big = join(root, 'big.txt')
+  writeFileSync(big, 'x'.repeat(100))
+  expect(((await resolveFileArgs({ a: `$file:${big}` }, { roots: [root], maxBytes: 100 })) as any).a.length).toBe(100)
+  await expect(resolveFileArgs({ a: `$file:${big}`, b: `$file:${big}` }, { roots: [root], maxBytes: 150 })).rejects.toBeInstanceOf(FileArgError)
+})

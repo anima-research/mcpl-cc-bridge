@@ -169,8 +169,9 @@ where a schema allows objects. The bridge swaps the contents in before the call
 leaves, so a 1 MB HTML page or a 400 KB data file never passes through the
 model's context. Files must be under the project directory
 (`$CLAUDE_PROJECT_DIR`), the session scratchpad (`/private/tmp/claude-<uid>/…`),
-the bridge's working directory, or extra roots from the config; one call may
-read at most 16 MB. Both are configurable:
+the bridge's working directory, or extra roots from the config (absolute paths,
+validated on load); one call may read at most 16 MB by default. Both are
+configurable:
 
 ```json
 "files": { "roots": ["/Users/me/data"], "maxBytes": 64 }
