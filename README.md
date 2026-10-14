@@ -160,6 +160,22 @@ Notes:
 - `disabled` — configured but not started (default `false`); `mcpl_enable`
   starts it for a session. See [Managing servers](#managing-servers-from-the-session).
 
+## File arguments (`$file:`)
+
+Any string argument of a proxied tool may name a local file instead of carrying
+its contents: `"$file:/abs/path"` (text, UTF-8) or `"$file:/abs/path;base64"`
+(bytes). The object form `{"$file": "/abs/path", "encoding": "base64"}` works
+where a schema allows objects. The bridge swaps the contents in before the call
+leaves, so a 1 MB HTML page or a 400 KB data file never passes through the
+model's context. Files must be under the project directory
+(`$CLAUDE_PROJECT_DIR`), the session scratchpad (`/private/tmp/claude-<uid>/…`),
+the bridge's working directory, or extra roots from the config; one call may
+read at most 16 MB. Both are configurable:
+
+```json
+"files": { "roots": ["/Users/me/data"], "maxBytes": 64 }
+```
+
 ## Wake policy
 
 Every `push/event` and every `channels/incoming` on a known channel is admitted

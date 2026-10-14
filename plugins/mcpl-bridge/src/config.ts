@@ -136,6 +136,8 @@ export type ServerConfig = {
 
 export type BridgeConfig = {
   servers: Record<string, ServerConfig>
+  /** $file references in tool arguments: extra roots they may read from, and the per-call cap (MB, default 16). */
+  files?: { roots?: string[]; maxBytes?: number }
 }
 
 export function configPath(): string | null {
