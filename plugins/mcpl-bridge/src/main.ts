@@ -20,6 +20,7 @@ import { basename, dirname, join } from 'path'
 import { loadConfig, type ServerConfig } from './config'
 import { McplServerHandle, type IncomingDelivery } from './mcpl-host'
 import { withBridgeClass } from './tool-classes'
+import { defaultFileRoots, resolveFileArgs } from './file-args'
 import { WakeGate } from './wake'
 
 import { appendFileSync } from 'fs'
@@ -49,6 +50,7 @@ const mcp = new Server(
       '- kind="channel-message" / kind="push-event": events from the MCPL server. To reply on a channel, call mcpl_send with that server and the channel\'s label (the channel="…" attribute) or its channel_id — both are accepted everywhere a channel is named.',
       '- kind="inference-request": the MCPL server is asking for a completion. Compose the answer and call mcpl_answer with the request_id from the message. Do this promptly — the request is held open.',
       'A <held server="..." count="N"> block at the top of a message lists deliveries the wake policy held back since the last turn (e.g. a bot replying to you, ambient traffic) — context, not a separate ping; the same block reaches a user turn via the UserPromptSubmit hook.',
+      'Any string argument of a proxied tool may be "$file:/abs/path" (or "$file:/abs/path;base64" for bytes): the bridge swaps in the file\'s contents before sending, so large content never passes through your context. Files must be under the project directory, the session scratchpad or the bridge\'s working directory (plus files.roots from the config); the default cap is 16 MB per call, configurable with files.maxBytes.',
       'Proxied MCPL tools are named <server>__<tool>. mcpl_status shows connections, grants, channel counts, open channels, and held count; mcpl_channels lists registered channels by label. mcpl_open / mcpl_close subscribe to or leave a registered channel\'s ambient traffic (channels/open).',
       'Managing the servers themselves: mcpl_enable / mcpl_disable start or stop configured servers for this session (a server can be configured with "disabled": true and enabled only when needed). mcpl_reload re-reads the config; mcpl_reload with server="<id>" also hot-reloads that server — respawns a stdio server or redials a ws one — which is how a rebuilt MCPL server\'s new code takes effect without restarting the session.',
     ].join('\n'),
@@ -446,6 +448,11 @@ function duration(ms: number): string {
   return `${Math.floor(h / 24)}d`
 }
 
+function fileArgOptions() {
+  const f = config.files ?? {}
+  return { roots: defaultFileRoots(f.roots ?? []), maxBytes: (f.maxBytes ?? 16) * 1024 * 1024 }
+}
+
 async function callToolImpl(name: string, args: Record<string, unknown>): Promise<unknown> {
   try {
     if (name === 'mcpl_status') {
@@ -608,7 +615,9 @@ async function callToolImpl(name: string, args: Record<string, unknown>): Promis
     for (const [id, h] of handles) {
       for (const t of h.tools) {
         if (toolName(id, h, t.name) === name) {
-          const result = (await h.callTool(t.name, args)) as { content?: unknown[]; isError?: boolean }
+          // "$file:/abs/path" arguments become the file's contents here, so large pages and data never cross the model's context.
+          const sent = await resolveFileArgs(args, fileArgOptions())
+          const result = (await h.callTool(t.name, sent)) as { content?: unknown[]; isError?: boolean }
           if (result && Array.isArray(result.content)) return result as never
           return text(JSON.stringify(result))
         }
