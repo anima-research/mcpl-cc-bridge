@@ -37,14 +37,25 @@ async function allowedPath(p: string, roots: string[]): Promise<string> {
 export async function resolveFileArgs(args: Record<string, unknown>, opts: FileArgOptions): Promise<Record<string, unknown>> {
   let total = 0
   let touched = false
+  const over = (p: string) => new FileArgError(`$file: ${p} would bring this call over ${Math.round(opts.maxBytes / 1024 / 1024)} MB of file contents`)
   const read = async (p: string, encoding: 'utf8' | 'base64'): Promise<string> => {
     const real = await allowedPath(p, opts.roots)
     const st = await fs.stat(real)
     if (!st.isFile()) throw new FileArgError(`$file: not a file: ${p}`)
-    total += st.size
-    if (total > opts.maxBytes) throw new FileArgError(`$file: ${p} would bring this call over ${Math.round(opts.maxBytes / 1024 / 1024)} MB of file contents`)
+    if (total + st.size > opts.maxBytes) throw over(p)
+    // Read through an open handle, bounded by what is left of the budget: a file that grows
+    // between stat and read cannot carry the call past the cap.
+    const budget = opts.maxBytes - total
+    const fh = await fs.open(real, 'r')
+    let buf: Buffer
+    try {
+      buf = Buffer.alloc(budget + 1)
+      const { bytesRead } = await fh.read(buf, 0, budget + 1, 0)
+      if (bytesRead > budget) throw over(p)
+      buf = buf.subarray(0, bytesRead)
+    } finally { await fh.close() }
+    total += buf.length
     touched = true
-    const buf = await fs.readFile(real)
     return encoding === 'base64' ? buf.toString('base64') : buf.toString('utf8')
   }
   const walk = async (v: unknown): Promise<unknown> => {
@@ -59,7 +70,8 @@ export async function resolveFileArgs(args: Record<string, unknown>, opts: FileA
         const enc = o.encoding === 'base64' ? 'base64' : 'utf8'
         return read(o.$file, enc)
       }
-      const out: Record<string, unknown> = {}
+      // A null prototype keeps an own "__proto__" key as data instead of re-pointing the prototype.
+      const out: Record<string, unknown> = Object.create(null)
       for (const [k, x] of Object.entries(o)) out[k] = await walk(x)
       return out
     }

@@ -164,6 +164,13 @@ export function loadConfig(): { config: BridgeConfig; path: string | null } {
   if (!raw || typeof raw !== 'object' || typeof raw.servers !== 'object' || raw.servers === null) {
     throw new Error(`${path}: expected { "servers": { ... } }`)
   }
+  // $file settings: a string where an array is expected would be iterated character by character ("/" among them, which allows every folder).
+  if (raw.files !== undefined) {
+    const f = raw.files
+    if (typeof f !== 'object' || f === null || Array.isArray(f)) throw new Error(`${path}: files must be an object { roots?, maxBytes? }`)
+    if (f.roots !== undefined && !(Array.isArray(f.roots) && f.roots.every(r => typeof r === 'string' && r.startsWith('/')))) throw new Error(`${path}: files.roots must be an array of absolute paths`)
+    if (f.maxBytes !== undefined && !(typeof f.maxBytes === 'number' && Number.isFinite(f.maxBytes) && f.maxBytes > 0)) throw new Error(`${path}: files.maxBytes must be a positive number (MB)`)
+  }
   for (const [id, s] of Object.entries(raw.servers)) {
     if (!/^[a-zA-Z0-9_-]+$/.test(id)) throw new Error(`${path}: bad server id ${JSON.stringify(id)}`)
     if (!s.transport) throw new Error(`${path}: servers.${id}: missing transport`)
