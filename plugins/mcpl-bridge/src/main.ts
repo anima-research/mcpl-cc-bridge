@@ -21,6 +21,7 @@ import type { AccessAuditRecord } from './access'
 import { isWs, loadConfig, resolveIdentity, staticToken, type BridgeConfig, type IdentityConfig, type ServerConfig } from './config'
 import { Identity } from './identity'
 import { McplServerHandle, type IncomingDelivery } from './mcpl-host'
+import { META_TOOLS, META_TOOL_NAMES, callMetaTool, presenting } from './meta-tools'
 import { secrets } from './redact'
 import { withBridgeClass } from './tool-classes'
 import { WakeGate } from './wake'
@@ -84,6 +85,7 @@ const mcp = new Server(
       '- kind="inference-request": the MCPL server is asking for a completion. Compose the answer and call mcpl_answer with the request_id from the message. Do this promptly — the request is held open.',
       'A <held server="..." count="N"> block at the top of a message lists deliveries the wake policy held back since the last turn (e.g. a bot replying to you, ambient traffic) — context, not a separate ping; the same block reaches a user turn via the UserPromptSubmit hook.',
       'Proxied MCPL tools are named <server>__<tool>. mcpl_status shows connections, grants, channel counts, open channels, and held count; mcpl_channels lists registered channels by label. mcpl_open / mcpl_close subscribe to or leave a registered channel\'s ambient traffic (channels/open).',
+      'Toolsets (games, building modes, tables) are opened with open, used with act, inspected with look and closed with close. Their tools are not in your tool list: they are announced in results and channel messages as signatures — [server/toolset:instance] tools now — act {…}: — and called through act. A <mcpl-tools> block after compaction restates what is open.',
       'Managing the servers themselves: mcpl_enable / mcpl_disable start or stop configured servers for this session (a server can be configured with "disabled": true and enabled only when needed). mcpl_reload re-reads the config; mcpl_reload with server="<id>" also hot-reloads that server — respawns a stdio server or redials a ws one — which is how a rebuilt MCPL server\'s new code takes effect without restarting the session.',
     ].join('\n'),
   },
@@ -417,11 +419,21 @@ const firstConnectionsSettled = Promise.race([
   new Promise(r => setTimeout(r, 4000)),
 ])
 
+/**
+ * RFC-014 meta-tools are listed from the first moment any server has
+ * toolsets or dynamic tools, and then for the rest of the session: the list
+ * stays constant whatever opens, closes or disconnects.
+ */
+let metaToolsListed = false
+
 async function listToolsImpl() {
   await firstConnectionsSettled
   const tools = [...BRIDGE_TOOLS]
+  if (!metaToolsListed && presenting(handles).length) metaToolsListed = true
+  if (metaToolsListed) tools.push(...META_TOOLS.map(withBridgeClass))
   for (const [id, h] of handles) {
-    for (const t of h.tools) {
+    // Static tools only, for a server that hints; none for a surface server (RFC-014 §8.1).
+    for (const t of h.listedTools()) {
       tools.push({
         name: toolName(id, h, t.name),
         description: `[mcpl:${id}] ${t.description ?? t.name}`,
@@ -523,6 +535,7 @@ async function callToolInner(name: string, args: Record<string, unknown>): Promi
             (held > 0 ? ` | held=${held}` : '') +
             (h.pendingInferenceIds.length ? ` | pending inference: ${h.pendingInferenceIds.join(', ')}` : '') +
             (h.accessAudience ? ` | access=${h.accessAudience}` : '') +
+            (h.presence.active ? ` | toolHints${h.presence.surface ? ' surface' : ''}: ${h.listedTools().length} listed, open=[${[...h.presence.openRecords().map(o => `${o.toolset}${o.instance ? `:${o.instance}` : ''}`), ...h.presence.openGroups].join(', ') || '—'}]` : '') +
             (h.manifestRevision ? ` | rev=${h.manifestRevision.slice(0, 18)}…` : '') +
             (h.pid ? ` | pid=${h.pid}` : '') +
             (h.connectedAt ? ` | up ${duration(Date.now() - h.connectedAt)}` : '') +
@@ -661,14 +674,19 @@ async function callToolInner(name: string, args: Record<string, unknown>): Promi
       const ok = h.answerInference(String(args.request_id), String(args.content))
       return text(ok ? 'answered' : `no pending inference request ${args.request_id} (it may have timed out)`, !ok)
     }
+    if (META_TOOL_NAMES.has(name)) return await callMetaTool(name, args, handles)
     // Proxied MCPL tool
     for (const [id, h] of handles) {
-      for (const t of h.tools) {
+      for (const t of h.listedTools()) {
         if (toolName(id, h, t.name) === name) {
           const result = (await h.callTool(t.name, args)) as { content?: unknown[]; isError?: boolean }
           if (result && Array.isArray(result.content)) return result as never
           return text(JSON.stringify(result))
         }
+      }
+      // A dynamic tool (or a surface server's) called by its proxied name: not in the tool list, reached through act.
+      for (const t of h.tools) {
+        if (toolName(id, h, t.name) === name) return text(`${name} is not in your tool list — call it with act {server:"${id}", tool:"${t.name}", args}`, true)
       }
     }
     // A stale call into a server that is off or down: say which, not just
@@ -736,6 +754,36 @@ type HookEvent = {
   hook_event_name?: string
   session_id?: string
   prompt?: string
+  /** SessionStart: startup | resume | clear | compact */
+  source?: string
+}
+
+/**
+ * What is open, with current tools (first sentences again — the model's copy
+ * was compacted away) and how to call and close it. Applies pending
+ * static↔dynamic moves first: compaction is the boundary RFC-014 §4.2 allows.
+ */
+async function toolsetReminder(reason: string): Promise<string> {
+  const parts: string[] = []
+  // Current titles and visibility first (one toolsets/list per server with toolsets, in parallel).
+  const notes = await Promise.all([...handles.values()].map(h => h.refreshOpen().catch(() => [] as string[])))
+  for (const [i, [id, h]] of [...handles].entries()) {
+    if (!h.presence.active) continue
+    h.presence.forgetShown()
+    const moves = h.applyPresenceMoves()
+    const r = h.presence.reminder()
+    if (r) parts.push(r)
+    parts.push(...notes[i]!)
+    for (const m of moves) {
+      parts.push(
+        m.to === 'dynamic'
+          ? `[${id}] ${m.name} left your tool list: it is announced here when available and called with act {server:"${id}", tool:"${m.name}", args}.`
+          : `[${id}] ${m.name} is now in your tool list as ${toolName(id, h, m.name)}.`,
+      )
+    }
+  }
+  if (!parts.length) return ''
+  return [`<mcpl-tools reason="${reason}">`, 'Open MCPL toolsets — call their tools with act (they are not in your tool list); look shows this again any time:', ...parts, '</mcpl-tools>'].join('\n')
 }
 
 const SOCK_DIR = join(process.env.CLAUDE_CONFIG_DIR ?? join(homedir(), '.claude'), 'mcpl-bridge')
@@ -833,6 +881,17 @@ async function handleHook(event: HookEvent): Promise<string> {
     return JSON.stringify({
       hookSpecificOutput: { hookEventName: 'UserPromptSubmit', additionalContext: secrets.scrub(parts.join('\n')) },
     })
+  }
+
+  // RFC-014 §8.3 reminders. After compaction (or /clear) the announcements
+  // of open toolsets are gone from context; Claude Code runs SessionStart
+  // hooks with source "compact" right after compacting and adds their
+  // additionalContext to the new context — so the reminder lands there.
+  if (name === 'SessionStart' && (event.source === 'compact' || event.source === 'clear')) {
+    const reminder = await toolsetReminder(event.source)
+    log(`hook SessionStart:${event.source}: ${reminder ? 'reminder of open toolsets published' : 'nothing open to remind of'}`)
+    if (!reminder) return ''
+    return JSON.stringify({ hookSpecificOutput: { hookEventName: 'SessionStart', additionalContext: secrets.scrub(reminder) } })
   }
 
   if (name === 'Stop' && currentInferenceId) {

@@ -51,6 +51,9 @@ const NON_CHANNEL_METHOD_CAPS: Record<string, string | null> = {
   'access/token': 'access.token', // RFC-015 §4.2: authorized by the grant alone, no featureSet
   'mcpl/manifestChanged': null, // deliberately ungated (§17.3)
   'notifications/tools/list_changed': null,
+  // RFC-014 §6.1: hints confer nothing and add no uses path. Applying one is
+  // ungated; delivering its notification into the conversation needs pushEvents.
+  'tools/hints': null,
 }
 
 /**

@@ -9,6 +9,8 @@
  * mcpl/manifestChanged, and answer-or-error discipline on every inbound id.
  * Delegated access (MCPL RFC-015): per-dial credentials for `transport.access`
  * and `access/token` answered for servers granted `access.token`.
+ * Tool presence (MCPL RFC-014 r2): hint changes from every carrier through one
+ * apply path (src/presence.ts), toolsets/open|close|list, instance-bound calls.
  */
 import { spawn, type ChildProcess } from 'child_process'
 import {
@@ -62,6 +64,7 @@ import {
   type AccessIssuer,
 } from './access'
 import { secrets } from './redact'
+import { ToolPresence, emptyChange, isEmpty, keyOf, type ChangeSet } from './presence'
 import { ChannelRefError, ChannelRegistry, buildLabelView, isAddressableId, norm, resolveChannelRef, type LabelView } from './channel-labels'
 
 export type McplTool = { name: string; description?: string; inputSchema?: unknown; _meta?: Record<string, unknown> }
@@ -71,6 +74,8 @@ export type IncomingDelivery = {
   kind: 'channel-message' | 'push-event' | 'inference-request'
   text: string
   meta: Record<string, string>
+  /** Carries a tool announcement (RFC-014): when held, keep it whole instead of a one-line summary. */
+  keepWhole?: boolean
 }
 
 export type HostCallbacks = {
@@ -93,8 +98,12 @@ type PendingInference = {
   reject(err: { code: number; message: string }): void
 }
 
-/** The host's `experimental.mcpl` advertisement. `access` (RFC-015 §4.2) only when it holds an identity to mint from. */
-export function hostMcplCaps(canMint: boolean): Record<string, unknown> {
+/**
+ * The host's `experimental.mcpl` advertisement. `access` (RFC-015 §4.2) only
+ * when it holds an identity to mint from; `toolHints` (RFC-014 §6.3) unless
+ * the server's config opts out.
+ */
+export function hostMcplCaps(canMint: boolean, toolHints = true): Record<string, unknown> {
   return {
     version: '0.5',
     pushEvents: true,
@@ -105,6 +114,7 @@ export function hostMcplCaps(canMint: boolean): Record<string, unknown> {
     channels: { register: true, lifecycle: true, publish: true, incoming: true, acknowledge: true },
     featureSets: true,
     ...(canMint ? { access: { token: true } } : {}),
+    ...(toolHints ? { toolHints: true } : {}),
   }
 }
 
@@ -122,6 +132,17 @@ export function renderContent(content: string | ContentBlock[] | undefined): str
 }
 
 let inferenceSeq = 0
+
+/** How long a tool call / a toolsets request is waited for (exported for tests). A late result still applies when read. */
+export const REQUEST_TIMEOUTS = { call: 120_000, toolset: 60_000 }
+
+/** Requests whose results carry hint state (RFC-014): the tap applies them as they are read. */
+const HINTED_RESULTS = new Set(['tools/call', 'toolsets/open', 'toolsets/close', 'toolsets/list', 'tools/list'])
+
+/** A result's `_meta["mcpl/hints"]`. */
+function metaHints(res: Record<string, unknown>): unknown {
+  return res._meta && typeof res._meta === 'object' ? (res._meta as Record<string, unknown>)['mcpl/hints'] : undefined
+}
 
 export class McplServerHandle {
   readonly id: string
@@ -194,6 +215,19 @@ export class McplServerHandle {
   /** RFC-015: credentials handed to this server, per audience (RFC §5 caching). */
   private accessCache = new CredentialCache()
   private warnedPlainWs = false
+  /** RFC-014: this server's tool presence — hints, toolsets, instances, what the model was shown. Survives reconnects. */
+  readonly presence: ToolPresence
+  /** What Claude Code's tool list holds of this server, last reported (toolsChanged fires only when it changes). */
+  private listedDigest = ''
+  private recoveryTimer: ReturnType<typeof setTimeout> | null = null
+  private recovering = false
+  private recoverAgain = false
+  /** This connection's requests whose results carry hint state, by id (RFC-014 r4: applied as read). */
+  private sentHinted = new Map<string, { method: string; params: Record<string, unknown> }>()
+  /** What applying a message's hints changed, for whoever renders it — keyed by the result or params object the caller later gets. */
+  private readChanges = new WeakMap<object, ChangeSet>()
+  /** eventIds of pushes read on this connection (bounded): a repeated one's hints are ignored (r5 §6.1). */
+  private seenEvents = new Set<string>()
 
   /**
    * `opts.predecessor`: the exit of the process a replaced handle for this
@@ -203,6 +237,7 @@ export class McplServerHandle {
     this.id = id
     this.cfg = cfg
     this.prefix = cfg.toolPrefix ?? id
+    this.presence = new ToolPresence(id)
     this.cb = cb
     this.policy = cfg.grant ?? DEFAULT_GRANT
     this.openOnAddressed = cfg.openOnAddressed ?? holdsAmbient(cfg.wake)
@@ -402,6 +437,10 @@ export class McplServerHandle {
       clearTimeout(this.reconnectTimer)
       this.reconnectTimer = null
     }
+    if (this.recoveryTimer) {
+      clearTimeout(this.recoveryTimer)
+      this.recoveryTimer = null
+    }
     this.connectedAt = null
     // Transport-epoch boundary: revoke all authority from the dead epoch (SPEC §5.3).
     this.grant = []
@@ -420,7 +459,7 @@ export class McplServerHandle {
     this.child = null
     if (this.tools.length) {
       this.tools = []
-      this.cb.toolsChanged()
+      this.listedChanged()
     }
     this.status = status
   }
@@ -574,6 +613,7 @@ export class McplServerHandle {
     this.child = child
     this.stderrTail = dialed.stderrTail
     this.childClosed = dialed.closed
+    this.attachTap(conn, myEpoch)
     conn.on('error', err => this.log(`conn error: ${err.message}`))
     conn.on('close', () => {
       if (myEpoch !== this.epoch) return
@@ -605,7 +645,7 @@ export class McplServerHandle {
     const canMint = (this.cb.issuer?.() ?? null) !== null
     const initResult = (await conn.sendRequest('initialize', {
       protocolVersion: '2024-11-05',
-      capabilities: { tools: {}, experimental: { mcpl: hostMcplCaps(canMint) } },
+      capabilities: { tools: {}, experimental: { mcpl: hostMcplCaps(canMint, this.hintsAdvertised) } },
       clientInfo: { name: 'mcpl-cc-bridge', version: '0.1.0' },
     })) as McplInitializeResult
     if (myEpoch !== this.epoch) throw new Error('stale epoch')
@@ -614,6 +654,8 @@ export class McplServerHandle {
     const caps: InitializeCapabilities = initResult.capabilities ?? {}
     const mcpl = extractMcpl(caps)
     this.isMcpl = mcpl != null
+    // RFC-014: a new connection — revs start over; its manifest declares toolsets.
+    this.presence.beginConnection(mcpl as Record<string, unknown> | undefined, this.hintsAdvertised)
 
     if (mcpl != null) {
       // §5.4: effective grant = advertised ∩ operator policy. tools comes only
@@ -663,22 +705,387 @@ export class McplServerHandle {
     }
 
     await this.refreshTools(conn)
-    this.log(`connected: ${this.status}, ${this.tools.length} tools, grant=[${this.grant.join(', ')}]`)
+    // RFC-014 §5.2–5.3: after every (re)connect, ask what the server still holds open and adopt it.
+    if (this.presence.active) await this.reattach(conn, myEpoch) // r5 §5.3: every server with toolHints answers toolsets/list
+    this.log(`connected: ${this.status}, ${this.tools.length} tools, grant=[${this.grant.join(', ')}]` + (this.presence.active ? `, toolHints${this.presence.surface ? ' (surface)' : ''}: ${this.listedTools().length} listed, ${this.presence.openRecords().length} open` : ''))
   }
 
-  private async refreshTools(conn: McplConnection): Promise<void> {
-    let tools: McplTool[] = []
+  /**
+   * tools/list. The result is applied where it is read, in arrival order (the
+   * tap, readToolList); this returns what that changed for the model.
+   */
+  private async refreshTools(conn: McplConnection): Promise<ChangeSet> {
     try {
-      const r = (await conn.sendRequest('tools/list', {})) as { tools?: McplTool[] }
-      tools = r?.tools ?? []
+      const r = await conn.sendRequest('tools/list', {})
+      return (r && typeof r === 'object' ? this.readChanges.get(r) : undefined) ?? emptyChange()
     } catch (e) {
       this.log(`tools/list failed: ${e instanceof Error ? e.message : e}`)
+      return emptyChange()
     }
-    // A connection torn down while the list was in flight (restart, disable)
-    // must not repopulate the tools of the one that replaced it.
-    if (conn !== this.conn) return
-    this.tools = tools
+  }
+
+  // ── RFC-014: tool presence ──
+
+  /** The host advertises toolHints to this server (config `toolHints: false` opts out: the server then sees a plain host). */
+  get hintsAdvertised(): boolean {
+    return this.cfg.toolHints !== false
+  }
+
+  /**
+   * What Claude Code's tool list carries of this server: everything when hints
+   * are off (today's behaviour); static tools in mixed mode; nothing in
+   * surface mode (RFC-014 §8.1).
+   */
+  listedTools(): McplTool[] {
+    if (!this.presence.active) return this.tools
+    if (this.presence.surface) return []
+    return this.tools.filter(t => this.presence.presenceOf(t.name) === 'static')
+  }
+
+  /** Tell the client only when what it lists changed — never for a dynamic tool's visibility (that is the point of RFC-014). */
+  private listedChanged(): void {
+    const d = JSON.stringify([this.presence.presents, this.listedTools().map(t => [t.name, t.description ?? '', t.inputSchema ?? null, t._meta ?? null])])
+    if (d === this.listedDigest) return
+    this.listedDigest = d
     this.cb.toolsChanged()
+  }
+
+  /** Apply pending static↔dynamic moves at a boundary (compaction); true when the listed tools changed. */
+  applyPresenceMoves(): Array<{ name: string; to: 'static' | 'dynamic' }> {
+    const moves = this.presence.applyMoves()
+    if (moves.length) this.listedChanged()
+    return moves
+  }
+
+  /**
+   * The one apply path (RFC-014 §6.1) for a HintChanges from any carrier — a
+   * call or open/close result, a push's `hints`, a standalone tools/hints —
+   * called as the message is read (the tap). Returns what changed for the
+   * model. Revs are consecutive (r4): anything but the last + 1 means a
+   * message was lost or misordered, and the host recovers.
+   */
+  private applyHints(h: unknown, source: string): ChangeSet {
+    if (h === undefined || !this.presence.active) return emptyChange()
+    const before = this.presence.view()
+    const last = this.presence.rev
+    const r = this.presence.apply(h)
+    const rev = String((h as { rev?: unknown }).rev)
+    if (r.behind) {
+      this.log(`hint change rev ${rev} (${source}) is not after rev ${last} — ignored; recovering from toolsets/list + tools/list`)
+      this.scheduleRecovery()
+    } else if (r.skipped) {
+      this.log(`hint change rev ${rev} (${source}) after rev ${last}: a rev was lost — applied; recovering from toolsets/list + tools/list`)
+      this.scheduleRecovery()
+    } else if (!r.applied) this.log(`malformed hint change (${source}) ignored`)
+    const cs = this.presence.diff(before, this.presence.view())
+    cs.suggest.push(...r.suggest)
+    return cs
+  }
+
+  // ── RFC-014 r4 §6.1: apply on arrival ──
+
+  /**
+   * Hint changes apply when a message is READ, in arrival order — whatever
+   * then becomes of the message: a push refused or not yet decided on, a
+   * result nobody waits for any more (a timed-out call). The connection emits
+   * every message here before routing it (`wire`, a local addition to the
+   * vendored McplConnection, which would otherwise drop a late response
+   * unseen), and `sent` names the request each response answers.
+   */
+  private attachTap(conn: McplConnection, myEpoch: number): void {
+    this.sentHinted = new Map()
+    this.seenEvents = new Set()
+    conn.on('sent', (id, method, params) => {
+      if (!HINTED_RESULTS.has(method)) return
+      this.sentHinted.set(String(id), { method, params: params && typeof params === 'object' ? (params as Record<string, unknown>) : {} })
+      if (this.sentHinted.size > 1000) this.sentHinted.delete(this.sentHinted.keys().next().value!)
+    })
+    conn.on('wire', msg => {
+      if (myEpoch !== this.epoch) return
+      try {
+        this.onRead(conn, msg)
+      } catch (e) {
+        this.log(`hint tap: ${e instanceof Error ? e.message : e}`)
+      }
+    })
+  }
+
+  private onRead(conn: McplConnection, msg: Record<string, unknown>): void {
+    if (msg.id != null && ('result' in msg || 'error' in msg)) {
+      const sent = this.sentHinted.get(String(msg.id))
+      if (!sent) return
+      this.sentHinted.delete(String(msg.id))
+      const result = msg.result
+      if (!result || typeof result !== 'object' || Array.isArray(result)) return // an error carries no state
+      const res = result as Record<string, unknown>
+      const awaited = conn.isPending(msg.id)
+      let cs: ChangeSet
+      switch (sent.method) {
+        case 'tools/list':
+          cs = this.readToolList(res)
+          break
+        case 'toolsets/list':
+          cs = this.readToolsetList(res)
+          break
+        case 'toolsets/open': {
+          cs = this.applyHints(metaHints(res), 'toolsets/open')
+          const before = this.presence.view()
+          const toolset = typeof res.toolset === 'string' ? res.toolset : String(sent.params.toolset ?? '')
+          const instance = typeof res.instance === 'string' && res.instance ? res.instance : typeof sent.params.instance === 'string' ? sent.params.instance : undefined
+          this.presence.noteOpened(toolset, instance, typeof res.title === 'string' && res.title ? res.title : undefined)
+          cs.changes.push(...this.presence.diff(before, this.presence.view()).changes)
+          break
+        }
+        case 'toolsets/close': {
+          // The hint changes the close caused ride in its result (r3 §5.2), like an open's.
+          cs = this.applyHints(metaHints(res), 'toolsets/close')
+          const before = this.presence.view()
+          this.presence.noteClosed(String(sent.params.toolset ?? ''), typeof sent.params.instance === 'string' ? sent.params.instance : undefined)
+          cs.changes.push(...this.presence.diff(before, this.presence.view()).changes)
+          break
+        }
+        default:
+          cs = this.applyHints(metaHints(res), sent.method)
+      }
+      if (awaited) this.readChanges.set(res, cs)
+      else {
+        // Nobody waits for this result any more (it timed out): applied all the same, and told on its own.
+        this.log(`late ${sent.method} result read — its hint changes applied`)
+        if (sent.method !== 'tools/list') this.deliverChange(cs)
+      }
+      return
+    }
+    const params = msg.params
+    if (!params || typeof params !== 'object' || Array.isArray(params) || !this.presence.active) return
+    const p = params as Record<string, unknown>
+    if (msg.method === 'tools/hints') {
+      this.readChanges.set(p, this.applyHints(p, 'tools/hints'))
+    } else if (msg.method === 'push/event' && p.hints !== undefined) {
+      // RFC-014 r3 §7: a push carrying hints is never coalesced — when its changes would apply is undefined.
+      if (p.coalesce != null) {
+        this.log(`push ${String(p.eventId ?? '')} carries hints and coalesce (RFC-014 §7 forbids it) — hints ignored; recovering`)
+        this.scheduleRecovery()
+        return
+      }
+      // r5 §6.1: a push carrying hints is never retried; one whose eventId was seen is a duplicate — its hints were applied once.
+      const eventId = typeof p.eventId === 'string' || typeof p.eventId === 'number' ? String(p.eventId) : ''
+      if (eventId) {
+        if (this.seenEvents.has(eventId)) {
+          this.log(`push ${eventId} seen before — its hints ignored`)
+          return
+        }
+        this.seenEvents.add(eventId)
+        if (this.seenEvents.size > 1000) this.seenEvents.delete(this.seenEvents.values().next().value!)
+      }
+      // Applied now, before (and whatever) the host decides about the push.
+      this.readChanges.set(p, this.applyHints(p.hints, 'push'))
+    }
+  }
+
+  /** tools/list, as read: definitions and presence as of its `mcpl/rev`, which takes no rev of its own (r4 §4.1). */
+  private readToolList(res: Record<string, unknown>): ChangeSet {
+    const tools = Array.isArray(res.tools) ? (res.tools as McplTool[]) : []
+    const before = this.presence.view()
+    this.tools = tools
+    this.presence.setTools(tools)
+    const meta = res._meta && typeof res._meta === 'object' ? (res._meta as Record<string, unknown>) : {}
+    if (this.presence.active && this.presence.noteListRev(meta['mcpl/rev'])) {
+      this.log(`tools/list was written after rev ${String(meta['mcpl/rev'])}, beyond the last rev read — a message was lost; recovering`)
+      this.scheduleRecovery()
+    }
+    this.listedChanged()
+    return this.presence.diff(before, this.presence.view())
+  }
+
+  /** toolsets/list, as read: a full statement of per-instance state at its own rev (r4 §5.3, §6.1). */
+  private readToolsetList(res: Record<string, unknown>): ChangeSet {
+    if (!this.presence.active) return emptyChange()
+    const before = this.presence.view()
+    const { lost, ended, suggest, skipped } = this.presence.adopt(res)
+    if (skipped && !this.recovering) {
+      // Per-instance state is restated in full; what else was lost (presence, groups) comes from tools/list.
+      this.log('toolsets/list rev skipped one — re-reading tools/list')
+      this.scheduleRecovery()
+    }
+    const cs = this.presence.diff(before, this.presence.view())
+    cs.suggest.push(...suggest)
+    // A lost toolset gets its note, not also a "closed" line.
+    cs.changes = cs.changes.filter(c => !lost.some(o => keyOf(o.toolset, o.instance) === c.key))
+    cs.notes.push(...this.presence.adoptionNotes(lost, ended))
+    return cs
+  }
+
+  /**
+   * A change with no result or event to ride on  /**
+   * A change with no result or event to ride on (tools/hints, a reconnect,
+   * a recovery): a short channel notification. Tagged surface:tools — held,
+   * not woken on, by default — or surface:invite when it suggests an open.
+   * Needs pushEvents, like any delivery into the conversation.
+   */
+  private deliverChange(cs: ChangeSet): void {
+    if (isEmpty(cs)) return
+    if (!granted(this.grant, 'pushEvents')) {
+      this.log('tool change not delivered (pushEvents not granted) — look shows it')
+      return
+    }
+    const one = cs.changes.length === 1 ? cs.changes[0]! : null
+    this.cb.deliver({
+      server: this.id,
+      kind: 'push-event',
+      text: this.presence.render(cs),
+      meta: {
+        tags: cs.suggest.some(s => s.action === 'open') ? 'surface:invite' : 'surface:tools',
+        ...(one?.toolset ? { toolset: one.toolset } : {}),
+        ...(one?.instance ? { instance: one.instance } : {}),
+      },
+      keepWhole: true,
+    })
+  }
+
+  /** The tool result, `mcpl/hints` taken out of its _meta, the change (applied when the result was read) appended after the server's content. */
+  private withChange(conn: McplConnection, result: unknown): unknown {
+    if (!result || typeof result !== 'object' || Array.isArray(result)) return result
+    const r = result as { content?: unknown; _meta?: Record<string, unknown> }
+    const cs = this.readChanges.get(r)
+    const out: Record<string, unknown> = { ...r }
+    if (r._meta && typeof r._meta === 'object' && 'mcpl/hints' in r._meta) {
+      const { 'mcpl/hints': _hints, ...meta } = r._meta
+      if (Object.keys(meta).length) out._meta = meta
+      else delete out._meta
+    }
+    if (conn !== this.conn || !cs) return out
+    const text = this.presence.render(cs)
+    if (text) out.content = [...(Array.isArray(r.content) ? r.content : []), { type: 'text', text }]
+    return out
+  }
+
+  /** Debounced: a burst of anomalies is one recovery; one that arrives during a recovery runs another after it. */
+  private scheduleRecovery(): void {
+    if (!this.presence.active) return
+    if (this.recovering) {
+      this.recoverAgain = true
+      return
+    }
+    if (this.recoveryTimer) return
+    this.recoveryTimer = setTimeout(() => {
+      this.recoveryTimer = null
+      void this.recover()
+    }, 200)
+  }
+
+  /**
+   * Recovering (r6 §6.1): re-read tools/list (presence, declared definitions)
+   * then toolsets/list (dynamic-tool state in full) — so every tool the
+   * statement names is already known — each applied where it is read in
+   * arrival order. What changed is announced. (This host speaks stdio and
+   * WebSocket only, where arrival order is rev order; it has no Streamable
+   * HTTP transport, so it never holds an early rev.)
+   */
+  private async recover(): Promise<void> {
+    const conn = this.conn
+    if (!conn || conn.isClosed) return
+    this.recovering = true
+    try {
+      const tools = await this.refreshTools(conn)
+      if (conn !== this.conn) return
+      let cs = emptyChange()
+      try {
+        const r = await conn.sendRequest('toolsets/list', {}, 15_000)
+        cs = (r && typeof r === 'object' ? this.readChanges.get(r) : undefined) ?? cs
+      } catch (e) {
+        this.log(`toolsets/list (recovery) failed: ${e instanceof Error ? e.message : e}`)
+      }
+      if (conn !== this.conn) return
+      this.deliverChange({ changes: [...tools.changes, ...cs.changes], suggest: cs.suggest, notes: cs.notes })
+    } finally {
+      this.recovering = false
+      if (this.recoverAgain) {
+        this.recoverAgain = false
+        this.scheduleRecovery()
+      }
+    }
+  }
+
+  /**
+   * Re-read what the server holds open — titles, visibility — without
+   * announcing it: for a reminder or a look, which restate everything anyway.
+   * (A title changes with state — "waiting for an opponent" becomes "vs bo" —
+   * and hint changes carry no title unless a toolset opens.) Returns notes
+   * for what the server no longer holds.
+   */
+  async refreshOpen(): Promise<string[]> {
+    if (!this.presence.active) return []
+    const conn = this.conn
+    if (!conn || conn.isClosed) return []
+    let r: unknown
+    try {
+      r = await conn.sendRequest('toolsets/list', {}, 5000)
+    } catch (e) {
+      this.log(`toolsets/list (refresh) failed: ${e instanceof Error ? e.message : e}`)
+      return []
+    }
+    if (conn !== this.conn || !r || typeof r !== 'object') return []
+    return this.readChanges.get(r)?.notes ?? []
+  }
+
+  /**
+   * After a (re)connect: toolsets/list is the truth (RFC-014 §5.2–5.3). What
+   * it reports is adopted (a game kept across the reconnect); anything the
+   * host believed open and it does not report is closed — and never re-opened
+   * here, since opening can start a new game. `ended` toolsets are told.
+   */
+  private async reattach(conn: McplConnection, myEpoch: number): Promise<void> {
+    let r: unknown
+    try {
+      r = await conn.sendRequest('toolsets/list', {}, 15_000)
+    } catch (e) {
+      this.log(`toolsets/list failed: ${e instanceof Error ? e.message : e}`)
+      return
+    }
+    if (myEpoch !== this.epoch || !r || typeof r !== 'object') return
+    this.deliverChange(this.readChanges.get(r) ?? emptyChange())
+  }
+
+  /** toolsets/open (RFC-014 §5.2). The server's refusal propagates (RpcError). */
+  async openToolset(toolset: string, instance: string | undefined, options: Record<string, unknown> | undefined): Promise<{ key: string; title?: string; content: ContentBlock[]; change: ChangeSet; adopted: boolean }> {
+    const conn = this.liveConn()
+    const r = (await conn.sendRequest('toolsets/open', { toolset, ...(instance ? { instance } : {}), ...(options ? { options } : {}) }, REQUEST_TIMEOUTS.toolset)) as Record<string, unknown> | null
+    if (conn !== this.conn) throw new Error(`${this.id}: the connection was replaced while opening ${toolset}`)
+    const res = r && typeof r === 'object' ? r : {}
+    const inst = typeof res.instance === 'string' && res.instance ? res.instance : instance
+    // r3 §5.2: a proposed name is used as given or the open refused — never another name.
+    if (instance && inst !== instance) this.log(`warning: proposed instance "${instance}" came back as "${inst}" (RFC-014 r3 §5.2 forbids renaming) — using the server's`)
+    const title = typeof res.title === 'string' && res.title ? res.title : undefined
+    // Applied (hints, then the open itself) when the result was read.
+    const change = this.readChanges.get(res) ?? emptyChange()
+    const key = keyOf(toolset, this.presence.declared[toolset]?.instances ? inst : undefined)
+    return {
+      key,
+      title: title ?? this.presence.openRecords().find(o => keyOf(o.toolset, o.instance) === key)?.title,
+      content: Array.isArray(res.content) ? (res.content as ContentBlock[]) : [],
+      change,
+      // r3 §5.2: it was already open; the content says which options were not applied.
+      adopted: res.adopted === true,
+    }
+  }
+
+  /** toolsets/close. */
+  async closeToolset(toolset: string, instance: string | undefined): Promise<{ content: ContentBlock[]; change: ChangeSet }> {
+    const conn = this.liveConn()
+    const r = (await conn.sendRequest('toolsets/close', { toolset, ...(instance ? { instance } : {}) }, REQUEST_TIMEOUTS.toolset)) as Record<string, unknown> | null
+    if (conn !== this.conn) throw new Error(`${this.id}: the connection was replaced while closing ${toolset}`)
+    const res = r && typeof r === 'object' ? r : {}
+    // Applied (its hints, then the close) when the result was read.
+    const change = this.readChanges.get(res) ?? emptyChange()
+    return { content: Array.isArray(res.content) ? (res.content as ContentBlock[]) : [], change }
+  }
+
+  /** Open / close an undeclared group (RFC-014 §5.4): the host's own act, the server is not told. */
+  setGroupOpen(group: string, open: boolean): ChangeSet {
+    const before = this.presence.view()
+    if (open) this.presence.openGroup(group)
+    else this.presence.closeGroup(group)
+    return this.presence.diff(before, this.presence.view())
   }
 
   // ── Inbound: pull-based loop (event style leaks incomingQueue) ──
@@ -728,11 +1135,19 @@ export class McplServerHandle {
 
     switch (methodName) {
       case 'notifications/tools/list_changed': {
-        await this.refreshTools(conn)
+        this.deliverChange(await this.refreshTools(conn))
+        return
+      }
+      case 'tools/hints': {
+        // RFC-014 §6.1 carrier 3: a change with nothing to say. A server sends it
+        // only to a host that advertised toolHints (§6.3); otherwise it is ignored.
+        // Applied when read (the tap); here only told.
+        if (!this.presence.active || !params || typeof params !== 'object') return
+        this.deliverChange(this.readChanges.get(params) ?? emptyChange())
         return
       }
       case 'push/event': {
-        const p = params as PushEventParams
+        const p = params as PushEventParams & { hints?: unknown; toolset?: unknown; instance?: unknown }
         const tags = expandTags(p.tags)
         // origin is opaque to the spec, but chat-shaped producers put the
         // routing facts there (which channel, which message, who). Pass the
@@ -751,13 +1166,20 @@ export class McplServerHandle {
         const refused = this.refusal({ channelId: from, refs: [mcplChannel, native], isDm: tags.includes('chat:dm'), authorId: s(o.authorId) })
         if (refused) {
           console.error(`${this.id}: dropped push from ${refused}`)
+          // Its hints were applied when it was read (r4 §6.1); the event is refused, the tool change is still told.
+          this.deliverChange(this.readChanges.get(p) ?? emptyChange())
           respond({ accepted: false, reason: `not admitted on this host: ${refused}` })
           return
         }
+        // RFC-014 §6.1 carrier 2: the change the event explains, applied when
+        // the push was read (the tap) and appended to the event it explains.
+        const changeText = this.presence.render(this.readChanges.get(p) ?? emptyChange())
+        const body = renderContent(p.payload?.content)
         this.cb.deliver({
           server: this.id,
           kind: 'push-event',
-          text: renderContent(p.payload?.content),
+          text: changeText ? (body ? `${body}\n${changeText}` : changeText) : body,
+          ...(changeText ? { keepWhole: true } : {}),
           meta: {
             event_id: String(p.eventId ?? ''),
             feature_set: String(p.featureSet ?? ''),
@@ -773,6 +1195,9 @@ export class McplServerHandle {
             message_id: s(o.messageId),
             author: s(o.authorName),
             author_id: s(o.authorId),
+            // RFC-014 §7: the toolset / instance the event belongs to.
+            toolset: s(p.toolset),
+            instance: s(p.instance),
             ...(tags.length ? { tags: tags.join(' ') } : {}),
           },
         })
@@ -1211,14 +1636,34 @@ export class McplServerHandle {
       this.log(`featureSets/update after manifest change failed: ${e instanceof Error ? e.message : e}`)
     }
     if (removedPaths.length) this.log(`manifest change revoked: [${removedPaths.join(', ')}]`)
+    // RFC-014 §5.1: toolset declarations live in the manifest (its `toolsets` domain).
+    if (this.presence.active) {
+      const before = this.presence.view()
+      const notes: string[] = []
+      if ((manifest as { toolHints?: unknown }).toolHints !== true) {
+        // r5 §5.1: hint-less from then on — every tool static, its dynamic presentation withdrawn.
+        this.presence.deactivate()
+        notes.push(`[${this.id}] no longer sends tool hints: its tools are in your tool list as ${this.prefix}__<tool>.`)
+        this.log('the server withdrew toolHints — treated as hint-less')
+      } else this.presence.setManifest(manifest)
+      const cs = this.presence.diff(before, this.presence.view())
+      cs.notes.push(...notes)
+      this.deliverChange(cs)
+    }
     await this.refreshTools(conn)
   }
 
   // ── Host → Server surface ──
 
-  async callTool(name: string, args: unknown): Promise<unknown> {
+  /**
+   * tools/call. `instance` rides in `_meta["mcpl/instance"]` (RFC-014 §5.5).
+   * The result's `mcpl/hints` is applied and the change appended after the
+   * server's content (a call reports its own consequences, §6.2).
+   */
+  async callTool(name: string, args: unknown, opts: { instance?: string } = {}): Promise<unknown> {
     const conn = this.liveConn()
-    return conn.sendRequest('tools/call', { name, arguments: args ?? {} }, 120_000)
+    const result = await conn.sendRequest('tools/call', { name, arguments: args ?? {}, ...(opts.instance ? { _meta: { 'mcpl/instance': opts.instance } } : {}) }, REQUEST_TIMEOUTS.call)
+    return this.withChange(conn, result)
   }
 
   async publish(ref: string, text: string): Promise<unknown> {

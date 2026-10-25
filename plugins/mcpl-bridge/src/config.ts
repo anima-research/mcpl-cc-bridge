@@ -135,6 +135,14 @@ export type ServerConfig = {
    * session that has not overridden it.
    */
   disabled?: boolean
+  /**
+   * MCPL RFC-014 tool presence. Default true: the bridge advertises toolHints;
+   * a server that hints keeps its static tools in the tool list, announces its
+   * dynamic tools in the conversation and is reached through open/act/look/close
+   * (a `surface` server entirely so). false: the bridge does not advertise
+   * toolHints and lists the server's tools as a plain host would.
+   */
+  toolHints?: boolean
   /** Reconnect on transport failure. Default: true for ws, false for stdio. */
   reconnect?: boolean
   reconnectIntervalMs?: number
@@ -257,7 +265,7 @@ export function loadConfig(): { config: BridgeConfig; path: string | null } {
     if (s.dmAllowlist !== undefined && !(Array.isArray(s.dmAllowlist) && s.dmAllowlist.every(c => typeof c === 'string'))) {
       throw new Error(`${path}: servers.${id}: dmAllowlist must be an array of channel or author ids`)
     }
-    for (const k of ['openOnAddressed', 'openChannelsOnly', 'disabled'] as const) {
+    for (const k of ['openOnAddressed', 'openChannelsOnly', 'disabled', 'toolHints'] as const) {
       if (s[k] !== undefined && typeof s[k] !== 'boolean') throw new Error(`${path}: servers.${id}: ${k} must be a boolean`)
     }
   }
