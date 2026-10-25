@@ -974,15 +974,20 @@ export class McplServerHandle {
   }
 
   /**
-   * Recovering (r4 §6.1): re-read toolsets/list (per-instance state in full)
-   * then tools/list (presence, definitions), each applied where it is read in
-   * arrival order — no common baseline needed. What changed is announced.
+   * Recovering (r6 §6.1): re-read tools/list (presence, declared definitions)
+   * then toolsets/list (dynamic-tool state in full) — so every tool the
+   * statement names is already known — each applied where it is read in
+   * arrival order. What changed is announced. (This host speaks stdio and
+   * WebSocket only, where arrival order is rev order; it has no Streamable
+   * HTTP transport, so it never holds an early rev.)
    */
   private async recover(): Promise<void> {
     const conn = this.conn
     if (!conn || conn.isClosed) return
     this.recovering = true
     try {
+      const tools = await this.refreshTools(conn)
+      if (conn !== this.conn) return
       let cs = emptyChange()
       try {
         const r = await conn.sendRequest('toolsets/list', {}, 15_000)
@@ -991,9 +996,7 @@ export class McplServerHandle {
         this.log(`toolsets/list (recovery) failed: ${e instanceof Error ? e.message : e}`)
       }
       if (conn !== this.conn) return
-      const tools = await this.refreshTools(conn)
-      if (conn !== this.conn) return
-      this.deliverChange({ changes: [...cs.changes, ...tools.changes], suggest: cs.suggest, notes: cs.notes })
+      this.deliverChange({ changes: [...tools.changes, ...cs.changes], suggest: cs.suggest, notes: cs.notes })
     } finally {
       this.recovering = false
       if (this.recoverAgain) {

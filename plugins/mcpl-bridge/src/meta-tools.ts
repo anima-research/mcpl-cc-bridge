@@ -41,17 +41,17 @@ export const META_TOOLS = [
     name: 'act',
     description:
       'Call a tool that was announced in the conversation (from an open toolset), or any tool of a server whose tools are not in your tool list. ' +
-      'args are the arguments its signature shows; instance picks the open copy when several are open. ' +
+      'args are the arguments its signature shows; instance picks the open copy when several are open; server is needed only when two servers have the tool. ' +
       'Returns the server\'s result, then any change in which tools are available.',
     inputSchema: {
       type: 'object',
       properties: {
-        server: { type: 'string', description: 'bridged server id' },
+        server: { type: 'string', description: 'bridged server id (only needed when two servers have the tool)' },
         tool: { type: 'string' },
         instance: { type: 'string', description: 'which open copy (only needed when several are open)' },
         args: { type: 'object' },
       },
-      required: ['server', 'tool'],
+      required: ['tool'],
     },
   },
   {
@@ -191,10 +191,23 @@ async function open(handles: Map<string, McplServerHandle>, args: Record<string,
   return fail(`${h.id} has no toolset "${toolset}"${openable.length ? ` — it has: ${openable.join(', ')}` : ''}`)
 }
 
+/**
+ * r6 §8.2: `server` may be left out of act and look; the name decides — a
+ * tool (or toolset, or instance) that exactly one server has. Two or more:
+ * name the server.
+ */
+function owner(handles: Map<string, McplServerHandle>, server: unknown, has: (h: McplServerHandle) => boolean, what: string): McplServerHandle {
+  if (str(server)) return pick(handles, server)
+  const owners = presenting(handles).filter(has)
+  if (owners.length === 1) return owners[0]!
+  return fail(owners.length ? `${what} is on several servers (${owners.map(h => h.id).join(', ')}) — add server` : `no server with toolsets has ${what}`)
+}
+
 async function act(handles: Map<string, McplServerHandle>, args: Record<string, unknown>): Promise<MetaResult> {
-  const h = pick(handles, args.server)
+  const name = str(args.tool) ?? fail('name the tool')
+  const h = owner(handles, args.server, x => !!x.presence.tool(name), `a tool "${name}"`)
   const p = h.presence
-  const tool = str(args.tool) ?? fail('name the tool')
+  const tool = name
   if (!p.tool(tool)) fail(`${h.id} has no tool "${tool}" — look {server:"${h.id}"} shows what is available`)
   if (args.args !== undefined && !isObj(args.args)) fail('args must be an object of the tool\'s arguments')
   let instance = str(args.instance)
@@ -231,10 +244,13 @@ async function look(handles: Map<string, McplServerHandle>, args: Record<string,
 function lookNow(handles: Map<string, McplServerHandle>, args: Record<string, unknown>, server: string | undefined, tool: string | undefined): MetaResult {
   if (!server) {
     const hs = presenting(handles)
-    if (tool) {
-      const owners = hs.filter(h => h.presence.tool(tool))
-      if (owners.length === 1) return lookTool(owners[0]!, tool, str(args.instance))
-      fail(owners.length ? `several servers have "${tool}": ${owners.map(h => h.id).join(', ')} — add server` : `no server with toolsets has a tool "${tool}"`)
+    if (tool) return lookTool(owner(handles, undefined, h => !!h.presence.tool(tool), `a tool "${tool}"`), tool, str(args.instance))
+    const ts = str(args.toolset)
+    const inst = str(args.instance)
+    if (ts || inst) {
+      // A toolset or instance name names its server when only one has it.
+      const h = owner(handles, undefined, x => (ts ? x.presence.isDeclared(ts) || x.presence.undeclaredGroups.includes(ts) : true) && (!inst || x.presence.openRecords().some(o => o.instance === inst)), ts ? `a toolset "${ts}"${inst ? ` with instance "${inst}"` : ''}` : `an open instance "${inst}"`)
+      return lookNow(handles, args, h.id, tool)
     }
     if (!hs.length) return text('No bridged server has toolsets or dynamic tools; every tool is in your tool list.')
     return text(hs.map(h => h.presence.catalog()).join('\n\n'))

@@ -249,8 +249,8 @@ toolsets or dynamic tools:
 | tool | |
 |---|---|
 | `open {server, toolset?, instance?, options?}` | open a toolset (sends `toolsets/open`; an undeclared group is opened by the bridge alone); an open the server adopts reads "already open" |
-| `act {server, tool, instance?, args}` | call a dynamic tool — or any tool of a surface server; `instance` rides in `_meta["mcpl/instance"]`, filled in when only one is open |
-| `look {server?, toolset?, instance?, tool?}` | what is open and what can be opened, with current tools; with `tool`, its full schema |
+| `act {server?, tool, instance?, args}` | call a dynamic tool — or any tool of a surface server; `instance` rides in `_meta["mcpl/instance"]`, filled in when only one is open |
+| `look {server?, toolset?, instance?, tool?}` | what is open and what can be opened, with current tools; with `tool`, its full schema (`server` only when a name is on several servers) |
 | `close {server, toolset?, instance?}` | close it |
 
 A server that hints `surface` has none of its tools listed, static ones
@@ -277,9 +277,13 @@ decides about it; a repeated `eventId`'s hints are ignored), a `tools/hints`.
 Revs are consecutive: every message carrying hints takes the next one,
 `toolsets/*` results included; `tools/list` carries `mcpl/rev` and takes none.
 Anything but the last rev + 1 means a message was lost, and the bridge
-**recovers**: it re-reads `toolsets/list` (a full statement of the server's
-dynamic tools — a tool not stated visible is invisible) and then `tools/list`,
-each applied where it is read, and announces what changed. Hints on a push
+**recovers**: it re-reads `tools/list` and then `toolsets/list` (a full
+statement of the server's dynamic tools — a tool not stated visible is
+invisible, an empty statement clears them), each applied where it is read, and
+announces what changed. `tools/list` replaces declared definitions only; a
+current definition from hints stays until hints or `toolsets/list` change it.
+(The bridge's transports are stdio and WebSocket, where arrival order is rev
+order; it has no Streamable HTTP transport.) Hints on a push
 that also carries RFC-006 `coalesce` are ignored and recovered instead. A
 definition in hints changes a tool's description, schema and annotations only
 (name and `_meta` stay the listed ones); with `instance` it is that

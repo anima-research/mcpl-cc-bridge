@@ -378,7 +378,7 @@ test('handle, vectors 3 + 11: a refused push\'s hints apply on arrival, its tool
   expect(counts).toEqual({ tools: 1, toolsets: 1 }) // only the reads at connect: nothing to recover
 })
 
-test('handle, vectors 4 + 12: a skipped rev recovers from toolsets/list then tools/list — including an instance\'s current definition, which act then checks against', async () => {
+test('handle, vectors 4 + 12: a skipped rev recovers from tools/list then toolsets/list — including an instance\'s current definition, which act then checks against', async () => {
   const state = { open: true, on: true }
   const counts = { tools: 0, toolsets: 0 }
   const dim = dyn('dim', 'Dim the lamp.', 'lamp', obj({ level: { type: 'integer' } }, ['level']))
@@ -401,7 +401,7 @@ test('handle, vectors 4 + 12: a skipped rev recovers from toolsets/list then too
   peer.notify('tools/hints', { rev: 1, tools: [{ name: 'on', visible: true }] })
   peer.notify('tools/hints', { rev: 3, tools: [{ name: 'off', visible: true }] }) // rev 2 was "dropped unread"
   await waitFor(() => counts.toolsets === 2 && counts.tools === 2)
-  expect(order().slice(2)).toEqual(['toolsets/list', 'tools/list']) // r4 §6.1: recovery reads toolsets/list, then tools/list
+  expect(order().slice(2)).toEqual(['tools/list', 'toolsets/list']) // r6 §6.1: recovery reads tools/list, then toolsets/list
   await waitFor(() => delivered.some(d => /dim\(level: 1\|2\)/.test(d.text)))
   expect([...h.presence.view().get(keyOf('lamp'))!.tools.keys()]).toEqual(['dim']) // a full statement: on and off were not stated visible
   // act checks arguments against the toolset's current definition, not the listed one
@@ -584,4 +584,49 @@ test('vector 34: a server with toolHints and no declared toolsets is asked tools
   const v = h.presence.view().get(keyOf(''))!
   expect([...v.tools.keys()]).toEqual(['beam']) // glow was visible by the list, not stated visible by the full statement
   expect(v.tools.get('beam')!.description).toBe('Beam a message now.')
+})
+
+// ── revision 6 (RFC-014) ──
+
+test('vector 38: a toolsets/list with nothing visible (empty tools) makes the previously visible dynamic tools invisible', async () => {
+  let listed = 0
+  const { peer, h, handles } = await setup({
+    peerOpts: { handlers: { 'toolsets/list': () => (listed++, listed === 1 ? { open: [], _meta: { 'mcpl/hints': { rev: 1, tools: [] } } } : { open: [{ toolset: 'lamp', title: 'Lamp' }], _meta: { 'mcpl/hints': { rev: 3, tools: [] } } }) } },
+  })
+  expect(h.presence.rev).toBe(1) // the empty statement takes its rev
+  peer.notify('tools/hints', { rev: 2, toolsets: [{ toolset: 'lamp', state: 'open', title: 'Lamp' }], tools: [{ name: 'on', visible: true }, { name: 'off', visible: true }] })
+  await sleep(100)
+  expect([...h.presence.view().get(keyOf('lamp'))!.tools.keys()]).toEqual(['on', 'off'])
+  await callMetaTool('look', { server: 'lamp' }, handles) // reads toolsets/list: open, nothing visible
+  expect(h.presence.isOpen('lamp')).toBe(true)
+  expect([...h.presence.view().get(keyOf('lamp'))!.tools.keys()]).toEqual([])
+  expect(h.presence.rev).toBe(3)
+})
+
+test('r6: tools/list replaces declared definitions only — a current definition from hints stays in force', async () => {
+  const { peer, h } = await setup({ peerOpts: { handlers: { 'toolsets/list': () => ({ open: [], _meta: { 'mcpl/hints': { rev: 1, tools: [] } } }) } } })
+  peer.notify('tools/hints', { rev: 2, toolsets: [{ toolset: 'lamp', state: 'open' }], tools: [{ name: 'on', visible: true, definition: { description: 'Switch on (bulb 2 only).' } }] })
+  await sleep(100)
+  peer.notify('notifications/tools/list_changed', {})
+  await sleep(200)
+  expect(h.presence.view().get(keyOf('lamp'))!.tools.get('on')!.description).toBe('Switch on (bulb 2 only).')
+})
+
+test('r6 §8.2: act and look name the server only when a tool or toolset is on more than one', async () => {
+  const one = await setup()
+  const peer2 = await McplPeer.start({ mcpl: HINTED, tools: [...LAMP_TOOLS, dyn('beam', 'Beam.', undefined, obj(), true)] as never })
+  const h2 = new McplServerHandle('lamp2', { transport: { url: peer2.url }, grant: ['tools', 'pushEvents'] }, { deliver() {}, toolsChanged() {}, log() {} })
+  cleanup.push(() => peer2.close(), () => h2.close())
+  h2.start()
+  await h2.firstAttempt
+  const handles = new Map([['lamp', one.h], ['lamp2', h2]])
+  const ambiguous = await callMetaTool('act', { tool: 'status' }, handles)
+  expect(ambiguous.isError).toBe(true)
+  expect(ambiguous.content[0]!.text).toBe('a tool "status" is on several servers (lamp, lamp2) — add server')
+  const unique = await callMetaTool('act', { tool: 'beam' }, handles) // only lamp2 has it
+  expect(unique.isError).toBeUndefined()
+  expect(peer2.received).toContain('tools/call')
+  expect((await callMetaTool('look', { tool: 'beam' }, handles)).content[0]!.text).toStartWith('beam()\nBeam.')
+  expect((await callMetaTool('look', { toolset: 'gestures' }, handles)).isError).toBe(true) // both have the group
+  expect((await callMetaTool('look', { server: 'lamp', toolset: 'gestures' }, handles)).content[0]!.text).toContain('lamp/gestures: wave')
 })
