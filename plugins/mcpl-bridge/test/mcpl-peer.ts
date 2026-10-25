@@ -24,6 +24,8 @@ export type PeerOptions = {
   handlers?: Record<string, (params: Record<string, unknown>) => unknown>
   /** Methods this peer never answers (a lost result). */
   silent?: string[]
+  /** Methods this peer answers late, by ms. */
+  delay?: Record<string, number>
 }
 
 export class McplPeer {
@@ -107,7 +109,9 @@ export class McplPeer {
     if (this.opts.silent?.includes(String(msg.method))) return
     const custom = this.opts.handlers?.[String(msg.method)]
     if (custom) {
-      this.send(ws, { id, result: custom(params) })
+      const later = this.opts.delay?.[String(msg.method)]
+      if (later) setTimeout(() => this.send(ws, { id, result: custom(params) }), later)
+      else this.send(ws, { id, result: custom(params) })
       return
     }
     switch (msg.method) {

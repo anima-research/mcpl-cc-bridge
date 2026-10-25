@@ -13,6 +13,7 @@
  */
 import type { McplServerHandle } from './mcpl-host'
 import { keyOf, type ChangeSet } from './presence'
+import { checkArgs } from './schema-check'
 import { renderToolDefinition, type ToolDef } from './tool-render'
 
 type Block = { type: string; text?: string; [k: string]: unknown }
@@ -206,6 +207,13 @@ async function act(handles: Map<string, McplServerHandle>, args: Record<string, 
     else fail(`several ${ts} instances are open (${open.map(o => o.instance).join(', ')}) — say which with instance`)
   }
   if (ts && !p.isDeclared(ts) && !p.isOpen(ts)) fail(`${tool} is in ${ts}, which is not open — ${p.openHint(ts)}`)
+  // r4 §6.1: an instance (or the toolset) with a definition of its own from hints — the legal
+  // moves of one game — has its arguments checked against that definition, not the listed one.
+  const key = ts ? keyOf(ts, p.isDeclared(ts) && p.declared[ts]!.instances ? instance : undefined) : keyOf('')
+  if (p.hasOwnDefinition(key, tool)) {
+    const problem = checkArgs(p.defOf(key, tool).inputSchema, args.args ?? {})
+    if (problem) fail(`Invalid arguments for ${tool} in ${p.label(key)} — ${problem}. Nothing was sent; look {server:"${h.id}", tool:"${tool}"${instance ? `, instance:"${instance}"` : ''}} shows its current definition.`)
+  }
   const r = (await h.callTool(tool, args.args ?? {}, { instance })) as { content?: Block[]; isError?: boolean }
   return { content: Array.isArray(r?.content) ? r.content : [{ type: 'text', text: JSON.stringify(r) }], ...(r?.isError ? { isError: true } : {}) }
 }

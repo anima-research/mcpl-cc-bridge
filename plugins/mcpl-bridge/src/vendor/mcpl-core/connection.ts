@@ -38,6 +38,12 @@ export type IncomingMessage =
 export interface McplConnectionEvents {
   request: [request: JsonRpcRequest];
   notification: [notification: JsonRpcNotification];
+  // LOCAL ADDITIONS (mcpl-cc-bridge, MCPL RFC-014 r4 §6.1 "apply on arrival"):
+  // `wire` — every parsed message, synchronously, in arrival order, BEFORE it
+  // is routed (so a response whose request timed out is still seen);
+  // `sent` — each request this side writes, with its id. Keep when re-syncing.
+  wire: [message: Record<string, unknown>];
+  sent: [id: number, method: string, params: unknown];
   close: [];
   error: [error: Error];
 }
@@ -196,6 +202,7 @@ export class McplConnection extends (EventEmitter as new () => TypedEmitter) {
 
     const id = this.nextId++;
     const request = makeRequest(id, method, params);
+    this.emit('sent', id, method, params);
 
     const timeoutMs = timeout ?? this.requestTimeout;
 
@@ -289,8 +296,14 @@ export class McplConnection extends (EventEmitter as new () => TypedEmitter) {
     this.writer.write(json + '\n');
   }
 
+  /** Is a request with this id still awaiting its response? (LOCAL ADDITION, see `wire`.) */
+  isPending(id: unknown): boolean {
+    return this.pending.has(String(id));
+  }
+
   private handleParsedMessage(msg: Record<string, unknown>): void {
     if (msg.jsonrpc !== '2.0') return; // Not a valid JSON-RPC 2.0 message
+    this.emit('wire', msg);
 
     const hasId = msg.id != null;
     const hasMethod = typeof msg.method === 'string';
