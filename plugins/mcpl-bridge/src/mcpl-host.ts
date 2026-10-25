@@ -7,6 +7,8 @@
  * as a Request, inbound method→capability enforcement, dual-shape featureSets
  * normalization, per-descriptor channel authorization, manifest re-fetch on
  * mcpl/manifestChanged, and answer-or-error discipline on every inbound id.
+ * Delegated access (MCPL RFC-015): per-dial credentials for `transport.access`
+ * and `access/token` answered for servers granted `access.token`.
  */
 import { spawn, type ChildProcess } from 'child_process'
 import {
@@ -38,10 +40,21 @@ import {
 } from './vendor/mcpl-core/index.js'
 // ^ vendored from anima-research/mcpl-core-ts src/ (npm @animalabs/mcpl-core@0.2.2
 //   is a stale publish missing the grant/manifest helpers).
-//   Re-sync: cp <mcpl-core-ts>/src/*.ts src/vendor/mcpl-core/
-import { ERR, computeGrant, expandTags, granted, methodCapability } from './grants'
+//   Re-sync: cp <mcpl-core-ts>/src/*.ts src/vendor/mcpl-core/ — and keep the
+//   local `access.token` path in capabilities.ts (RFC-015) until upstream has it.
+import { ERR, computeGrant, expandTags, granted, methodCapability, wildcardOnlyMatches } from './grants'
 import { holdsAmbient } from './wake'
-import { DEFAULT_GRANT, isWs, resolveUrl, type ServerConfig, type StdioTransportConfig } from './config'
+import { DEFAULT_GRANT, dialUrl, isLoopbackHost, isWs, resolveUrl, staticToken, type ServerConfig, type StdioTransportConfig } from './config'
+import {
+  ACCESS_TTL,
+  AccessRefused,
+  CredentialCache,
+  auditFields,
+  validateAccessParams,
+  type AccessAuditRecord,
+  type AccessIssuer,
+} from './access'
+import { secrets } from './redact'
 import { ChannelRefError, ChannelRegistry, buildLabelView, isAddressableId, norm, resolveChannelRef, type LabelView } from './channel-labels'
 
 export type McplTool = { name: string; description?: string; inputSchema?: unknown; _meta?: Record<string, unknown> }
@@ -57,6 +70,15 @@ export type HostCallbacks = {
   deliver(msg: IncomingDelivery): void
   toolsChanged(): void
   log(line: string): void
+  /**
+   * The bridge identity to mint credentials from (RFC-015), or null when none
+   * is configured — then the host does not advertise `access`, `access/token`
+   * is refused (-32040) and a `transport.access` dial fails. Asked at each
+   * use, so a reload that changes the identity reaches new requests.
+   */
+  issuer?(): AccessIssuer | null
+  /** RFC-015 §8.2 audit sink: one record per access/token request and per access dial. Never carries the credential. */
+  audit?(rec: AccessAuditRecord): void
 }
 
 type PendingInference = {
@@ -64,15 +86,19 @@ type PendingInference = {
   reject(err: { code: number; message: string }): void
 }
 
-const HOST_MCPL_CAPS = {
-  version: '0.5',
-  pushEvents: true,
-  inferenceRequest: true,
-  inferenceLifecycle: true,
-  modelInfo: true,
-  contextHooks: { beforeInference: { observe: true, inject: { system: true, beforeUser: true, afterUser: true } } },
-  channels: { register: true, lifecycle: true, publish: true, incoming: true, acknowledge: true },
-  featureSets: true,
+/** The host's `experimental.mcpl` advertisement. `access` (RFC-015 §4.2) only when it holds an identity to mint from. */
+export function hostMcplCaps(canMint: boolean): Record<string, unknown> {
+  return {
+    version: '0.5',
+    pushEvents: true,
+    inferenceRequest: true,
+    inferenceLifecycle: true,
+    modelInfo: true,
+    contextHooks: { beforeInference: { observe: true, inject: { system: true, beforeUser: true, afterUser: true } } },
+    channels: { register: true, lifecycle: true, publish: true, incoming: true, acknowledge: true },
+    featureSets: true,
+    ...(canMint ? { access: { token: true } } : {}),
+  }
 }
 
 export function renderContent(content: string | ContentBlock[] | undefined): string {
@@ -158,6 +184,9 @@ export class McplServerHandle {
   private pendingInference = new Map<string, PendingInference>()
   private manifestFetchAt = 0
   private isMcpl = false
+  /** RFC-015: credentials handed to this server, per audience (RFC §5 caching). */
+  private accessCache = new CredentialCache()
+  private warnedPlainWs = false
 
   /**
    * `opts.predecessor`: the exit of the process a replaced handle for this
@@ -231,6 +260,49 @@ export class McplServerHandle {
     this.cb.log(`[${this.id}] ${line}`)
   }
 
+  private audit(rec: Omit<AccessAuditRecord, 'at' | 'server'>): void {
+    const full: AccessAuditRecord = { at: new Date().toISOString(), server: this.id, ...rec }
+    this.log(
+      `access ${full.kind} "${full.audience}": ${full.outcome}` +
+        (full.expiresAt ? ` until ${full.expiresAt}` : '') +
+        (full.reason ? ` — ${full.reason}` : '') +
+        (full.endpoint ? ` endpoint=${full.endpoint}` : '') +
+        (full.purpose ? ` purpose=${JSON.stringify(full.purpose)}` : ''),
+    )
+    try {
+      this.cb.audit?.(full)
+    } catch {}
+  }
+
+  /** The audience this server's dial mints for (`transport.access`), if any. */
+  get accessAudience(): string | null {
+    return isWs(this.cfg.transport) ? (this.cfg.transport.access ?? null) : null
+  }
+
+  /**
+   * Mint the dial credential for `transport.access` (RFC-015 §5: requested at
+   * each dial and reconnect). Throws an error naming the audience and the
+   * reason — never the credential — so the dial fails loudly.
+   */
+  private async dialCredential(audience: string): Promise<string> {
+    const issuer = this.cb.issuer?.() ?? null
+    if (!issuer) {
+      const reason = 'no identity configured (add "identity" to the bridge config)'
+      this.audit({ kind: 'dial', audience, outcome: 'refused', reason })
+      throw new Error(`access "${audience}": ${reason}`)
+    }
+    try {
+      const c = await issuer.mint(audience, { ttl: ACCESS_TTL })
+      secrets.add(c.credential, c.expiresAt)
+      this.audit({ kind: 'dial', audience, outcome: 'granted', expiresAt: new Date(c.expiresAt).toISOString(), ...(c.principal ? { principal: c.principal } : {}) })
+      return c.credential
+    } catch (e) {
+      const reason = e instanceof AccessRefused ? e.reason : secrets.scrubLog(e instanceof Error ? e.message : String(e))
+      this.audit({ kind: 'dial', audience, outcome: 'refused', reason })
+      throw new Error(`access "${audience}": ${reason}`)
+    }
+  }
+
   /** Non-blocking: failures schedule reconnect instead of throwing. */
   start(): void {
     if (this.halted) {
@@ -244,6 +316,7 @@ export class McplServerHandle {
   close(): Promise<void> {
     this.retired = true
     this.teardown('closed')
+    this.accessCache.clear()
     return this.childGone
   }
 
@@ -371,8 +444,19 @@ export class McplServerHandle {
   private async dial(): Promise<{ conn: McplConnection; child: ChildProcess | null; stderrTail: string[]; closed: Promise<void> }> {
     const stderrTail: string[] = []
     if (isWs(this.cfg.transport)) {
+      const t = this.cfg.transport
       const { default: WebSocket } = await import('ws')
-      const url = resolveUrl(this.cfg.transport) // credential resolved per-dial
+      // Credential resolved per dial: minted for `access` (wins), else the static token / env var.
+      const minted = t.access ? await this.dialCredential(t.access) : undefined
+      if (minted && !this.warnedPlainWs) {
+        const u = new URL(dialUrl(t))
+        if (u.protocol === 'ws:' && !isLoopbackHost(u.hostname)) {
+          this.warnedPlainWs = true
+          this.log(`warning: access credential for "${t.access}" sent over plain ws:// to ${u.hostname} — use wss:// unless the link is already private (tailnet)`)
+        }
+      }
+      if (!minted) secrets.add(staticToken(t))
+      const url = resolveUrl(t, minted) // carries the credential: never logged
       const ws = new WebSocket(url)
       await new Promise<void>((resolve, reject) => {
         const t = setTimeout(() => reject(new Error('ws open timeout')), 15_000)
@@ -509,9 +593,10 @@ export class McplServerHandle {
   }
 
   private async handshake(conn: McplConnection, myEpoch: number): Promise<void> {
+    const canMint = (this.cb.issuer?.() ?? null) !== null
     const initResult = (await conn.sendRequest('initialize', {
       protocolVersion: '2024-11-05',
-      capabilities: { tools: {}, experimental: { mcpl: HOST_MCPL_CAPS } },
+      capabilities: { tools: {}, experimental: { mcpl: hostMcplCaps(canMint) } },
       clientInfo: { name: 'mcpl-cc-bridge', version: '0.1.0' },
     })) as McplInitializeResult
     if (myEpoch !== this.epoch) throw new Error('stale epoch')
@@ -526,6 +611,7 @@ export class McplServerHandle {
       // from the OUTER capabilities — advertisedCapabilitiesFromInitialize handles that.
       const advertised = advertisedCapabilitiesFromInitialize(caps)
       this.grant = computeGrant(advertised, this.policy)
+      this.noteAccessGrant(advertised, canMint)
 
       // Dual-shape featureSets normalization (0.5 object vs 0.4 array). Digest
       // is computed over the manifest AS SENT, before normalization.
@@ -611,8 +697,13 @@ export class McplServerHandle {
     const respond = (result: unknown) => {
       if (id != null) conn.sendResponse(id as never, result)
     }
-    const deny = (code: number, message: string) => {
-      if (id != null) conn.sendError(id as never, code, message)
+    const deny = (code: number, message: string, data?: unknown) => {
+      if (id != null) conn.sendError(id as never, code, message, data)
+    }
+
+    if (methodName === 'access/token') {
+      await this.answerAccessToken(conn, id, params)
+      return
     }
 
     const cap = methodCapability(methodName)
@@ -622,7 +713,7 @@ export class McplServerHandle {
       return
     }
     if (cap !== null && !granted(this.grant, cap)) {
-      deny(ERR.CAPABILITY_DENIED, `capability ${cap} not granted`)
+      deny(ERR.CAPABILITY_DENIED, `capability ${cap} not granted`, { capability: cap }) // SPEC App. A: data { capability }
       return
     }
 
@@ -808,6 +899,69 @@ export class McplServerHandle {
         deny(ERR.METHOD_NOT_FOUND, `method not supported by this host: ${methodName}`)
       }
     }
+  }
+
+  /** Log what the operator should know about access.token in this epoch's grant. */
+  private noteAccessGrant(advertised: ReadonlySet<CapabilityPath>, canMint: boolean): void {
+    for (const p of wildcardOnlyMatches(advertised, this.policy)) {
+      this.log(`warning: ${p} is matched only by a wildcard in the grant — not granted; name "${p}" explicitly to grant it (RFC-015 §4.1)`)
+    }
+    if (granted(this.grant, 'access.token')) {
+      this.log(canMint ? 'access.token granted: this server may obtain credentials acting as the agent' : 'warning: access.token granted but no identity is configured — its requests will be refused (-32040)')
+    }
+  }
+
+  /**
+   * RFC-015 `access/token` (Server → Host). In order: the grant (-32002, also
+   * for malformed requests from an ungranted server), the params (-32602),
+   * an identity to mint from, then the cache or a fresh mint (-32040 on any
+   * refusal). Every request is audited; the credential only ever goes into
+   * the response.
+   */
+  private async answerAccessToken(conn: McplConnection, id: unknown, params: unknown): Promise<void> {
+    const seen = auditFields(params)
+    if (id == null) {
+      this.log('access/token arrived as a notification — it is a request; ignored')
+      return
+    }
+    const rid = id as never
+    if (!granted(this.grant, 'access.token')) {
+      conn.sendError(rid, ERR.CAPABILITY_DENIED, 'capability access.token not granted', { capability: 'access.token' })
+      this.audit({ kind: 'request', ...seen, outcome: 'denied', reason: 'access.token not granted' })
+      return
+    }
+    const check = validateAccessParams(params)
+    if (!check.ok) {
+      conn.sendError(rid, ERR.INVALID_PARAMS, `Invalid params: ${check.field} ${check.reason}`, { field: check.field, reason: check.reason })
+      this.audit({ kind: 'request', ...seen, outcome: 'invalid', reason: `${check.field} ${check.reason}` })
+      return
+    }
+    const { audience, endpoint, purpose, fresh } = check.params
+    const about = { kind: 'request' as const, audience, ...(endpoint !== undefined ? { endpoint } : {}), ...(purpose !== undefined ? { purpose } : {}) }
+    const refuse = (reason: string) => {
+      conn.sendError(rid, ERR.ACCESS_REFUSED, 'Access refused', { audience, reason })
+      this.audit({ ...about, outcome: 'refused', reason })
+    }
+    const issuer = this.cb.issuer?.() ?? null
+    if (!issuer) return refuse('this host has no identity to mint from')
+    let got: Awaited<ReturnType<CredentialCache['get']>>
+    try {
+      got = await this.accessCache.get(audience, fresh === true, () => issuer.mint(audience, { ttl: ACCESS_TTL }))
+    } catch (e) {
+      return refuse(e instanceof AccessRefused ? e.reason : `could not mint: ${secrets.scrubLog(e instanceof Error ? e.message : String(e))}`)
+    }
+    // The mint took time: a grant revoked meanwhile (manifest change) or a
+    // connection replaced meanwhile gets nothing.
+    if (conn !== this.conn || !granted(this.grant, 'access.token')) {
+      conn.sendError(rid, ERR.CAPABILITY_DENIED, 'capability access.token not granted', { capability: 'access.token' })
+      this.audit({ ...about, outcome: 'denied', reason: 'grant or connection changed while minting' })
+      return
+    }
+    const c = got.credential
+    secrets.add(c.credential, c.expiresAt)
+    const expiresAt = new Date(c.expiresAt).toISOString()
+    conn.sendResponse(rid, { scheme: 'bearer', credential: c.credential, expiresAt, ...(c.principal ? { principal: c.principal } : {}) })
+    this.audit({ ...about, outcome: got.cached ? 'cached' : 'granted', expiresAt, ...(c.principal ? { principal: c.principal } : {}) })
   }
 
   /**
@@ -1012,6 +1166,8 @@ export class McplServerHandle {
     const removedPaths = this.grant.filter(g => !newGrant.includes(g))
     // Reduction applies atomically first, then tell (§6.7).
     this.grant = newGrant
+    // RFC-015 §4.5: a revoked access.token takes effect at once; nothing cached outlives it here.
+    if (removedPaths.includes('access.token')) this.accessCache.clear()
     const declared = normalizeFeatureSets((manifest as { featureSets?: unknown }).featureSets as never)
     const derivation = deriveFeatureSets(declared, this.grant)
     const wanted = this.cfg.enableFeatureSets ?? ['*']
