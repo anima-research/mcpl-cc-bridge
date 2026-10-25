@@ -159,6 +159,80 @@ Notes:
   [Opening channels](#opening-channels).
 - `disabled` — configured but not started (default `false`); `mcpl_enable`
   starts it for a session. See [Managing servers](#managing-servers-from-the-session).
+- `transport.access` — mint this audience's credential at every dial instead of
+  a static `token`; `"access.token"` in `grant` lets the server ask for
+  credentials itself. See [Identity and delegated access](#identity-and-delegated-access-mcpl-rfc-015).
+
+## Identity and delegated access (MCPL RFC-015)
+
+The bridge can hold an identity of its own — an ed25519 key enrolled as a
+principal at an [archipelago-home](https://github.com/anima-research/archipelago-home)
+identity provider — and use it two ways:
+
+```json
+{
+  "identity": { "home": "id.animalabs.ai" },
+  "servers": {
+    "games": {
+      "transport": { "url": "wss://games.example/mcpl", "access": "games" },
+      "grant": ["tools", "pushEvents"]
+    },
+    "surfaces": {
+      "transport": { "url": "ws://127.0.0.1:7470/mcpl" },
+      "grant": ["tools", "pushEvents", "channels.register", "channels.publish", "access.token"]
+    }
+  }
+}
+```
+
+- **Per-dial credentials** — `transport.access: "<audience>"` mints a
+  credential for that audience, with a 15-minute lifetime, at every dial (first
+  connect and each reconnect) and sends it where `token` would go (`?token=`).
+  It takes precedence over `token` / `tokenEnv`. A failed mint is a dial
+  error naming the audience and the issuer's reason.
+- **`access/token` (RFC-015)** — when `identity` is configured the host
+  advertises `access: { token: true }`. A server granted `access.token` may
+  ask for a credential for any audience the principal can obtain; the answer is
+  `{ scheme: "bearer", credential, expiresAt, principal }`, minted with a
+  15-minute lifetime and cached per (server, principal, audience, scheme) —
+  never answered from the cache with under two minutes left (`fresh: true`
+  bypasses it). The answer comes within `timeoutMs` − 2 s (5–120 s, default 30 s) and
+  at most 20 s. Unknown params members are ignored. Errors: `-32002` without
+  the grant, `-32602` for malformed params, `-32040
+  { audience, kind, reason }` when there is no identity (`no_identity`), the
+  issuer refuses (`provider_refused`) or throttles (`rate_limited`), or gives no
+  usable answer within 20 s (`unavailable`), or the server's `schemes` exclude
+  `bearer` (`host_policy`). `expiresAt` is RFC 3339 UTC (`…Z`).
+  Granting `access.token` is the whole trust decision — there is no
+  per-audience list; the issuer's policy for the principal is the bound. It is
+  never in the default grant, and a wildcard (`access.*`, `*.*`) does not grant
+  it: name it.
+
+`identity.keyPath` defaults to `~/.config/mcpl-bridge/identity-key.pem`
+(created 0600 on first use; the enrollment record sits beside it as
+`identity-key.json`). `identity.url` overrides the issuer base URL
+(`https://<home>`) for a local issuer; plain `http://` only to loopback.
+Every request and access dial is audited to
+`~/.claude/mcpl-bridge/access-audit.jsonl` (server, audience, endpoint as
+scheme/host/path only, purpose, outcome and refusal kind, expiry — never the
+credential).
+
+Credentials never reach the model: tool results, tool lists, channel
+notifications, hook context, `mcpl_status`, error strings and logs all pass a
+redactor that removes every credential the bridge minted or dialed with, and
+anything shaped like an aid1 token.
+
+Enrollment is an operator step, not a tool:
+
+```bash
+cd plugins/mcpl-bridge
+bun run identity status                                   # key id, enrollment
+bun run identity enroll --invite inv_XXXX --name cc-bridge
+bun run identity status --check games                     # mint once, show expiry (never the token)
+```
+
+(`--config <path>` picks the config; otherwise the bridge's own lookup order,
+plus `./.mcpl-bridge.json`.)
 
 ## Wake policy
 
@@ -368,10 +442,21 @@ happens to route a call through.
 cd plugins/mcpl-bridge
 bun install
 bun run test/smoke.ts     # full-surface smoke test against test/toy-server.ts (wake policy, open/close, enable/disable, hot reload included)
+bun test                  # unit tests
 ```
 
 `src/vendor/mcpl-core/` is vendored from
 [anima-research/mcpl-core-ts](https://github.com/anima-research/mcpl-core-ts)
 `src/` (MIT; the npm `@animalabs/mcpl-core@0.2.2` is a stale publish missing
 the grant and manifest helpers). Re-sync after upstream changes:
-`cp <mcpl-core-ts>/src/*.ts plugins/mcpl-bridge/src/vendor/mcpl-core/`
+`cp <mcpl-core-ts>/src/*.ts plugins/mcpl-bridge/src/vendor/mcpl-core/` —
+keeping the local `access.token` capability path (MCPL RFC-015) in
+`capabilities.ts` until upstream carries it.
+
+Tests: `bun test` (unit tests, including RFC-015 against an in-process MCPL
+peer and a fake issuer). The RFC-015 end-to-end test runs against a real local
+archipelago-home issuer it starts itself (temp dirs, free port, killed by pid):
+
+```bash
+MCPL_ACCESS_E2E_ISSUER=/path/to/archipelago-home bun test test/access-e2e.test.ts
+```

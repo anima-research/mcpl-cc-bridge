@@ -17,25 +17,59 @@ import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprot
 import { existsSync, mkdirSync, rmSync, watch, type FSWatcher } from 'fs'
 import { homedir } from 'os'
 import { basename, dirname, join } from 'path'
-import { loadConfig, type ServerConfig } from './config'
+import type { AccessAuditRecord } from './access'
+import { isWs, loadConfig, resolveIdentity, staticToken, type BridgeConfig, type IdentityConfig, type ServerConfig } from './config'
+import { Identity } from './identity'
 import { McplServerHandle, type IncomingDelivery } from './mcpl-host'
+import { secrets } from './redact'
 import { withBridgeClass } from './tool-classes'
 import { WakeGate } from './wake'
 
 import { appendFileSync } from 'fs'
-const DEBUG_LOG = join(process.env.CLAUDE_CONFIG_DIR ?? join(homedir(), '.claude'), 'mcpl-bridge', 'debug.log')
+const BRIDGE_DIR = join(process.env.CLAUDE_CONFIG_DIR ?? join(homedir(), '.claude'), 'mcpl-bridge')
+const DEBUG_LOG = join(BRIDGE_DIR, 'debug.log')
+/** RFC-015 §8.2: one JSON line per credential request / access dial — never the credential. */
+const ACCESS_AUDIT_LOG = join(BRIDGE_DIR, 'access-audit.jsonl')
 try {
-  mkdirSync(join(DEBUG_LOG, '..'), { recursive: true })
+  mkdirSync(BRIDGE_DIR, { recursive: true })
 } catch {}
-const log = (line: string) => {
+const log = (raw: string) => {
+  // Every log line passes the redactor: a server's stderr, an error string, a URL.
+  const line = secrets.scrubLog(raw)
   process.stderr.write(`mcpl-bridge: ${line}\n`)
   try {
     appendFileSync(DEBUG_LOG, `${new Date().toISOString()} [${process.pid}] ${line}\n`)
   } catch {}
 }
 
+function writeAudit(rec: AccessAuditRecord): void {
+  try {
+    appendFileSync(ACCESS_AUDIT_LOG, secrets.scrubLog(JSON.stringify(rec)) + '\n', { mode: 0o600 })
+  } catch (e) {
+    log(`access audit write failed: ${e instanceof Error ? e.message : e}`)
+  }
+}
+
 let { config, path: configPathUsed } = loadConfig()
 log(configPathUsed ? `config: ${configPathUsed}` : 'no config found — running with zero MCPL servers (create .mcpl-bridge.json)')
+
+/** Static tokens are credentials too: track them so no edge prints one. */
+function trackStaticTokens(c: BridgeConfig): void {
+  for (const s of Object.values(c.servers)) if (isWs(s.transport)) secrets.add(staticToken(s.transport))
+}
+trackStaticTokens(config)
+
+// ── Identity (MCPL RFC-015) ──
+// The bridge's enrolled principal: mints per-dial credentials for
+// `transport.access` and answers `access/token` for servers granted
+// `access.token`. Enrollment is the operator CLI's job (src/identity-cli.ts);
+// nothing here is a tool.
+const makeIdentity = (c: IdentityConfig | undefined): Identity | null => (c ? new Identity(resolveIdentity(c)) : null)
+let identity: Identity | null = makeIdentity(config.identity)
+if (identity) log(`identity: ${identity.home} — ${identity.record() ? `enrolled as ${identity.record()!.sub}` : 'not enrolled (run the identity CLI: enroll --invite … --name …)'}`)
+
+/** Servers whose connection depends on the identity: they dial with it, or may ask it for credentials. */
+const usesIdentity = (s: ServerConfig): boolean => (isWs(s.transport) && !!s.transport.access) || (s.grant ?? []).includes('access.token')
 
 // ── MCP server face ──
 
@@ -57,7 +91,7 @@ const mcp = new Server(
 
 let deliverToSession: (msg: IncomingDelivery) => void = msg => {
   // Before the MCP transport is up, drop to stderr (channel messages are best-effort).
-  log(`(early, dropped) ${msg.server}/${msg.kind}: ${msg.text.slice(0, 120)}`)
+  log(`(early, dropped) ${msg.server}/${msg.kind}: ${secrets.scrub(msg.text).slice(0, 120)}`) // scrub before cutting: half a token escapes the pattern
 }
 
 const handles = new Map<string, McplServerHandle>()
@@ -94,6 +128,8 @@ function makeHandle(id: string, serverCfg: ServerConfig, predecessor?: Promise<v
       deliver: msg => deliverToSession(msg),
       toolsChanged: scheduleToolsChanged,
       log,
+      issuer: () => identity,
+      audit: writeAudit,
     },
     { disabled: !wantEnabled(id, serverCfg), predecessor },
   )
@@ -173,9 +209,20 @@ async function reloadConfigInner(reason: string): Promise<ReloadResult> {
   }
   const prev = config.servers
   const nextServers = next.config.servers
+  // A changed identity is a different principal (or none): every server that
+  // dials with it or may ask it for credentials reconnects, so its advertised
+  // `access` and its cached credentials belong to the new one.
+  const identityChanged = stableJson(config.identity ?? null) !== stableJson(next.config.identity ?? null)
   const added = Object.keys(nextServers).filter(id => !(id in prev))
   const removed = Object.keys(prev).filter(id => !(id in nextServers))
-  const changed = Object.keys(prev).filter(id => id in nextServers && connectionJson(prev[id]) !== connectionJson(nextServers[id]))
+  const changed = Object.keys(prev).filter(
+    id => id in nextServers && (connectionJson(prev[id]) !== connectionJson(nextServers[id]) || (identityChanged && (usesIdentity(prev[id]) || usesIdentity(nextServers[id])))),
+  )
+  if (identityChanged) {
+    identity = makeIdentity(next.config.identity)
+    log(`identity ${identity ? `now ${identity.home}` : 'removed'} (reload)`)
+  }
+  trackStaticTokens(next.config)
   for (const [id, on] of [...sessionOverride]) {
     if (!(id in nextServers) || on === configEnabled(nextServers[id])) sessionOverride.delete(id)
   }
@@ -386,7 +433,7 @@ async function listToolsImpl() {
       })
     }
   }
-  return { tools }
+  return secrets.scrubDeep({ tools })
 }
 
 mcp.setRequestHandler(ListToolsRequestSchema, async () => {
@@ -446,7 +493,12 @@ function duration(ms: number): string {
   return `${Math.floor(h / 24)}d`
 }
 
+/** Every tool result — proxied or the bridge's own (status, errors, stderr tails) — leaves through the redactor. */
 async function callToolImpl(name: string, args: Record<string, unknown>): Promise<unknown> {
+  return secrets.scrubDeep(await callToolInner(name, args))
+}
+
+async function callToolInner(name: string, args: Record<string, unknown>): Promise<unknown> {
   try {
     if (name === 'mcpl_status') {
       const lines: string[] = []
@@ -470,12 +522,17 @@ async function callToolImpl(name: string, args: Record<string, unknown>): Promis
             ` | open=[${open.join(', ') || '—'}]` +
             (held > 0 ? ` | held=${held}` : '') +
             (h.pendingInferenceIds.length ? ` | pending inference: ${h.pendingInferenceIds.join(', ')}` : '') +
+            (h.accessAudience ? ` | access=${h.accessAudience}` : '') +
             (h.manifestRevision ? ` | rev=${h.manifestRevision.slice(0, 18)}…` : '') +
             (h.pid ? ` | pid=${h.pid}` : '') +
             (h.connectedAt ? ` | up ${duration(Date.now() - h.connectedAt)}` : '') +
             (sessionOverride.get(id) === true ? ' | enabled this session (config: disabled)' : '') +
             (h.status !== 'ready' && h.status !== 'mcp-only' && h.lastError ? ` | last error: ${h.lastError}` : ''),
         )
+      }
+      if (identity) {
+        const rec = identity.record()
+        lines.push(`identity: ${identity.home} — ${rec ? `enrolled as ${rec.sub}` : 'not enrolled (operator: identity CLI enroll)'}`)
       }
       lines.push(`config: ${configPathUsed ?? 'none'}${configWatcher ? ' (watched)' : ''}`)
       return text(lines.join('\n'))
@@ -642,7 +699,9 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
 
 await mcp.connect(new StdioServerTransport())
 
-deliverToSession = msg => {
+deliverToSession = raw => {
+  // Scrubbed before the gate: a held delivery is shown later, by a wake or the prompt hook.
+  const msg: IncomingDelivery = { ...raw, text: secrets.scrub(raw.text), meta: secrets.scrubDeep(raw.meta) }
   const gate = gates.get(msg.server)
   if (gate && gate.decide(msg) === 'hold') {
     gate.hold(msg)
@@ -772,7 +831,7 @@ async function handleHook(event: HookEvent): Promise<string> {
     }
     if (!parts.length) return ''
     return JSON.stringify({
-      hookSpecificOutput: { hookEventName: 'UserPromptSubmit', additionalContext: parts.join('\n') },
+      hookSpecificOutput: { hookEventName: 'UserPromptSubmit', additionalContext: secrets.scrub(parts.join('\n')) },
     })
   }
 

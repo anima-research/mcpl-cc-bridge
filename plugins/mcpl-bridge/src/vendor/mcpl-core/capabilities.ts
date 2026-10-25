@@ -48,6 +48,11 @@ export const CAPABILITY_PATHS = [
   'channels.streaming',
   'channels.acknowledge',
   'channels.typing',
+
+  // MCPL RFC-015 (Delegated Access, draft): the server may ask its host for a
+  // short-lived credential acting as the principal. LOCAL ADDITION to the
+  // vendored copy — keep it when re-syncing until mcpl-core-ts carries it.
+  'access.token',
 ] as const;
 
 export type CapabilityPath = (typeof CAPABILITY_PATHS)[number];
