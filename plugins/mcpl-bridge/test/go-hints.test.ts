@@ -133,7 +133,7 @@ go('stdio: surface mode lists nothing; open/act/look/close; instances carried on
   const catalog = textOf(await callMetaTool('look', {}, map))
   expect(catalog).toContain('go — Go: Go on 9×9, 13×13 or 19×19, against a Monte Carlo bot or another agent. (everything through open/act/look/close)')
   expect(catalog).toContain('  [go/game:first] Go 9×9 — you are Black, vs bot (easy) tools now — act {server:"go", instance:"first", tool, args}:')
-  expect(catalog).toContain('can open — open {server:"go", toolset, instance?, options?}:\n  game — Go: A game of Go against the bot or another agent (several can be open at once; name each with instance); options {size?: 9|13|19 =9, color?: "black"|"white"|"random" =')
+  expect(catalog).toContain('can open — open {server:"go", toolset, instance?, options?}:\n  game — Go: A game of Go against the bot or another agent (several can be open at once; name each with instance) · options {size?: 9|13|19 =9, color?: "black"|"white"|"random" =')
   expect(catalog).toContain('tools — act {server:"go", tool, args}:\n  games()')
   const def = textOf(await callMetaTool('look', { server: 'go', tool: 'play' }, map))
   expect(def).toStartWith('play(point: string)\nPlace a stone')
@@ -146,13 +146,13 @@ go('stdio: surface mode lists nothing; open/act/look/close; instances carried on
   expect(toolsChanged()).toBe(n) // the tool list never moved
 }, 30_000)
 
-go('stdio: a respawned server lost its instances — the host says so instead of re-opening a fresh game under the old name', async () => {
+go('stdio: a respawned server lost its instances — toolsets/list is the truth: closed, told, never re-opened under the old name', async () => {
   const { h, map, delivered } = await connect(stdioGo(join(base, 'stdio-2')))
   await callMetaTool('open', { server: 'go', instance: 'lost', options: { level: 'easy' } }, map)
   await h.restart() // kill + respawn: a new process, no games
   await waitFor(() => delivered.length > 0, 5000, 'the reconnect notice')
   expect(delivered[0]!.meta.tags).toBe('surface:tools')
-  expect(delivered[0]!.text).toBe('[go/game:lost] is gone — go did not keep it across the reconnect. open {server:"go", toolset:"game"} starts a new one.')
+  expect(delivered[0]!.text).toBe('[go/game:lost] is closed: go no longer has it open. open {server:"go", toolset:"game"} starts a new one.')
   expect(delivered).toHaveLength(1)
   expect(h.presence.openRecords()).toEqual([])
 }, 20_000)
@@ -186,9 +186,9 @@ go('ws, agent vs agent: a move arrives as a push and the visibility change is re
   expect(join.meta.tags).toContain('surface:turn')
   expect(new WakeGate(undefined).decide(join)).toBe('wake')
   expect(join.text).toStartWith('bo joined as White. Your move.\n    A B C D E F G H J')
-  // (the title the open announced still stands: the server sends no toolsets entry when an opponent joins)
+  // the open announced "waiting for an opponent"; the join retitles it (a toolsets "open" entry with a new title)
   expect(join.text).toEndWith(
-    'Your move.\n[go/game:g] tools now — act {server:"go", instance:"g", tool, args}:\n' +
+    'Your move.\n[go/game:g] Go 9×9 — you are Black, vs bo tools now — act {server:"go", instance:"g", tool, args}:\n' +
       '  play(point: string) — Place a stone: column letter (A–T, no I) then row number counted from the bottom, e.g. "D4".\n' +
       '  pass() — Pass.\n  resign() — Resign the game.\nnow unavailable: cancel',
   )
@@ -209,6 +209,29 @@ go('ws, agent vs agent: a move arrives as a push and the visibility change is re
   expect(ada.delivered[1]!.meta.tags).toContain('surface:done')
   expect(ada.delivered[1]!.text).toContain('rematch() — Play again with the same settings and colors swapped.')
 }, 30_000)
+
+go('ws, one principal on two connections (§5.6): an open on one reaches the other as an ordinary hint change, not a suggestion', async () => {
+  const first = await connect({ url: `ws://127.0.0.1:${wsPort}/mcpl?name=twin` })
+  const second = await connect({ url: `ws://127.0.0.1:${wsPort}/mcpl?name=twin` })
+  await callMetaTool('open', { server: 'go', instance: 'shared', options: { level: 'easy' } }, first.map)
+  await waitFor(() => second.delivered.length === 1, 5000, 'the other connection to hear of the open')
+  const heard = second.delivered[0]!
+  expect(heard.meta.tags).toBe('surface:tools') // held by default, not a suggestion (no surface:invite)
+  expect(heard.text).toBe(
+    '[go/game:shared] Go 9×9 — you are Black, vs bot (easy) tools now — act {server:"go", instance:"shared", tool, args}:\n' +
+      '  play(point: string) — Place a stone: column letter (A–T, no I) then row number counted from the bottom, e.g. "D4".\n' +
+      '  pass() — Pass.\n  resign() — Resign the game.\n  undo() — Take back your last move and the bot\'s reply.\n' +
+      'close {server:"go", toolset:"game", instance:"shared"} closes it.',
+  )
+  expect(second.h.presence.isOpen('game', 'shared')).toBe(true)
+  // the second connection can play it; the first hears nothing it needs (the bot replied inside the call)
+  expect(textOf(await callMetaTool('act', { server: 'go', tool: 'play', args: { point: 'E5' } }, second.map))).toStartWith('You played E5.')
+  // a close on the second reaches the first as a state change
+  await callMetaTool('close', { server: 'go', instance: 'shared' }, second.map)
+  await waitFor(() => first.delivered.length >= 1, 5000, 'the first connection to hear of the close')
+  expect(first.delivered.at(-1)!.text).toContain('[go/game:shared] closed.')
+  expect(first.h.presence.isOpen('game', 'shared')).toBe(false)
+}, 20_000)
 
 // ── the whole adapter ──
 
@@ -263,7 +286,7 @@ go('adapter: the tool list is constant (no list_changed) through a game; a push 
   await waitFor(() => channel().length >= 1, 5000, 'the join notification')
   expect(channel()[0]!.meta).toMatchObject({ server: 'go', kind: 'push-event', toolset: 'game', instance: 'm' })
   expect(channel()[0]!.content).toContain('bo2 joined as White. Your move.')
-  expect(channel()[0]!.content).toContain('Your move.\n[go/game:m] tools now — act {server:"go", instance:"m", tool, args}:\n  play(point: string) — Place a stone')
+  expect(channel()[0]!.content).toContain('Your move.\n[go/game:m] Go 9×9 — you are Black, vs bo2 tools now — act {server:"go", instance:"m", tool, args}:\n  play(point: string) — Place a stone')
 
   const mine = textOf(await tool('act', { server: 'go', tool: 'play', args: { point: 'E5' } }))
   expect(mine).toContain('now unavailable: play, pass')

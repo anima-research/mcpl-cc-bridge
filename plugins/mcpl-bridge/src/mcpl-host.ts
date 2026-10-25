@@ -692,9 +692,11 @@ export class McplServerHandle {
 
   private async refreshTools(conn: McplConnection): Promise<void> {
     let tools: McplTool[] = []
+    let listRev: unknown
     try {
-      const r = (await conn.sendRequest('tools/list', {})) as { tools?: McplTool[] }
+      const r = (await conn.sendRequest('tools/list', {})) as { tools?: McplTool[]; _meta?: Record<string, unknown> }
       tools = r?.tools ?? []
+      listRev = r?._meta?.['mcpl/rev']
     } catch (e) {
       this.log(`tools/list failed: ${e instanceof Error ? e.message : e}`)
     }
@@ -703,6 +705,8 @@ export class McplServerHandle {
     if (conn !== this.conn) return
     this.tools = tools
     this.presence.setTools(tools)
+    // RFC-014 §4.1: the list reflects hint changes through this rev; only later ones apply on top.
+    this.presence.noteListRev(listRev)
     this.listedChanged()
   }
 
@@ -749,8 +753,10 @@ export class McplServerHandle {
     const before = this.presence.view()
     const r = this.presence.apply(h)
     if (r.stale) {
-      this.log(`hint change rev ${String((h as { rev?: unknown }).rev)} (${source}) is stale — already at rev ${this.presence.rev}; ignored`)
+      this.log(`hint change rev ${String((h as { rev?: unknown }).rev)} (${source}) arrived after rev ${this.presence.rev} — ignored; re-reading toolsets/list`)
       this.scheduleResync()
+    } else if (r.duplicate) {
+      // Applied before, or covered by a list (a refused push's changes come back as tools/hints, same rev): each rev applies once.
     } else if (!r.applied) this.log(`malformed hint change (${source}) ignored`)
     const cs = this.presence.diff(before, this.presence.view())
     cs.suggest.push(...r.suggest)
@@ -821,12 +827,18 @@ export class McplServerHandle {
       return
     }
     if (conn !== this.conn) return
-    const { lost, suggest } = this.presence.adopt(r)
+    this.deliverChange(this.adoption(before, r))
+  }
+
+  /** Adopt a toolsets/list result (the truth, RFC-014 §5.2–5.3) and say what changed: tools, what ended while away, what is closed now. */
+  private adoption(before: ReturnType<ToolPresence['view']>, result: unknown): ChangeSet {
+    const { lost, ended, suggest } = this.presence.adopt(result)
     const cs = this.presence.diff(before, this.presence.view())
     cs.suggest.push(...suggest)
+    // A lost toolset gets its note, not also a "closed" line.
     cs.changes = cs.changes.filter(c => !lost.some(o => keyOf(o.toolset, o.instance) === c.key))
-    for (const o of lost) cs.notes.push(`[${this.presence.label(keyOf(o.toolset, o.instance))}] is no longer open on ${this.id}.`)
-    this.deliverChange(cs)
+    cs.notes.push(...this.presence.adoptionNotes(lost, ended))
+    return cs
   }
 
   /**
@@ -848,16 +860,17 @@ export class McplServerHandle {
       return []
     }
     if (conn !== this.conn) return []
-    return this.presence.adopt(r).lost.map(o => `[${this.presence.label(keyOf(o.toolset, o.instance))}] is no longer open on ${this.id}.`)
+    const { lost, ended } = this.presence.adopt(r)
+    return this.presence.adoptionNotes(lost, ended)
   }
 
   /**
-   * After a (re)connect: adopt what the server holds open (a game kept across
-   * the reconnect), re-open stateless toolsets it lost, say which instances
-   * are gone, and on the first connection open declared default-open toolsets.
+   * After a (re)connect: toolsets/list is the truth (RFC-014 §5.2–5.3). What
+   * it reports is adopted (a game kept across the reconnect); anything the
+   * host believed open and it does not report is closed — and never re-opened
+   * here, since opening can start a new game. `ended` toolsets are told.
    */
   private async reattach(conn: McplConnection, myEpoch: number): Promise<void> {
-    const first = !this.presence.reconciledOnce
     const before = this.presence.view()
     let r: unknown
     try {
@@ -867,31 +880,7 @@ export class McplServerHandle {
       return
     }
     if (myEpoch !== this.epoch) return
-    this.presence.reconciledOnce = true
-    const { lost, suggest } = this.presence.adopt(r)
-    const cs = this.presence.diff(before, this.presence.view())
-    cs.suggest.push(...suggest)
-    // A lost instance gets its own note below, not also a "closed" line.
-    cs.changes = cs.changes.filter(c => !lost.some(o => keyOf(o.toolset, o.instance) === c.key))
-    const reopen: string[] = []
-    for (const o of lost) {
-      if (this.presence.declared[o.toolset]?.instances) {
-        // An instance has state of its own; opening a new one under the old name would pass a new game off as the old.
-        cs.notes.push(`[${this.presence.label(keyOf(o.toolset, o.instance))}] is gone — ${this.id} did not keep it across the reconnect. ${this.presence.openHint(o.toolset)} starts a new one.`)
-      } else reopen.push(o.toolset)
-    }
-    if (first) {
-      for (const [name, d] of Object.entries(this.presence.declared)) if (d.default === 'open' && !d.instances && !this.presence.isOpen(name)) reopen.push(name)
-    }
-    for (const ts of reopen) {
-      try {
-        const o = await this.openToolset(ts, undefined, undefined)
-        cs.changes.push(...o.change.changes)
-      } catch (e) {
-        cs.notes.push(`[${this.id}/${ts}] could not be re-opened: ${e instanceof Error ? e.message : e}`)
-      }
-    }
-    this.deliverChange(cs)
+    this.deliverChange(this.adoption(before, r))
   }
 
   /** toolsets/open (RFC-014 §5.2). The server's refusal propagates (RpcError). */
@@ -997,9 +986,6 @@ export class McplServerHandle {
       case 'push/event': {
         const p = params as PushEventParams & { hints?: unknown; toolset?: unknown; instance?: unknown }
         const tags = expandTags(p.tags)
-        // RFC-014 §6.1 carrier 2: the change the event explains. Applied
-        // whatever admission decides — it is the server's state either way.
-        const pushChange = p.hints !== undefined ? this.applyHints(p.hints, 'push') : emptyChange()
         // origin is opaque to the spec, but chat-shaped producers put the
         // routing facts there (which channel, which message, who). Pass the
         // common ones through as meta so a wake is addressable without a
@@ -1020,7 +1006,10 @@ export class McplServerHandle {
           respond({ accepted: false, reason: `not admitted on this host: ${refused}` })
           return
         }
-        const changeText = this.presence.render(pushChange)
+        // RFC-014 §6.1 carrier 2: the change the event explains — applied only
+        // for a push this host accepts (a refused push's changes come back as
+        // tools/hints with the same rev).
+        const changeText = p.hints !== undefined ? this.presence.render(this.applyHints(p.hints, 'push')) : ''
         const body = renderContent(p.payload?.content)
         this.cb.deliver({
           server: this.id,

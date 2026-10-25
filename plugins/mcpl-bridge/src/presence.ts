@@ -12,9 +12,10 @@
  *    toolsets/list, hint `toolsets` entries) and which undeclared groups the
  *    host has opened itself (RFC §5.4 — the server is never told);
  *  - the server's visibility statements per instance, and definition
- *    overrides, from hint changes applied strictly in `rev` order (stale ones
- *    dropped) — ONE apply path for open/close results, call results, push
- *    `hints` and `tools/hints`;
+ *    overrides, from hint changes applied strictly in `rev` order, each rev
+ *    at most once — ONE apply path for open/close results, call results,
+ *    accepted pushes' `hints` and `tools/hints`; `tools/list` (`mcpl/rev`)
+ *    and `toolsets/list` are full statements that later changes build on;
  *  - which definitions the model has been shown, so a tool's first sentence
  *    is said once.
  *
@@ -26,6 +27,8 @@ import { objectSignature, renderToolLines, signature, toolDigest, type ToolDef }
 export type ToolsetDecl = { title?: string; summary?: string; default?: 'open' | 'closed'; instances?: boolean; options?: unknown }
 export type Suggestion = { toolset: string; instance?: string; action: 'open' | 'close'; reason: string }
 export type OpenRecord = { toolset: string; instance?: string; title?: string }
+/** RFC-014 §5.3: a toolset that closed while no connection was told. */
+export type Ended = { toolset: string; instance?: string; reason: string }
 export type Presence = 'static' | 'dynamic'
 
 /** Toolset-less dynamic tools live under this key: always "open", visible per the server. */
@@ -63,7 +66,16 @@ const isObj = (v: unknown): v is Record<string, unknown> => typeof v === 'object
 const arr = (v: unknown): unknown[] => (Array.isArray(v) ? v : [])
 const str = (v: unknown): string | undefined => (typeof v === 'string' && v ? v : undefined)
 
-export type ApplyOutcome = { applied: boolean; stale: boolean; suggest: Suggestion[] }
+/**
+ * applied: a new rev, applied. duplicate: a rev already applied or already
+ * covered by a full statement (tools/list, toolsets/list) — ignored, nothing
+ * lost (a refused push's changes come back as tools/hints with the same rev,
+ * RFC-014 §6.1). stale: an earlier rev never applied, arriving after a later
+ * one — ignored, and what it said may be missing.
+ */
+export type ApplyOutcome = { applied: boolean; duplicate: boolean; stale: boolean; suggest: Suggestion[] }
+
+const APPLIED_REVS_KEPT = 1024
 
 export class ToolPresence {
   /** Hints are in effect on the current connection: the host advertised toolHints and the server sends hints or declares toolsets. */
@@ -72,6 +84,9 @@ export class ToolPresence {
   surface: { title?: string; summary?: string } | null = null
   /** Last applied rev — per connection (RFC §6.1), reset at each connect. */
   rev = 0
+  /** Revs applied as changes on this connection (bounded), and the rev a full statement covers. */
+  private appliedRevs = new Set<number>()
+  private coveredThrough = 0
   private tools = new Map<string, ToolDef>()
   private open = new Map<string, OpenRecord>()
   private groups = new Set<string>()
@@ -81,8 +96,6 @@ export class ToolPresence {
   private moved = new Map<string, Presence>()
   /** Digests of definitions the model has been shown with their first sentence. */
   readonly shown = new Set<string>()
-  /** Set once the first connection has been reconciled (default-open toolsets are opened then, not on every reconnect). */
-  reconciledOnce = false
 
   constructor(readonly server: string) {}
 
@@ -91,6 +104,8 @@ export class ToolPresence {
   /** A new connection's handshake: its manifest, and whether the host advertised toolHints. */
   beginConnection(mcpl: Record<string, unknown> | null | undefined, hostHints: boolean): void {
     this.rev = 0
+    this.appliedRevs.clear()
+    this.coveredThrough = 0
     this.active = hostHints && !!mcpl && (mcpl.toolHints === true || isObj(mcpl.toolsets))
     this.setManifest(this.active ? mcpl : null)
   }
@@ -250,10 +265,22 @@ export class ToolPresence {
    * order: a rev at or below the last applied is stale and ignored.
    */
   apply(h: unknown): ApplyOutcome {
-    if (!isObj(h) || typeof h.rev !== 'number' || !Number.isFinite(h.rev)) return { applied: false, stale: false, suggest: [] }
-    if (h.rev <= this.rev) return { applied: false, stale: true, suggest: [] }
+    if (!isObj(h) || typeof h.rev !== 'number' || !Number.isFinite(h.rev)) return { applied: false, duplicate: false, stale: false, suggest: [] }
+    if (h.rev <= this.rev) {
+      const duplicate = this.appliedRevs.has(h.rev) || h.rev <= this.coveredThrough
+      return { applied: false, duplicate, stale: !duplicate, suggest: [] }
+    }
     this.rev = h.rev
-    return { applied: true, stale: false, suggest: this.applyBody(h) }
+    this.appliedRevs.add(h.rev)
+    if (this.appliedRevs.size > APPLIED_REVS_KEPT) for (const r of this.appliedRevs) if (r < this.rev - APPLIED_REVS_KEPT) this.appliedRevs.delete(r)
+    return { applied: true, duplicate: false, stale: false, suggest: this.applyBody(h) }
+  }
+
+  /** tools/list's `_meta["mcpl/rev"]` (RFC-014 §4.1): the list reflects changes through this rev; only later ones apply on top. */
+  noteListRev(rev: unknown): void {
+    if (typeof rev !== 'number' || !Number.isFinite(rev)) return
+    this.coveredThrough = Math.max(this.coveredThrough, rev)
+    this.rev = Math.max(this.rev, rev)
   }
 
   private applyBody(h: Record<string, unknown>): Suggestion[] {
@@ -261,6 +288,8 @@ export class ToolPresence {
       if (!isObj(e) || !str(e.toolset) || !this.isDeclared(e.toolset as string)) continue // undeclared toolsets are host-local
       const ts = e.toolset as string
       const key = keyOf(ts, this.declared[ts]!.instances ? str(e.instance) : undefined)
+      // "open" opens, confirms, or — with a new title for one already open — retitles (RFC-014 §6.1);
+      // it may come from another connection of the same principal (§5.6).
       if (e.state === 'open') this.open.set(key, { toolset: ts, ...(this.declared[ts]!.instances && str(e.instance) ? { instance: str(e.instance) } : {}), title: str(e.title) ?? this.open.get(key)?.title })
       else if (e.state === 'closed') this.dropKey(key)
     }
@@ -324,11 +353,13 @@ export class ToolPresence {
   }
 
   /**
-   * toolsets/list (RFC §5.3): what the server holds open, with the full hint
-   * state of their tools. Adopted as the truth for declared toolsets; returns
-   * what the host had open that the server no longer reports.
+   * toolsets/list (RFC §5.3): what the principal has open, with the full hint
+   * state of their tools — the truth for declared toolsets. Anything the host
+   * believed open and the server does not report is closed (never re-opened
+   * here: opening can start a new game). Returns what was lost, and what the
+   * server says ended while no connection was told.
    */
-  adopt(result: unknown): { lost: OpenRecord[]; suggest: Suggestion[] } {
+  adopt(result: unknown): { lost: OpenRecord[]; ended: Ended[]; suggest: Suggestion[] } {
     const had = [...this.open.values()]
     for (const k of [...this.open.keys()]) this.dropKey(k)
     for (const k of [...this.visible.keys()]) if (this.isDeclared(splitKey(k).toolset) && this.declared[splitKey(k).toolset]!.instances) this.dropKey(k)
@@ -340,11 +371,28 @@ export class ToolPresence {
     let suggest: Suggestion[] = []
     const h = isObj(r._meta) ? r._meta['mcpl/hints'] : undefined
     if (isObj(h)) {
-      // A full statement, not a delta: applied whatever its rev, and the rev advances.
+      // A full statement, not a delta: applied whatever its rev, and later changes build on it.
       suggest = this.applyBody(h)
-      if (typeof h.rev === 'number' && Number.isFinite(h.rev)) this.rev = Math.max(this.rev, h.rev)
+      this.noteListRev(h.rev)
     }
-    return { lost: had.filter(o => !this.open.has(keyOf(o.toolset, o.instance))), suggest }
+    const ended: Ended[] = []
+    for (const e of arr(r.ended)) {
+      if (!isObj(e) || !str(e.toolset)) continue
+      ended.push({ toolset: e.toolset as string, ...(str(e.instance) ? { instance: str(e.instance) } : {}), reason: str(e.reason) ?? '' })
+    }
+    return { lost: had.filter(o => !this.open.has(keyOf(o.toolset, o.instance))), ended, suggest }
+  }
+
+  /** What the agent should hear about an adoption: what ended while it was away, and what is closed now. */
+  adoptionNotes(lost: OpenRecord[], ended: Ended[]): string[] {
+    const notes: string[] = []
+    const endedKeys = new Set(ended.map(e => keyOf(e.toolset, e.instance)))
+    for (const e of ended) notes.push(`[${this.label(keyOf(e.toolset, e.instance))}] ended while you were away${e.reason ? `: ${e.reason}` : ''}.`)
+    for (const o of lost) {
+      if (endedKeys.has(keyOf(o.toolset, o.instance))) continue
+      notes.push(`[${this.label(keyOf(o.toolset, o.instance))}] is closed: ${this.server} no longer has it open. ${this.openHint(o.toolset)} starts a new one.`)
+    }
+    return notes
   }
 
   // ── host-made opens of undeclared groups (RFC §5.4) ──
@@ -467,7 +515,7 @@ export class ToolPresence {
       openable.push(
         `  ${name}${d.title ? ` — ${d.title}` : ''}${d.summary ? `: ${d.summary}` : ''}` +
           (d.instances ? ' (several can be open at once; name each with instance)' : '') +
-          (d.options ? `; options ${objectSignature(d.options)}` : ''),
+          (d.options ? ` · options ${objectSignature(d.options)}` : ''),
       )
     }
     for (const g of this.undeclaredGroups) {

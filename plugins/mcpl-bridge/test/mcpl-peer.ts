@@ -18,6 +18,10 @@ export type PeerOptions = {
   onToolCall?(name: string, args: unknown): unknown
   /** Decide an upgrade (return an HTTP status to refuse it). */
   verifyUpgrade?(url: URL): true | number
+  /** tools/list result `_meta["mcpl/rev"]` (RFC-014). */
+  listRev?: number
+  /** Answers for other host → server methods (toolsets/list, …). */
+  handlers?: Record<string, (params: Record<string, unknown>) => unknown>
 }
 
 export class McplPeer {
@@ -26,6 +30,8 @@ export class McplPeer {
   readonly inits: Json[] = []
   /** featureSets/update params, newest last. */
   readonly policies: Json[] = []
+  /** Every host → server request method, in order. */
+  readonly received: string[] = []
   private sockets: WebSocket[] = []
   private seq = 1000
   private pending = new Map<number, (a: RpcAnswer) => void>()
@@ -95,6 +101,12 @@ export class McplPeer {
     }
     const id = msg.id
     const params = (msg.params ?? {}) as Json
+    if (id != null) this.received.push(String(msg.method))
+    const custom = this.opts.handlers?.[String(msg.method)]
+    if (custom) {
+      this.send(ws, { id, result: custom(params) })
+      return
+    }
     switch (msg.method) {
       case 'initialize':
         this.inits.push(params)
@@ -116,7 +128,7 @@ export class McplPeer {
         this.send(ws, { id, result: this.opts.mcpl ?? {} })
         return
       case 'tools/list':
-        this.send(ws, { id, result: { tools: this.opts.tools ?? [] } })
+        this.send(ws, { id, result: { tools: this.opts.tools ?? [], ...(this.opts.listRev !== undefined ? { _meta: { 'mcpl/rev': this.opts.listRev } } : {}) } })
         return
       case 'tools/call': {
         const r = this.opts.onToolCall?.(String(params.name), params.arguments) ?? { content: [{ type: 'text', text: 'ok' }] }

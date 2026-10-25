@@ -272,10 +272,20 @@ standalone `tools/hints` becomes a short notification tagged `surface:tools`.
 A `suggest` is shown, never acted on.
 
 Hint changes from all four carriers go through one apply path, in `rev`
-order; a stale one is dropped and the bridge re-reads the state with
-`toolsets/list`. After every (re)connect it sends `toolsets/list` and adopts
-what the server holds (a game kept across the reconnect); an instance the
-server lost is reported, not silently re-opened under its old name.
+order, each `rev` at most once. A push's `hints` apply only if the bridge
+accepts the push (a refused push's changes come back as `tools/hints` with the
+same rev). `tools/list` carries `mcpl/rev`; later changes apply on top of it.
+A change that arrives after a later one (out of order, never applied) is
+dropped and the bridge re-reads the state with `toolsets/list`.
+
+After every (re)connect the bridge sends `toolsets/list` and takes it as the
+truth: what it reports is adopted (a game kept across the reconnect, or one
+opened by another connection of the same principal); anything else the bridge
+believed open is closed — and never re-opened on its own, since opening can
+start a new game. Toolsets the server reports as `ended` while no connection
+was told are told to the agent ("[go/game:first] ended while you were away:
+…"). An open, close or retitle made on another connection arrives as an
+ordinary hint change and is announced like any other.
 
 **Reminders.** After compaction (and `/clear`) Claude Code runs `SessionStart`
 hooks with source `compact`; the plugin's hook returns a `<mcpl-tools>`
