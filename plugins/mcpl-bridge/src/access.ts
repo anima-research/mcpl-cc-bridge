@@ -12,7 +12,10 @@
 /** Lifetime asked of the identity provider for every credential this host mints (RFC §5: SHOULD expire within 15 minutes). */
 export const ACCESS_TTL = '15m'
 /** A cached credential is reused until this long before it expires (RFC §5: the reference implementation renews 60 s early). */
-export const RENEW_EARLY_MS = 60_000
+/** RFC-015 r5 §5: never answer from the cache with less than two minutes left. */
+export const RENEW_EARLY_MS = 120_000
+/** RFC-015 r5 §3.1: the requester's wait when it names none. */
+export const DEFAULT_TIMEOUT_MS = 30_000
 
 export type MintedCredential = {
   credential: string
@@ -24,8 +27,14 @@ export type MintedCredential = {
 
 /** Something that can mint a credential for an audience — the bridge's Identity. */
 export interface AccessIssuer {
-  mint(audience: string, opts: { ttl: string }): Promise<MintedCredential>
+  /** `timeoutMs`: how long the provider may take before the mint fails `unavailable`. */
+  mint(audience: string, opts: { ttl: string; timeoutMs?: number }): Promise<MintedCredential>
+  /** Whom this issuer mints for — part of the cache key (RFC-015 r5 §5). */
+  principal?(): string | undefined
 }
+
+/** The cache key within one configured server (RFC-015 r5 §5): principal, audience, scheme. */
+export const cacheKey = (principal: string, audience: string, scheme: string): string => `${principal}\u0000${audience}\u0000${scheme}`
 
 /**
  * RFC-015 §3.3: what kind of refusal — servers branch on this, never on
@@ -77,15 +86,10 @@ export function auditEndpoint(endpoint: unknown): string | undefined {
   return (u.host ? `${u.protocol}//${u.host}${u.pathname}` : `${u.protocol}${u.pathname}`).slice(0, 512)
 }
 
-export type AccessTokenParams = { audience: string; endpoint?: string; purpose?: string; fresh?: boolean; schemes?: string[] }
+export type AccessTokenParams = { audience: string; endpoint?: string; purpose?: string; fresh?: boolean; schemes?: string[]; timeoutMs?: number }
 
 export type ParamsCheck = { ok: true; params: AccessTokenParams } | { ok: false; field: string; reason: string }
 
-/**
- * `_meta` is MCP's reserved request member (every request's params may carry
- * it), not an RFC-015 member — accepted when it is an object, and ignored.
- */
-const MEMBERS = new Set(['audience', 'endpoint', 'purpose', 'fresh', 'schemes', '_meta'])
 const ENDPOINT_MAX = 2048
 /** C0 and C1 controls, and DEL (r4 §3.1): a purpose reaches the audit as data. */
 const CONTROL = /[\u0000-\u001f\u007f-\u009f]/
@@ -93,16 +97,20 @@ const CONTROL = /[\u0000-\u001f\u007f-\u009f]/
 /** Length in code points, so a limit means characters rather than UTF-16 halves. */
 const chars = (s: string) => [...s].length
 
-/** RFC-015 §3.1, strictly: an object; unknown members rejected; each member its type and bound. */
+/**
+ * RFC-015 §3.1: an object; each known member its type and bound. Unknown
+ * members are ignored (r5), so later revisions can add some. `_meta` is MCP's
+ * reserved member: accepted when it is an object, and ignored.
+ */
 export function validateAccessParams(raw: unknown): ParamsCheck {
   const bad = (field: string, reason: string): ParamsCheck => ({ ok: false, field: field.slice(0, 64), reason })
   if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) return bad('params', 'must be an object')
   const p = raw as Record<string, unknown>
-  for (const k of Object.keys(p)) if (!MEMBERS.has(k)) return bad(k, 'unknown member')
-  const { audience, endpoint, purpose, fresh, schemes, _meta } = p
+  const { audience, endpoint, purpose, fresh, schemes, timeoutMs, _meta } = p
   if (audience === undefined) return bad('audience', 'required')
   if (typeof audience !== 'string') return bad('audience', 'must be a string')
   if (chars(audience) < 1 || chars(audience) > 128) return bad('audience', 'must be 1-128 characters')
+  if (CONTROL.test(audience)) return bad('audience', 'must not contain control characters')
   if (endpoint !== undefined) {
     if (typeof endpoint !== 'string') return bad('endpoint', 'must be a string (URI)')
     if (chars(endpoint) > ENDPOINT_MAX) return bad('endpoint', `must be at most ${ENDPOINT_MAX} characters`)
@@ -125,6 +133,7 @@ export function validateAccessParams(raw: unknown): ParamsCheck {
     if (!Array.isArray(schemes) || schemes.length < 1 || schemes.length > 8) return bad('schemes', 'must be an array of 1-8 scheme names')
     if (!schemes.every(x => typeof x === 'string' && x.length > 0 && chars(x) <= 64)) return bad('schemes', 'must hold non-empty strings')
   }
+  if (timeoutMs !== undefined && !(Number.isInteger(timeoutMs) && (timeoutMs as number) >= 1000 && (timeoutMs as number) <= 120_000)) return bad('timeoutMs', 'must be an integer from 1000 to 120000')
   if (_meta !== undefined && (typeof _meta !== 'object' || _meta === null || Array.isArray(_meta))) return bad('_meta', 'must be an object')
   return {
     ok: true,
@@ -134,15 +143,16 @@ export function validateAccessParams(raw: unknown): ParamsCheck {
       ...(purpose !== undefined ? { purpose } : {}),
       ...(fresh !== undefined ? { fresh } : {}),
       ...(schemes !== undefined ? { schemes: schemes as string[] } : {}),
+      ...(timeoutMs !== undefined ? { timeoutMs: timeoutMs as number } : {}),
     },
   }
 }
 
 /**
- * Credentials per audience for one server, reused until RENEW_EARLY_MS
- * before expiry. Concurrent requests for the same audience share one mint.
- * `fresh` (the endpoint refused the last one) always mints. A failed mint
- * drops whatever was cached for the audience.
+ * Credentials for one configured server, keyed by cacheKey (principal,
+ * audience, scheme), reused until RENEW_EARLY_MS before expiry. Concurrent
+ * requests for one key share one mint. `fresh` (the endpoint refused the last
+ * one) always mints. A failed mint drops whatever was cached for the key.
  */
 export class CredentialCache {
   private entries = new Map<string, MintedCredential>()
@@ -173,6 +183,17 @@ export class CredentialCache {
     } finally {
       if (this.inflight.get(audience) === p) this.inflight.delete(audience)
     }
+  }
+
+  /** A mint that outlived the requester's time bound: later requests must not wait on it (they mint anew). */
+  abandon(key: string): void {
+    this.inflight.delete(key)
+  }
+
+  /** A cached credential with more than RENEW_EARLY_MS left, without minting. */
+  peek(key: string): MintedCredential | undefined {
+    const hit = this.entries.get(key)
+    return hit && hit.expiresAt - this.now() > RENEW_EARLY_MS ? hit : undefined
   }
 
   clear(): void {

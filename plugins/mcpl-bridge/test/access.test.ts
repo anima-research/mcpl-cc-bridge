@@ -42,8 +42,8 @@ test('access/token params: the four members, typed and bounded; anything else is
     const r = validateAccessParams(p)
     return r.ok ? null : r.field
   }
-  expect(bad({ audience: 'games', scope: 'x' })).toBe('scope') // unknown member
-  expect(bad({ audience: 'games', Audience: 'x' })).toBe('Audience')
+  expect(bad({ audience: 'games', scope: 'x' })).toBeNull() // r5: an unknown member is ignored
+  expect(bad({ audience: 'games', Audience: 'x' })).toBeNull()
   expect(bad({})).toBe('audience')
   expect(bad({ audience: '' })).toBe('audience')
   expect(bad({ audience: 'a'.repeat(129) })).toBe('audience')
@@ -157,13 +157,18 @@ class FakeIssuer implements AccessIssuer {
   refuse: { kind: RefusalKind; reason: string } | null = null
   lifetimeMs = 15 * 60_000
   hang = false
-  constructor(readonly principal = 'agent:test@guest') {}
-  async mint(audience: string, opts: { ttl: string }): Promise<MintedCredential> {
+  timeouts: Array<number | undefined> = []
+  constructor(readonly who = 'agent:test@guest') {}
+  principal(): string {
+    return this.who
+  }
+  async mint(audience: string, opts: { ttl: string; timeoutMs?: number }): Promise<MintedCredential> {
     this.mints.push({ audience, ttl: opts.ttl })
+    this.timeouts.push(opts.timeoutMs)
     if (this.hang) await new Promise(() => {})
     if (this.refuse) throw new AccessRefused(audience, this.refuse.kind, this.refuse.reason)
     const payload = Buffer.from(JSON.stringify({ aud: audience, n: this.mints.length })).toString('base64url')
-    return { credential: `aid1.${payload}.${Buffer.from(this.principal).toString('base64url')}${'c2lnbmF0dXJl'.repeat(3)}${this.mints.length}`, expiresAt: Date.now() + this.lifetimeMs, principal: this.principal }
+    return { credential: `aid1.${payload}.${Buffer.from(this.who).toString('base64url')}${'c2lnbmF0dXJl'.repeat(3)}${this.mints.length}`, expiresAt: Date.now() + this.lifetimeMs, principal: this.who }
   }
 }
 
@@ -174,7 +179,7 @@ afterEach(async () => {
 
 const SERVER_CAPS = { version: '0.5', pushEvents: true, access: { token: true }, featureSets: { apps: { description: 'apps', uses: ['access.token'] } } }
 
-async function setup(opts: { grant?: string[]; issuer?: AccessIssuer | null; transport?: Partial<{ access: string; token: string }> } = {}) {
+async function setup(opts: { grant?: string[]; issuer?: AccessIssuer | null; issuerFn?: () => AccessIssuer | null; transport?: Partial<{ access: string; token: string }> } = {}) {
   const peer = await McplPeer.start({ mcpl: SERVER_CAPS })
   const audits: AccessAuditRecord[] = []
   const logs: string[] = []
@@ -184,7 +189,7 @@ async function setup(opts: { grant?: string[]; issuer?: AccessIssuer | null; tra
     deliver() {},
     toolsChanged() {},
     log: l => logs.push(l),
-    issuer: () => issuer,
+    issuer: opts.issuerFn ?? (() => issuer),
     audit: r => audits.push(r),
   })
   cleanup.push(() => peer.close(), () => h.close())
@@ -232,7 +237,7 @@ test('the audit keeps an endpoint\'s scheme, host and path only — never userin
   await peer.policyCount(1)
   const leaky = 'wss://user:pw@games.example:8443/mcpl?token=abc123secret#frag'
   await peer.request('access/token', { audience: 'games', endpoint: leaky })
-  await peer.request('access/token', { audience: 'games', endpoint: leaky, bogus: 1 }) // invalid: audited from raw params
+  await peer.request('access/token', { audience: 'games', endpoint: leaky, fresh: 'no' }) // invalid: audited from raw params
   expect(audits.map(a => a.endpoint)).toEqual(['wss://games.example:8443/mcpl', 'wss://games.example:8443/mcpl'])
   for (const text of [JSON.stringify(audits), logs.join('\n')]) {
     expect(text).not.toContain('abc123secret')
@@ -278,9 +283,9 @@ test('a wildcard alone grants nothing, and the operator is told', async () => {
 test('malformed params from a granted server: -32602 with { field, reason }', async () => {
   const { peer, audits, issuer } = await setup()
   await peer.policyCount(1)
-  const r = await peer.request('access/token', { audience: 'games', scopes: ['all'] })
+  const r = await peer.request('access/token', { audience: 'games', fresh: 'yes' })
   expect(r.error?.code).toBe(-32602)
-  expect(r.error?.data).toEqual({ field: 'scopes', reason: 'unknown member' })
+  expect(r.error?.data).toEqual({ field: 'fresh', reason: 'must be a boolean' })
   const r2 = await peer.request('access/token', { audience: 'games', fresh: 1 })
   expect(r2.error?.data).toEqual({ field: 'fresh', reason: 'must be a boolean' })
   expect(issuer!.mints).toHaveLength(0)
@@ -443,4 +448,87 @@ test('time bound (r4 §3.4): a provider that does not answer gets the server -32
   } finally {
     ACCESS_TIME_BOUND.ms = was
   }
+})
+
+// ── revision 5 vectors (RFC-015 §12) ──
+
+test('vector 5: an unknown params member is ignored; a _meta object alongside valid params is accepted', async () => {
+  const { peer } = await setup()
+  await peer.policyCount(1)
+  const r = await peer.request('access/token', { audience: 'games', proofOfPossession: true, _meta: { trace: 'x' } })
+  expect(r.result).toMatchObject({ scheme: 'bearer' })
+})
+
+test('vector 13: the audit drops query and fragment and keeps a non-default port', () => {
+  expect(auditEndpoint('wss://games.example:8443/mcpl?ticket=1#frag')).toBe('wss://games.example:8443/mcpl')
+})
+
+test('vector 14 (r5): an audience with a newline, and timeoutMs out of bounds, are -32602', () => {
+  const field = (p: unknown) => {
+    const r = validateAccessParams(p)
+    return r.ok ? null : r.field
+  }
+  expect(field({ audience: 'games\n' })).toBe('audience')
+  expect(field({ audience: 'ga\u0000mes' })).toBe('audience')
+  expect(field({ audience: 'games', timeoutMs: 500 })).toBe('timeoutMs')
+  expect(field({ audience: 'games', timeoutMs: 120_001 })).toBe('timeoutMs')
+  expect(field({ audience: 'games', timeoutMs: 1500.5 })).toBe('timeoutMs')
+  expect(field({ audience: 'games', timeoutMs: '30000' })).toBe('timeoutMs')
+  expect(field({ audience: 'games', timeoutMs: 1000 })).toBeNull()
+  expect(field({ audience: 'games', timeoutMs: 120_000 })).toBeNull()
+})
+
+test('vector 19: a provider that does not answer gets -32040 unavailable within timeoutMs − 2000 ms; the provider call is bounded by it; too little time answers from cache or refuses at once', async () => {
+  const issuer = new FakeIssuer()
+  const { peer } = await setup({ issuer })
+  await peer.policyCount(1)
+  issuer.hang = true
+  const t0 = Date.now()
+  const r = await peer.request('access/token', { audience: 'games', timeoutMs: 3000 })
+  const took = Date.now() - t0
+  expect(r.error).toMatchObject({ code: -32040, data: { audience: 'games', kind: 'unavailable' } })
+  expect(took).toBeGreaterThanOrEqual(900)
+  expect(took).toBeLessThan(2500) // within timeoutMs − 2000 (+ slack), well before the requester gives up
+  expect(issuer.timeouts.at(-1)).toBe(1000) // the provider call itself got that budget
+  // timeoutMs 1500: nothing cached → refused at once
+  const quick = await peer.request('access/token', { audience: 'games', timeoutMs: 1500 })
+  expect(quick.error).toMatchObject({ code: -32040, data: { kind: 'unavailable' } })
+  // with a credential cached, the cache answers even then
+  issuer.hang = false
+  const minted = (await peer.request('access/token', { audience: 'games' })).result as { credential: string }
+  const cached = (await peer.request('access/token', { audience: 'games', timeoutMs: 1500 })).result as { credential: string }
+  expect(cached.credential).toBe(minted.credential)
+})
+
+test('vector 23: a cached answer always has at least two minutes left', async () => {
+  let now = 0
+  const cache = new CredentialCache(() => now)
+  let n = 0
+  const mint = async (): Promise<MintedCredential> => ({ credential: `c${++n}`, expiresAt: now + 150_000 }) // 2.5 minutes
+  expect((await cache.get('k', false, mint)).cached).toBe(false)
+  now = 29_000 // 2:01 left → still served
+  expect((await cache.get('k', false, mint)).cached).toBe(true)
+  now = 31_000 // 1:59 left → never from the cache
+  expect(cache.peek('k')).toBeUndefined()
+  const again = await cache.get('k', false, mint)
+  expect(again).toMatchObject({ cached: false, credential: { credential: 'c2' } })
+  expect(RENEW_EARLY_MS).toBe(120_000)
+})
+
+test('vector 24: two principals on one configured server get different cached credentials for the same audience', async () => {
+  const ada = new FakeIssuer('agent:ada@guest')
+  const bo = new FakeIssuer('agent:bo@guest')
+  let current: FakeIssuer = ada
+  const { peer } = await setup({ issuerFn: () => current })
+  await peer.policyCount(1)
+  const a1 = (await peer.request('access/token', { audience: 'games' })).result as { credential: string; principal: string }
+  current = bo
+  const b1 = (await peer.request('access/token', { audience: 'games' })).result as { credential: string; principal: string }
+  expect(b1.principal).toBe('agent:bo@guest')
+  expect(b1.credential).not.toBe(a1.credential)
+  current = ada
+  const a2 = (await peer.request('access/token', { audience: 'games' })).result as { credential: string }
+  expect(a2.credential).toBe(a1.credential) // ada's own cached entry
+  expect(ada.mints).toHaveLength(1)
+  expect(bo.mints).toHaveLength(1)
 })

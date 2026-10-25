@@ -82,7 +82,12 @@ export class Identity implements AccessIssuer {
    * Rejects with AccessRefused (audience + reason) when not enrolled, when the
    * issuer is unreachable, refuses, or answers without a stated expiry.
    */
-  async mint(audience: string, opts: { ttl?: string } = {}): Promise<MintedCredential> {
+  /** Whom this identity mints for: its enrolled principal (or its key, before enrollment). */
+  principal(): string | undefined {
+    return this.record()?.sub
+  }
+
+  async mint(audience: string, opts: { ttl?: string; timeoutMs?: number } = {}): Promise<MintedCredential> {
     const refuse = (kind: RefusalKind, reason: string): never => {
       throw new AccessRefused(audience, kind, secrets.scrubLog(reason).slice(0, REASON_MAX))
     }
@@ -94,7 +99,7 @@ export class Identity implements AccessIssuer {
     const proof = cryptoSign(null, Buffer.from(tokenStatement(this.home, audience, timestamp), 'utf8'), key.privateKey).toString('base64url')
     let res: { status: number; json: Record<string, unknown> }
     try {
-      res = await this.post('/token', { id: key.id, audience, timestamp, proof, ...(opts.ttl ? { ttl: opts.ttl } : {}) })
+      res = await this.post('/token', { id: key.id, audience, timestamp, proof, ...(opts.ttl ? { ttl: opts.ttl } : {}) }, opts.timeoutMs)
     } catch (e) {
       return refuse('unavailable', `${this.home} unreachable: ${e instanceof Error ? e.message : String(e)}`)
     }
@@ -165,14 +170,14 @@ export class Identity implements AccessIssuer {
     return this.key
   }
 
-  private async post(path: string, body: unknown): Promise<{ status: number; json: Record<string, unknown> }> {
+  private async post(path: string, body: unknown, timeoutMs = this.timeoutMs): Promise<{ status: number; json: Record<string, unknown> }> {
     const res = await this.fetchImpl(`${this.url}${path}`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify(body),
       // A redirect would carry a signed proof somewhere else; the issuer never redirects these.
       redirect: 'error',
-      signal: AbortSignal.timeout(this.timeoutMs),
+      signal: AbortSignal.timeout(Math.max(1, timeoutMs)),
     })
     const json = (await res.json().catch(() => ({}))) as unknown
     return { status: res.status, json: json && typeof json === 'object' && !Array.isArray(json) ? (json as Record<string, unknown>) : {} }

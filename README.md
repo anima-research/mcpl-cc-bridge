@@ -194,9 +194,11 @@ identity provider — and use it two ways:
   advertises `access: { token: true }`. A server granted `access.token` may
   ask for a credential for any audience the principal can obtain; the answer is
   `{ scheme: "bearer", credential, expiresAt, principal }`, minted with a
-  15-minute lifetime and cached per (server, audience) until 60 s before it
-  expires (`fresh: true` bypasses the cache). Errors: `-32002` without the
-  grant, `-32602` for malformed or unknown params members, `-32040
+  15-minute lifetime and cached per (server, principal, audience, scheme) —
+  never answered from the cache with under two minutes left (`fresh: true`
+  bypasses it). The answer comes within `timeoutMs` − 2 s (default 30 s) and
+  at most 20 s. Unknown params members are ignored. Errors: `-32002` without
+  the grant, `-32602` for malformed params, `-32040
   { audience, kind, reason }` when there is no identity (`no_identity`), the
   issuer refuses (`provider_refused`) or throttles (`rate_limited`), or gives no
   usable answer within 20 s (`unavailable`), or the server's `schemes` exclude

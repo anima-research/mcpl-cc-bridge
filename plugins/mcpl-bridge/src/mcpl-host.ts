@@ -48,6 +48,8 @@ import { DEFAULT_GRANT, dialUrl, isLoopbackHost, isWs, resolveUrl, staticToken, 
 import {
   ACCESS_TIME_BOUND,
   ACCESS_TTL,
+  DEFAULT_TIMEOUT_MS,
+  cacheKey,
   AccessRefused,
   SCHEME,
   CredentialCache,
@@ -943,7 +945,7 @@ export class McplServerHandle {
       this.audit({ kind: 'request', ...seen, outcome: 'invalid', reason: `${check.field} ${check.reason}` })
       return
     }
-    const { audience, endpoint, purpose, fresh, schemes } = check.params
+    const { audience, endpoint, purpose, fresh, schemes, timeoutMs } = check.params
     // RFC-015 r3 §8.2: the audit keeps the endpoint's scheme, host and path only.
     const audited = auditEndpoint(endpoint)
     const about = { kind: 'request' as const, audience, ...(audited !== undefined ? { endpoint: audited } : {}), ...(purpose !== undefined ? { purpose } : {}) }
@@ -955,14 +957,27 @@ export class McplServerHandle {
     if (!issuer) return refuse('no_identity', 'this host has no identity to mint from')
     // r4 §3.1–3.3: the server names the schemes it can use; this host mints bearer only.
     if (!(schemes ?? [SCHEME]).includes(SCHEME)) return refuse('host_policy', `this host offers only the "${SCHEME}" scheme`)
+    // r5 §5: per (principal, audience, scheme) within this configured server.
+    const key = cacheKey(issuer.principal?.() ?? '', audience, SCHEME)
+    // r5 §3.4: answer within timeoutMs − 2000 ms, and in any case within 20 s — a refusal rather than silence.
+    const budget = Math.min((timeoutMs ?? DEFAULT_TIMEOUT_MS) - 2000, ACCESS_TIME_BOUND.ms)
     let got: Awaited<ReturnType<CredentialCache['get']>>
     let timer: ReturnType<typeof setTimeout> | undefined
     try {
-      // r4 §3.4: answer within the bound, a refusal rather than silence.
-      const bound = new Promise<never>((_, reject) => {
-        timer = setTimeout(() => reject(new AccessRefused(audience, 'unavailable', `the identity provider did not answer within ${Math.round(ACCESS_TIME_BOUND.ms / 1000)} s`)), ACCESS_TIME_BOUND.ms)
-      })
-      got = await Promise.race([this.accessCache.get(audience, fresh === true, () => issuer.mint(audience, { ttl: ACCESS_TTL })), bound])
+      if (budget <= 0) {
+        // No time to ask the provider: the cache can still answer.
+        const hit = fresh ? undefined : this.accessCache.peek(key)
+        if (!hit) throw new AccessRefused(audience, 'unavailable', `timeoutMs ${timeoutMs} leaves no time to ask the identity provider`)
+        got = { credential: hit, cached: true }
+      } else {
+        const bound = new Promise<never>((_, reject) => {
+          timer = setTimeout(() => {
+            this.accessCache.abandon(key) // the next request must not wait on this mint
+            reject(new AccessRefused(audience, 'unavailable', `the identity provider did not answer within ${budget} ms`))
+          }, budget)
+        })
+        got = await Promise.race([this.accessCache.get(key, fresh === true, () => issuer.mint(audience, { ttl: ACCESS_TTL, timeoutMs: budget })), bound])
+      }
     } catch (e) {
       if (e instanceof AccessRefused) return refuse(e.kind, e.reason)
       return refuse('unavailable', `could not mint: ${secrets.scrubLog(e instanceof Error ? e.message : String(e))}`)
