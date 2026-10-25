@@ -226,6 +226,8 @@ export class McplServerHandle {
   private sentHinted = new Map<string, { method: string; params: Record<string, unknown> }>()
   /** What applying a message's hints changed, for whoever renders it — keyed by the result or params object the caller later gets. */
   private readChanges = new WeakMap<object, ChangeSet>()
+  /** eventIds of pushes read on this connection (bounded): a repeated one's hints are ignored (r5 §6.1). */
+  private seenEvents = new Set<string>()
 
   /**
    * `opts.predecessor`: the exit of the process a replaced handle for this
@@ -704,7 +706,7 @@ export class McplServerHandle {
 
     await this.refreshTools(conn)
     // RFC-014 §5.2–5.3: after every (re)connect, ask what the server still holds open and adopt it.
-    if (this.presence.active && Object.keys(this.presence.declared).length) await this.reattach(conn, myEpoch)
+    if (this.presence.active) await this.reattach(conn, myEpoch) // r5 §5.3: every server with toolHints answers toolsets/list
     this.log(`connected: ${this.status}, ${this.tools.length} tools, grant=[${this.grant.join(', ')}]` + (this.presence.active ? `, toolHints${this.presence.surface ? ' (surface)' : ''}: ${this.listedTools().length} listed, ${this.presence.openRecords().length} open` : ''))
   }
 
@@ -792,6 +794,7 @@ export class McplServerHandle {
    */
   private attachTap(conn: McplConnection, myEpoch: number): void {
     this.sentHinted = new Map()
+    this.seenEvents = new Set()
     conn.on('sent', (id, method, params) => {
       if (!HINTED_RESULTS.has(method)) return
       this.sentHinted.set(String(id), { method, params: params && typeof params === 'object' ? (params as Record<string, unknown>) : {} })
@@ -863,6 +866,16 @@ export class McplServerHandle {
         this.log(`push ${String(p.eventId ?? '')} carries hints and coalesce (RFC-014 §7 forbids it) — hints ignored; recovering`)
         this.scheduleRecovery()
         return
+      }
+      // r5 §6.1: a push carrying hints is never retried; one whose eventId was seen is a duplicate — its hints were applied once.
+      const eventId = typeof p.eventId === 'string' || typeof p.eventId === 'number' ? String(p.eventId) : ''
+      if (eventId) {
+        if (this.seenEvents.has(eventId)) {
+          this.log(`push ${eventId} seen before — its hints ignored`)
+          return
+        }
+        this.seenEvents.add(eventId)
+        if (this.seenEvents.size > 1000) this.seenEvents.delete(this.seenEvents.values().next().value!)
       }
       // Applied now, before (and whatever) the host decides about the push.
       this.readChanges.set(p, this.applyHints(p.hints, 'push'))
@@ -971,13 +984,11 @@ export class McplServerHandle {
     this.recovering = true
     try {
       let cs = emptyChange()
-      if (Object.keys(this.presence.declared).length) {
-        try {
-          const r = await conn.sendRequest('toolsets/list', {}, 15_000)
-          cs = (r && typeof r === 'object' ? this.readChanges.get(r) : undefined) ?? cs
-        } catch (e) {
-          this.log(`toolsets/list (recovery) failed: ${e instanceof Error ? e.message : e}`)
-        }
+      try {
+        const r = await conn.sendRequest('toolsets/list', {}, 15_000)
+        cs = (r && typeof r === 'object' ? this.readChanges.get(r) : undefined) ?? cs
+      } catch (e) {
+        this.log(`toolsets/list (recovery) failed: ${e instanceof Error ? e.message : e}`)
       }
       if (conn !== this.conn) return
       const tools = await this.refreshTools(conn)
@@ -1000,7 +1011,7 @@ export class McplServerHandle {
    * for what the server no longer holds.
    */
   async refreshOpen(): Promise<string[]> {
-    if (!this.presence.active || !Object.keys(this.presence.declared).length) return []
+    if (!this.presence.active) return []
     const conn = this.conn
     if (!conn || conn.isClosed) return []
     let r: unknown
@@ -1622,8 +1633,20 @@ export class McplServerHandle {
       this.log(`featureSets/update after manifest change failed: ${e instanceof Error ? e.message : e}`)
     }
     if (removedPaths.length) this.log(`manifest change revoked: [${removedPaths.join(', ')}]`)
-    // RFC-014 §5.1: toolset declarations live in the manifest.
-    if (this.presence.active) this.presence.setManifest(manifest)
+    // RFC-014 §5.1: toolset declarations live in the manifest (its `toolsets` domain).
+    if (this.presence.active) {
+      const before = this.presence.view()
+      const notes: string[] = []
+      if ((manifest as { toolHints?: unknown }).toolHints !== true) {
+        // r5 §5.1: hint-less from then on — every tool static, its dynamic presentation withdrawn.
+        this.presence.deactivate()
+        notes.push(`[${this.id}] no longer sends tool hints: its tools are in your tool list as ${this.prefix}__<tool>.`)
+        this.log('the server withdrew toolHints — treated as hint-less')
+      } else this.presence.setManifest(manifest)
+      const cs = this.presence.diff(before, this.presence.view())
+      cs.notes.push(...notes)
+      this.deliverChange(cs)
+    }
     await this.refreshTools(conn)
   }
 

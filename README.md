@@ -271,25 +271,31 @@ appended to that channel notification (its `toolset` / `instance` in meta); a
 standalone `tools/hints` becomes a short notification tagged `surface:tools`.
 A `suggest` is shown, never acted on.
 
-Hint changes from all four carriers go through one apply path, in `rev`
-order, each `rev` at most once. A push's `hints` apply only if the bridge
-accepts the push (the server restates a refused push's changes under a new
-rev), and never from a push that also carries RFC-006 `coalesce`. `tools/list`
-carries `mcpl/rev`; later changes apply on top of it. A definition in hints
-changes a tool's description, schema and annotations only — its name and
-RFC-008 class stay the listed ones. After a reversal, a gap in the revs, a
-coalesced push with hints, or a result lost to a timeout, the bridge
-**recovers**: it re-reads `tools/list` and `toolsets/list` and announces what
-changed. Calls into a toolset the server does not declare are gated here:
-`act` refuses them while the bridge has the group closed.
+Hint changes apply **when a message is read, in arrival order** — a result
+(even one whose call timed out), a push (before, and whatever, the bridge
+decides about it; a repeated `eventId`'s hints are ignored), a `tools/hints`.
+Revs are consecutive: every message carrying hints takes the next one,
+`toolsets/*` results included; `tools/list` carries `mcpl/rev` and takes none.
+Anything but the last rev + 1 means a message was lost, and the bridge
+**recovers**: it re-reads `toolsets/list` (a full statement of the server's
+dynamic tools — a tool not stated visible is invisible) and then `tools/list`,
+each applied where it is read, and announces what changed. Hints on a push
+that also carries RFC-006 `coalesce` are ignored and recovered instead. A
+definition in hints changes a tool's description, schema and annotations only
+(name and `_meta` stay the listed ones); with `instance` it is that
+instance's own, and `act` checks arguments against it before sending. Calls
+into a toolset the server does not declare are gated here: `act` refuses them
+while the bridge has the group closed.
 
-After every (re)connect the bridge sends `toolsets/list` and takes it as the
+After every (re)connect the bridge sends `toolsets/list` to every server that
+advertised `toolHints`, and takes it as the
 truth: what it reports is adopted (a game kept across the reconnect, or one
 opened by another connection of the same principal); anything else the bridge
 believed open is closed — and never re-opened on its own, since opening can
-start a new game. Toolsets the server reports as `ended` while no connection
-was told are told to the agent ("[go/game:first] ended while you were away:
-…"). An open, close or retitle made on another connection arrives as an
+start a new game. Toolsets the server reports as `ended` are told to the agent once per record
+id, across reconnects ("[go/game:first] ended while you were away: …"). A
+manifest change that removes a toolset ends its instances; a server that
+withdraws `toolHints` is hint-less from then on. An open, close or retitle made on another connection arrives as an
 ordinary hint change and is announced like any other.
 
 **Reminders.** After compaction (and `/clear`) Claude Code runs `SessionStart`

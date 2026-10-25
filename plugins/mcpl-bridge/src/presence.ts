@@ -113,6 +113,7 @@ export class ToolPresence {
 
   /** Toolset declarations and the surface hint, from initialize or a manifest re-fetch. */
   setManifest(mcpl: Record<string, unknown> | null | undefined): void {
+    const prev = this.declared
     const decl: Record<string, ToolsetDecl> = {}
     if (mcpl && isObj(mcpl.toolsets)) {
       for (const [name, d] of Object.entries(mcpl.toolsets)) {
@@ -128,8 +129,27 @@ export class ToolPresence {
     }
     this.declared = decl
     this.surface = mcpl && isObj(mcpl.surface) ? { title: str(mcpl.surface.title), summary: str(mcpl.surface.summary) } : null
-    // A toolset no longer declared is no longer the server's to track.
-    for (const [k, r] of this.open) if (!decl[r.toolset]) this.dropKey(k)
+    // r5 §5.1: removing a toolset, or turning its instances on or off, ends its
+    // open instances; one that becomes undeclared starts closed under the host's gating.
+    for (const [k, r] of [...this.open]) if (!decl[r.toolset] || !!decl[r.toolset]!.instances !== !!prev[r.toolset]?.instances) this.dropKey(k)
+    for (const name of Object.keys(prev)) {
+      if (decl[name]) continue
+      this.groups.delete(name)
+      for (const k of new Set([...this.visible.keys(), ...this.defs.keys()])) if (splitKey(k).toolset === name) this.dropKey(k)
+    }
+  }
+
+  /** r5 §5.1: a server that withdraws toolHints is hint-less from then on — every tool static, nothing dynamic presented. */
+  deactivate(): void {
+    this.active = false
+    this.declared = {}
+    this.surface = null
+    this.open.clear()
+    this.groups.clear()
+    this.visible.clear()
+    this.defs.clear()
+    this.pendingMoves.clear()
+    this.moved.clear()
   }
 
   /** tools/list: every definition, visible or not (RFC §4.1). */
@@ -382,9 +402,17 @@ export class ToolPresence {
    */
   adopt(result: unknown): { lost: OpenRecord[]; ended: Ended[]; suggest: Suggestion[]; skipped: boolean } {
     const had = [...this.open.values()]
-    // r4 §5.3: a full statement — every declared toolset's per-instance state
-    // (open, visibility, definitions) is replaced; a tool not stated visible is invisible.
-    for (const k of new Set([...this.open.keys(), ...this.visible.keys(), ...this.defs.keys()])) if (this.isDeclared(splitKey(k).toolset)) this.dropKey(k)
+    // r5 §5.3: a full statement of the server's dynamic tools — every declared
+    // toolset's instances (open, visibility, definitions), and dynamic tools
+    // outside declared toolsets too; a dynamic tool not stated visible is
+    // invisible. Undeclared groups stay as the host has them open or closed.
+    for (const k of new Set([...this.open.keys(), ...this.visible.keys(), ...this.defs.keys()])) {
+      if (this.isDeclared(splitKey(k).toolset)) this.dropKey(k)
+      else {
+        this.visible.delete(k)
+        this.defs.delete(k)
+      }
+    }
     const r = isObj(result) ? result : {}
     for (const o of arr(r.open)) {
       if (!isObj(o) || !str(o.toolset)) continue
