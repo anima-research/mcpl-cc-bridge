@@ -960,24 +960,18 @@ export class McplServerHandle {
     // r5 §5: per (principal, audience, scheme) within this configured server.
     const key = cacheKey(issuer.principal?.() ?? '', audience, SCHEME)
     // r5 §3.4: answer within timeoutMs − 2000 ms, and in any case within 20 s — a refusal rather than silence.
+    // (r6: timeoutMs is at least 5000, so there is always time to ask the provider.)
     const budget = Math.min((timeoutMs ?? DEFAULT_TIMEOUT_MS) - 2000, ACCESS_TIME_BOUND.ms)
     let got: Awaited<ReturnType<CredentialCache['get']>>
     let timer: ReturnType<typeof setTimeout> | undefined
     try {
-      if (budget <= 0) {
-        // No time to ask the provider: the cache can still answer.
-        const hit = fresh ? undefined : this.accessCache.peek(key)
-        if (!hit) throw new AccessRefused(audience, 'unavailable', `timeoutMs ${timeoutMs} leaves no time to ask the identity provider`)
-        got = { credential: hit, cached: true }
-      } else {
-        const bound = new Promise<never>((_, reject) => {
-          timer = setTimeout(() => {
-            this.accessCache.abandon(key) // the next request must not wait on this mint
-            reject(new AccessRefused(audience, 'unavailable', `the identity provider did not answer within ${budget} ms`))
-          }, budget)
-        })
-        got = await Promise.race([this.accessCache.get(key, fresh === true, () => issuer.mint(audience, { ttl: ACCESS_TTL, timeoutMs: budget })), bound])
-      }
+      const bound = new Promise<never>((_, reject) => {
+        timer = setTimeout(() => {
+          this.accessCache.abandon(key) // the next request must not wait on this mint
+          reject(new AccessRefused(audience, 'unavailable', `the identity provider did not answer within ${budget} ms`))
+        }, budget)
+      })
+      got = await Promise.race([this.accessCache.get(key, fresh === true, () => issuer.mint(audience, { ttl: ACCESS_TTL, timeoutMs: budget })), bound])
     } catch (e) {
       if (e instanceof AccessRefused) return refuse(e.kind, e.reason)
       return refuse('unavailable', `could not mint: ${secrets.scrubLog(e instanceof Error ? e.message : String(e))}`)

@@ -91,6 +91,8 @@ export type AccessTokenParams = { audience: string; endpoint?: string; purpose?:
 export type ParamsCheck = { ok: true; params: AccessTokenParams } | { ok: false; field: string; reason: string }
 
 const ENDPOINT_MAX = 2048
+/** RFC-015 r6 §3.1: a scheme name. */
+const SCHEME_NAME = /^[a-z0-9][a-z0-9._-]{0,31}$/
 /** C0 and C1 controls, and DEL (r4 §3.1): a purpose reaches the audit as data. */
 const CONTROL = /[\u0000-\u001f\u007f-\u009f]/
 
@@ -131,9 +133,10 @@ export function validateAccessParams(raw: unknown): ParamsCheck {
   if (fresh !== undefined && typeof fresh !== 'boolean') return bad('fresh', 'must be a boolean')
   if (schemes !== undefined) {
     if (!Array.isArray(schemes) || schemes.length < 1 || schemes.length > 8) return bad('schemes', 'must be an array of 1-8 scheme names')
-    if (!schemes.every(x => typeof x === 'string' && x.length > 0 && chars(x) <= 64)) return bad('schemes', 'must hold non-empty strings')
+    // r6 §3.1: scheme names have a grammar.
+    if (!schemes.every(x => typeof x === 'string' && SCHEME_NAME.test(x))) return bad('schemes', 'entries must match ^[a-z0-9][a-z0-9._-]{0,31}$')
   }
-  if (timeoutMs !== undefined && !(Number.isInteger(timeoutMs) && (timeoutMs as number) >= 1000 && (timeoutMs as number) <= 120_000)) return bad('timeoutMs', 'must be an integer from 1000 to 120000')
+  if (timeoutMs !== undefined && !(Number.isInteger(timeoutMs) && (timeoutMs as number) >= 5000 && (timeoutMs as number) <= 120_000)) return bad('timeoutMs', 'must be an integer from 5000 to 120000')
   if (_meta !== undefined && (typeof _meta !== 'object' || _meta === null || Array.isArray(_meta))) return bad('_meta', 'must be an object')
   return {
     ok: true,

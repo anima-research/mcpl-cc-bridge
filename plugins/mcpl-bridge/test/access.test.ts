@@ -380,6 +380,9 @@ test('vector 14: bounds — each -32602; 128 astral-plane characters are accepte
   expect(field({ audience: 'games', purpose: 'tab\there' })).toBe('purpose')
   expect(field({ audience: 'games', schemes: [] })).toBe('schemes')
   expect(field({ audience: 'games', schemes: ['bearer', ''] })).toBe('schemes')
+  // r6 §3.1: each entry matches ^[a-z0-9][a-z0-9._-]{0,31}$
+  for (const bad of ['Bearer', '-pop', 'pop scheme', 'a'.repeat(33), 'pöp', '.x']) expect(field({ audience: 'games', schemes: [bad] })).toBe('schemes')
+  for (const good of ['bearer', 'example-pop', 'dpop.v1', '0x', 'a'.repeat(32), 'a_b']) expect(field({ audience: 'games', schemes: [good] })).toBeNull()
   expect(field({ audience: 'games', schemes: Array(9).fill('bearer') })).toBe('schemes')
   expect(field({ audience: 'games', schemes: 'bearer' })).toBe('schemes')
   expect(field({ audience: 'games', schemes: ['example-pop', 'bearer'], purpose: 'Doom — level 2' })).toBeNull()
@@ -474,31 +477,28 @@ test('vector 14 (r5): an audience with a newline, and timeoutMs out of bounds, a
   expect(field({ audience: 'games', timeoutMs: 120_001 })).toBe('timeoutMs')
   expect(field({ audience: 'games', timeoutMs: 1500.5 })).toBe('timeoutMs')
   expect(field({ audience: 'games', timeoutMs: '30000' })).toBe('timeoutMs')
-  expect(field({ audience: 'games', timeoutMs: 1000 })).toBeNull()
+  expect(field({ audience: 'games', timeoutMs: 1000 })).toBe('timeoutMs') // r6: from 5000
+  expect(field({ audience: 'games', timeoutMs: 4999 })).toBe('timeoutMs')
+  expect(field({ audience: 'games', timeoutMs: 5000 })).toBeNull()
   expect(field({ audience: 'games', timeoutMs: 120_000 })).toBeNull()
 })
 
-test('vector 19: a provider that does not answer gets -32040 unavailable within timeoutMs − 2000 ms; the provider call is bounded by it; too little time answers from cache or refuses at once', async () => {
+test('vector 19: a provider that does not answer gets -32040 unavailable within timeoutMs − 2000 ms, and the provider call is bounded by it', async () => {
   const issuer = new FakeIssuer()
   const { peer } = await setup({ issuer })
   await peer.policyCount(1)
   issuer.hang = true
   const t0 = Date.now()
-  const r = await peer.request('access/token', { audience: 'games', timeoutMs: 3000 })
+  const r = await peer.request('access/token', { audience: 'games', timeoutMs: 5000 })
   const took = Date.now() - t0
   expect(r.error).toMatchObject({ code: -32040, data: { audience: 'games', kind: 'unavailable' } })
-  expect(took).toBeGreaterThanOrEqual(900)
-  expect(took).toBeLessThan(2500) // within timeoutMs − 2000 (+ slack), well before the requester gives up
-  expect(issuer.timeouts.at(-1)).toBe(1000) // the provider call itself got that budget
-  // timeoutMs 1500: nothing cached → refused at once
-  const quick = await peer.request('access/token', { audience: 'games', timeoutMs: 1500 })
-  expect(quick.error).toMatchObject({ code: -32040, data: { kind: 'unavailable' } })
-  // with a credential cached, the cache answers even then
+  expect(took).toBeGreaterThanOrEqual(2900)
+  expect(took).toBeLessThan(4500) // within timeoutMs − 2000 (+ slack), before the requester gives up at 5000
+  expect(issuer.timeouts.at(-1)).toBe(3000) // the provider call itself got that budget
+  // the abandoned mint does not hold up the next request
   issuer.hang = false
-  const minted = (await peer.request('access/token', { audience: 'games' })).result as { credential: string }
-  const cached = (await peer.request('access/token', { audience: 'games', timeoutMs: 1500 })).result as { credential: string }
-  expect(cached.credential).toBe(minted.credential)
-})
+  expect((await peer.request('access/token', { audience: 'games' })).result).toMatchObject({ scheme: 'bearer' })
+}, 15_000)
 
 test('vector 23: a cached answer always has at least two minutes left', async () => {
   let now = 0

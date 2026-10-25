@@ -196,7 +196,7 @@ identity provider — and use it two ways:
   `{ scheme: "bearer", credential, expiresAt, principal }`, minted with a
   15-minute lifetime and cached per (server, principal, audience, scheme) —
   never answered from the cache with under two minutes left (`fresh: true`
-  bypasses it). The answer comes within `timeoutMs` − 2 s (default 30 s) and
+  bypasses it). The answer comes within `timeoutMs` − 2 s (5–120 s, default 30 s) and
   at most 20 s. Unknown params members are ignored. Errors: `-32002` without
   the grant, `-32602` for malformed params, `-32040
   { audience, kind, reason }` when there is no identity (`no_identity`), the
