@@ -9,9 +9,16 @@
  * <held> block, and into the next user turn via the UserPromptSubmit hook.
  *
  * A rule is an AND-set of tags. Evaluation: `wake` rules, then `hold` rules,
- * then the default (wake). An event carrying none of the tags a rule names can
- * not match it, so events outside the chat domain (a heartbeat's own tags, a
- * bare push) keep waking under every policy unless a rule names their tags.
+ * then the host defaults, then wake. An event carrying none of the tags a rule
+ * names can not match it, so events outside the chat domain (a heartbeat's own
+ * tags, a bare push) keep waking under every policy unless a rule names their
+ * tags.
+ *
+ * Host defaults (MCPL RFC-014 §7), under every policy including "all":
+ * `surface:tools` (a change in which tools are available, with nothing else
+ * to say) and `surface:update` (ambient latest-value state) are held, not
+ * woken on. `surface:turn`, `surface:alert`, `surface:done` and
+ * `surface:invite` wake. A `wake` rule naming the tag overrides the default.
  */
 import type { IncomingDelivery } from './mcpl-host'
 
@@ -57,6 +64,9 @@ export function holdsAmbient(cfg: WakeConfig | undefined): boolean {
   )
 }
 
+/** RFC-014 §7 tags the host holds unless a policy's wake rule names them. */
+export const HELD_BY_DEFAULT: readonly string[] = ['surface:tools', 'surface:update']
+
 export type HeldDelivery = { delivery: IncomingDelivery; heldAt: string }
 
 const DEFAULT_HOLD_CAP = 50
@@ -79,12 +89,14 @@ export class WakeGate {
 
   /** Inference requests are never held: a server is blocked on the answer. */
   decide(d: IncomingDelivery): 'wake' | 'hold' {
-    if (!this.policy) return 'wake'
     if (d.kind === 'inference-request') return 'wake'
     const tags = new Set((d.meta.tags ?? '').split(' ').filter(Boolean))
     const matches = (rule: WakeRule) => rule.length > 0 && rule.every(t => tags.has(t))
-    if ((this.policy.wake ?? []).some(matches)) return 'wake'
-    if ((this.policy.hold ?? []).some(matches)) return 'hold'
+    if (this.policy) {
+      if ((this.policy.wake ?? []).some(matches)) return 'wake'
+      if ((this.policy.hold ?? []).some(matches)) return 'hold'
+    }
+    if (HELD_BY_DEFAULT.some(t => tags.has(t))) return 'hold'
     return 'wake'
   }
 
@@ -116,5 +128,7 @@ function renderHeldLine(h: HeldDelivery): string {
   const text = h.delivery.text.replace(/\s+/g, ' ').trim()
   const body = text.length > 300 ? `${text.slice(0, 297)}...` : text
   const tags = m.tags ? ` [${m.tags}]` : ''
+  // A tool announcement is read, not skimmed: cut to a line it would lose the tools it announces.
+  if (h.delivery.keepWhole) return `- [${stamp}]${where}${who}${tags}\n${h.delivery.text.trim().replace(/^/gm, '  ')}`
   return `- [${stamp}]${where}${who} ${body}${tags}`
 }

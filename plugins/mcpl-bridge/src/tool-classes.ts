@@ -40,8 +40,28 @@ export const UNCLASSED_BRIDGE_TOOLS: ReadonlySet<string> = new Set([
   'mcpl_answer',
 ])
 
-/** The tool with its RFC-008 class declared in `_meta`, if the map has one. */
+/**
+ * The RFC-014 meta-tools (src/meta-tools.ts), listed only when some server
+ * has toolsets or dynamic tools — kept apart from the map above so a session
+ * without them is not "missing" tools the map names.
+ */
+export const META_TOOL_CLASSES: Readonly<Record<string, readonly ToolClass[]>> = {
+  // Tool lists and toolset catalogs — no one's messages.
+  look: ['control'],
+  close: ['control'],
+}
+
+/** Deliberately unclassed: they carry whatever the server's tool carries. */
+export const UNCLASSED_META_TOOLS: ReadonlySet<string> = new Set([
+  // Any server tool's arguments and result (a game move, a chat line in a world).
+  'act',
+  // Returns what the server shows on opening — a board, or a room with people talking.
+  'open',
+])
+
+/** The tool with its RFC-008 class declared in `_meta`, if a map has one. */
 export function withBridgeClass<T extends { name: string; _meta?: Record<string, unknown> }>(tool: T): T {
-  if (!Object.hasOwn(BRIDGE_TOOL_CLASSES, tool.name)) return tool
-  return { ...tool, _meta: { ...tool._meta, [CLASS_META_KEY]: [...BRIDGE_TOOL_CLASSES[tool.name]] } }
+  const classes = Object.hasOwn(BRIDGE_TOOL_CLASSES, tool.name) ? BRIDGE_TOOL_CLASSES[tool.name] : Object.hasOwn(META_TOOL_CLASSES, tool.name) ? META_TOOL_CLASSES[tool.name] : undefined
+  if (!classes) return tool
+  return { ...tool, _meta: { ...tool._meta, [CLASS_META_KEY]: [...classes] } }
 }

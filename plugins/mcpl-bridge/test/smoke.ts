@@ -14,7 +14,7 @@ import { spawn } from 'child_process'
 import { copyFileSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
-import { BRIDGE_TOOL_CLASSES, UNCLASSED_BRIDGE_TOOLS } from '../src/tool-classes'
+import { BRIDGE_TOOL_CLASSES, META_TOOL_CLASSES, UNCLASSED_BRIDGE_TOOLS, UNCLASSED_META_TOOLS } from '../src/tool-classes'
 
 const ROOT = join(import.meta.dir, '..')
 // MCPL RFC-008 §4, written out here rather than imported so the module cannot widen it.
@@ -161,8 +161,11 @@ try {
         const mapped = BRIDGE_TOOL_CLASSES[t.name]
         const vocabOk = mapped.length > 0 && mapped.every(c => RFC008_VOCABULARY.includes(c))
         if (!vocabOk || !Bun.deepEquals(declared, [...mapped], true) || UNCLASSED_BRIDGE_TOOLS.has(t.name)) wrong.push(`${t.name}=${JSON.stringify(declared)}`)
-      } else if (UNCLASSED_BRIDGE_TOOLS.has(t.name)) {
+      } else if (UNCLASSED_BRIDGE_TOOLS.has(t.name) || UNCLASSED_META_TOOLS.has(t.name)) {
         if (declared !== undefined) wrong.push(`${t.name} is meant to be unclassed but declares ${JSON.stringify(declared)}`)
+      } else if (Object.hasOwn(META_TOOL_CLASSES, t.name)) {
+        // RFC-014 meta-tools: listed only when some server has toolsets.
+        if (!Bun.deepEquals(declared, [...META_TOOL_CLASSES[t.name]], true)) wrong.push(`${t.name}=${JSON.stringify(declared)}`)
       } else unaccounted.push(t.name)
     }
     ok(bridge.length >= 6 && unaccounted.length === 0, `every bridge tool is classed or deliberately unclassed (unaccounted: ${unaccounted.join(', ') || 'none'})`)
