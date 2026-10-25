@@ -199,7 +199,8 @@ identity provider — and use it two ways:
   grant, `-32602` for malformed or unknown params members, `-32040
   { audience, kind, reason }` when there is no identity (`no_identity`), the
   issuer refuses (`provider_refused`) or throttles (`rate_limited`), or gives no
-  usable answer (`unavailable`). `expiresAt` is RFC 3339 UTC (`…Z`).
+  usable answer within 20 s (`unavailable`), or the server's `schemes` exclude
+  `bearer` (`host_policy`). `expiresAt` is RFC 3339 UTC (`…Z`).
   Granting `access.token` is the whole trust decision — there is no
   per-audience list; the issuer's policy for the principal is the bound. It is
   never in the default grant, and a wildcard (`access.*`, `*.*`) does not grant

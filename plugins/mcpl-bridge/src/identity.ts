@@ -58,7 +58,8 @@ export class Identity implements AccessIssuer {
     this.url = (opts.url ?? `https://${opts.home}`).replace(/\/+$/, '')
     this.recordPath = opts.keyPath.replace(/\.pem$/, '') + '.json'
     this.fetchImpl = opts.fetchImpl ?? fetch
-    this.timeoutMs = opts.timeoutMs ?? 10_000
+    // Under the 20 s an access/token answer gets (RFC-015 r4 §3.4), so the provider's silence becomes "unavailable" in time.
+    this.timeoutMs = opts.timeoutMs ?? 15_000
   }
 
   /** The public key id, `ed25519:<base64url raw 32 bytes>` — what the issuer knows the key by. Creates the key on first use. */

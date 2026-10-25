@@ -46,8 +46,10 @@ import { ERR, computeGrant, expandTags, granted, methodCapability, wildcardOnlyM
 import { holdsAmbient } from './wake'
 import { DEFAULT_GRANT, dialUrl, isLoopbackHost, isWs, resolveUrl, staticToken, type ServerConfig, type StdioTransportConfig } from './config'
 import {
+  ACCESS_TIME_BOUND,
   ACCESS_TTL,
   AccessRefused,
+  SCHEME,
   CredentialCache,
   auditEndpoint,
   auditFields,
@@ -941,7 +943,7 @@ export class McplServerHandle {
       this.audit({ kind: 'request', ...seen, outcome: 'invalid', reason: `${check.field} ${check.reason}` })
       return
     }
-    const { audience, endpoint, purpose, fresh } = check.params
+    const { audience, endpoint, purpose, fresh, schemes } = check.params
     // RFC-015 r3 §8.2: the audit keeps the endpoint's scheme, host and path only.
     const audited = auditEndpoint(endpoint)
     const about = { kind: 'request' as const, audience, ...(audited !== undefined ? { endpoint: audited } : {}), ...(purpose !== undefined ? { purpose } : {}) }
@@ -951,12 +953,21 @@ export class McplServerHandle {
     }
     const issuer = this.cb.issuer?.() ?? null
     if (!issuer) return refuse('no_identity', 'this host has no identity to mint from')
+    // r4 §3.1–3.3: the server names the schemes it can use; this host mints bearer only.
+    if (!(schemes ?? [SCHEME]).includes(SCHEME)) return refuse('host_policy', `this host offers only the "${SCHEME}" scheme`)
     let got: Awaited<ReturnType<CredentialCache['get']>>
+    let timer: ReturnType<typeof setTimeout> | undefined
     try {
-      got = await this.accessCache.get(audience, fresh === true, () => issuer.mint(audience, { ttl: ACCESS_TTL }))
+      // r4 §3.4: answer within the bound, a refusal rather than silence.
+      const bound = new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new AccessRefused(audience, 'unavailable', `the identity provider did not answer within ${Math.round(ACCESS_TIME_BOUND.ms / 1000)} s`)), ACCESS_TIME_BOUND.ms)
+      })
+      got = await Promise.race([this.accessCache.get(audience, fresh === true, () => issuer.mint(audience, { ttl: ACCESS_TTL })), bound])
     } catch (e) {
       if (e instanceof AccessRefused) return refuse(e.kind, e.reason)
       return refuse('unavailable', `could not mint: ${secrets.scrubLog(e instanceof Error ? e.message : String(e))}`)
+    } finally {
+      clearTimeout(timer)
     }
     // The mint took time: a grant revoked meanwhile (manifest change) or a
     // connection replaced meanwhile gets nothing.
@@ -968,7 +979,7 @@ export class McplServerHandle {
     const c = got.credential
     secrets.add(c.credential, c.expiresAt)
     const expiresAt = rfc3339(c.expiresAt) // RFC-015 r3 §3.2: RFC 3339, UTC, Z
-    conn.sendResponse(rid, { scheme: 'bearer', credential: c.credential, expiresAt, ...(c.principal ? { principal: c.principal } : {}) })
+    conn.sendResponse(rid, { scheme: SCHEME, credential: c.credential, expiresAt, ...(c.principal ? { principal: c.principal } : {}) })
     this.audit({ ...about, outcome: got.cached ? 'cached' : 'granted', expiresAt, ...(c.principal ? { principal: c.principal } : {}) })
   }
 

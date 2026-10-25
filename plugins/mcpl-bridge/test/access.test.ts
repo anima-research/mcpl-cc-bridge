@@ -5,7 +5,12 @@
  * with a fake issuer standing in for the identity provider.
  */
 import { afterEach, expect, test } from 'bun:test'
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { Identity } from '../src/identity'
 import {
+  ACCESS_TIME_BOUND,
   ACCESS_TTL,
   AccessRefused,
   CredentialCache,
@@ -151,11 +156,14 @@ class FakeIssuer implements AccessIssuer {
   mints: Array<{ audience: string; ttl: string }> = []
   refuse: { kind: RefusalKind; reason: string } | null = null
   lifetimeMs = 15 * 60_000
+  hang = false
+  constructor(readonly principal = 'agent:test@guest') {}
   async mint(audience: string, opts: { ttl: string }): Promise<MintedCredential> {
     this.mints.push({ audience, ttl: opts.ttl })
+    if (this.hang) await new Promise(() => {})
     if (this.refuse) throw new AccessRefused(audience, this.refuse.kind, this.refuse.reason)
     const payload = Buffer.from(JSON.stringify({ aud: audience, n: this.mints.length })).toString('base64url')
-    return { credential: `aid1.${payload}.${'c2lnbmF0dXJl'.repeat(3)}${this.mints.length}`, expiresAt: Date.now() + this.lifetimeMs, principal: 'agent:test@guest' }
+    return { credential: `aid1.${payload}.${Buffer.from(this.principal).toString('base64url')}${'c2lnbmF0dXJl'.repeat(3)}${this.mints.length}`, expiresAt: Date.now() + this.lifetimeMs, principal: this.principal }
   }
 }
 
@@ -166,7 +174,7 @@ afterEach(async () => {
 
 const SERVER_CAPS = { version: '0.5', pushEvents: true, access: { token: true }, featureSets: { apps: { description: 'apps', uses: ['access.token'] } } }
 
-async function setup(opts: { grant?: string[]; issuer?: FakeIssuer | null; transport?: Partial<{ access: string; token: string }> } = {}) {
+async function setup(opts: { grant?: string[]; issuer?: AccessIssuer | null; transport?: Partial<{ access: string; token: string }> } = {}) {
   const peer = await McplPeer.start({ mcpl: SERVER_CAPS })
   const audits: AccessAuditRecord[] = []
   const logs: string[] = []
@@ -343,4 +351,96 @@ test('transport.access with no identity configured: a dial error that says so', 
   expect(h.status).toBe('disconnected')
   expect(h.lastError).toMatch(/access "games": no identity configured/)
   expect(peer.upgrades).toHaveLength(0)
+})
+
+// ── revision 4 vectors (RFC-015 §12) ──
+
+test('vector 14: bounds — each -32602; 128 astral-plane characters are accepted', () => {
+  const field = (p: unknown) => {
+    const r = validateAccessParams(p)
+    return r.ok ? null : r.field
+  }
+  expect(field({ audience: '' })).toBe('audience')
+  expect(field({ audience: 'a'.repeat(129) })).toBe('audience')
+  expect(field({ audience: '😀'.repeat(128) })).toBeNull() // 256 UTF-16 units, 128 code points
+  expect(field({ audience: '😀'.repeat(129) })).toBe('audience')
+  expect(field({ audience: 'games', endpoint: '/mcpl' })).toBe('endpoint') // relative
+  expect(field({ audience: 'games', endpoint: 'wss://user:pw@games.example/mcpl' })).toBe('endpoint') // userinfo
+  expect(field({ audience: 'games', endpoint: 'wss://user@games.example/mcpl' })).toBe('endpoint')
+  expect(field({ audience: 'games', endpoint: `https://e.example/${'a'.repeat(2049 - 'https://e.example/'.length)}` })).toBe('endpoint') // 2049
+  expect(field({ audience: 'games', endpoint: `https://e.example/${'a'.repeat(2048 - 'https://e.example/'.length)}` })).toBeNull() // 2048
+  expect(field({ audience: 'games', fresh: 'true' })).toBe('fresh')
+  expect(field({ audience: 'games', purpose: 'line one\nline two' })).toBe('purpose')
+  expect(field({ audience: 'games', purpose: 'next line\u0085' })).toBe('purpose') // C1 control
+  expect(field({ audience: 'games', purpose: 'tab\there' })).toBe('purpose')
+  expect(field({ audience: 'games', schemes: [] })).toBe('schemes')
+  expect(field({ audience: 'games', schemes: ['bearer', ''] })).toBe('schemes')
+  expect(field({ audience: 'games', schemes: Array(9).fill('bearer') })).toBe('schemes')
+  expect(field({ audience: 'games', schemes: 'bearer' })).toBe('schemes')
+  expect(field({ audience: 'games', schemes: ['example-pop', 'bearer'], purpose: 'Doom — level 2' })).toBeNull()
+})
+
+test('vector 13: the audit drops the query and keeps a non-default port', () => {
+  expect(auditEndpoint('https://api.example:8443/v1/run?key=1')).toBe('https://api.example:8443/v1/run')
+  expect(auditEndpoint('https://api.example:443/v1/run?key=1')).toBe('https://api.example/v1/run') // 443 is https's default
+})
+
+test('vector 17: schemes — none the host can offer → -32040 host_policy; absent or including bearer → bearer', async () => {
+  const { peer, issuer, audits } = await setup()
+  await peer.policyCount(1)
+  const pop = await peer.request('access/token', { audience: 'games', schemes: ['example-pop'] })
+  expect(pop.error).toMatchObject({ code: -32040, data: { audience: 'games', kind: 'host_policy' } })
+  expect((issuer as FakeIssuer).mints).toHaveLength(0) // refused before minting
+  expect(audits.at(-1)).toMatchObject({ outcome: 'refused', refusal: 'host_policy' })
+  expect((await peer.request('access/token', { audience: 'games' })).result).toMatchObject({ scheme: 'bearer' })
+  expect((await peer.request('access/token', { audience: 'games', schemes: ['example-pop', 'bearer'] })).result).toMatchObject({ scheme: 'bearer' })
+})
+
+test('vector 16: cache — two requests share one credential, fresh mints a new one, two principals never share an entry', async () => {
+  const ada = await setup({ issuer: new FakeIssuer('agent:ada@guest') })
+  const bo = await setup({ issuer: new FakeIssuer('agent:bo@guest') })
+  await ada.peer.policyCount(1)
+  await bo.peer.policyCount(1)
+  const a1 = (await ada.peer.request('access/token', { audience: 'games' })).result as { credential: string; principal: string }
+  const a2 = (await ada.peer.request('access/token', { audience: 'games' })).result as { credential: string }
+  expect(a2.credential).toBe(a1.credential)
+  const a3 = (await ada.peer.request('access/token', { audience: 'games', fresh: true })).result as { credential: string }
+  expect(a3.credential).not.toBe(a1.credential)
+  const b1 = (await bo.peer.request('access/token', { audience: 'games' })).result as { credential: string; principal: string }
+  expect(b1.principal).toBe('agent:bo@guest')
+  expect(a1.principal).toBe('agent:ada@guest')
+  expect(b1.credential).not.toBe(a1.credential)
+  expect((bo.issuer as FakeIssuer).mints).toHaveLength(1) // bo's own mint, nothing of ada's
+})
+
+test('vector 15: a provider answer without an expiry is -32040 unavailable — no result, no silence', async () => {
+  const dir = mkdtempSync(join(process.env.MCPL_TEST_TMP ?? tmpdir(), 'mcpl-v15-'))
+  cleanup.push(() => rmSync(dir, { recursive: true, force: true }))
+  const keyPath = join(dir, 'identity-key.pem')
+  const fetchImpl = (async () => new Response(JSON.stringify({ token: 'opaque-credential-without-expiry', sub: 'agent:x@guest' }), { status: 200 })) as unknown as typeof fetch
+  const identity = new Identity({ home: 'id.example', keyPath, fetchImpl })
+  identity.keyId()
+  writeFileSync(identity.recordPath, JSON.stringify({ sub: 'agent:x@guest', name: 'x', home: 'id.example', enrolledAt: 'x' }))
+  const { peer } = await setup({ issuer: identity })
+  await peer.policyCount(1)
+  const r = await peer.request('access/token', { audience: 'games' })
+  expect(r.result).toBeUndefined()
+  expect(r.error).toMatchObject({ code: -32040, data: { audience: 'games', kind: 'unavailable', reason: 'id.example did not say when the credential expires' } })
+})
+
+test('time bound (r4 §3.4): a provider that does not answer gets the server -32040 unavailable, not silence', async () => {
+  const issuer = new FakeIssuer()
+  issuer.hang = true
+  const was = ACCESS_TIME_BOUND.ms
+  ACCESS_TIME_BOUND.ms = 200
+  try {
+    const { peer } = await setup({ issuer })
+    await peer.policyCount(1)
+    const t0 = Date.now()
+    const r = await peer.request('access/token', { audience: 'games' })
+    expect(Date.now() - t0).toBeLessThan(2000)
+    expect(r.error).toMatchObject({ code: -32040, data: { audience: 'games', kind: 'unavailable' } })
+  } finally {
+    ACCESS_TIME_BOUND.ms = was
+  }
 })

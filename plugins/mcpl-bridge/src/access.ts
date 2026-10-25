@@ -28,15 +28,21 @@ export interface AccessIssuer {
 }
 
 /**
- * RFC-015 r3 §3.3: what kind of refusal — servers branch on this, never on `reason`.
+ * RFC-015 §3.3: what kind of refusal — servers branch on this, never on
+ * `reason`. The set is open (r4); these are the ones this host sends.
  *  no_identity       the host has none to mint from (none configured, not enrolled)
- *  host_policy       the host's own policy refuses
+ *  host_policy       the host's own policy refuses — including: it can offer none of the server's `schemes`
  *  provider_refused  the identity provider said no
  *  rate_limited      the provider (or host) is throttling
- *  upstream_refused  a chain hop's own host refused (RFC §7)
- *  unavailable       no usable answer in time (unreachable, an error, an answer without a credential or expiry)
+ *  unavailable       no usable answer within the time bound (unreachable, an error, no credential or no expiry)
+ * (This host is no chain hop, so it never forwards a refusal.)
  */
-export type RefusalKind = 'no_identity' | 'host_policy' | 'provider_refused' | 'rate_limited' | 'upstream_refused' | 'unavailable'
+export type RefusalKind = 'no_identity' | 'host_policy' | 'provider_refused' | 'rate_limited' | 'unavailable'
+
+/** RFC-015 r4 §3.4: answer an access/token within this (exported for tests). The provider call itself is bounded shorter. */
+export const ACCESS_TIME_BOUND = { ms: 20_000 }
+/** The only credential scheme this host mints. */
+export const SCHEME = 'bearer'
 
 /** A refusal from (or for want of) the identity provider: becomes -32040 `{ audience, kind, reason }`. Never carries a credential. */
 export class AccessRefused extends Error {
@@ -71,7 +77,7 @@ export function auditEndpoint(endpoint: unknown): string | undefined {
   return (u.host ? `${u.protocol}//${u.host}${u.pathname}` : `${u.protocol}${u.pathname}`).slice(0, 512)
 }
 
-export type AccessTokenParams = { audience: string; endpoint?: string; purpose?: string; fresh?: boolean }
+export type AccessTokenParams = { audience: string; endpoint?: string; purpose?: string; fresh?: boolean; schemes?: string[] }
 
 export type ParamsCheck = { ok: true; params: AccessTokenParams } | { ok: false; field: string; reason: string }
 
@@ -79,8 +85,10 @@ export type ParamsCheck = { ok: true; params: AccessTokenParams } | { ok: false;
  * `_meta` is MCP's reserved request member (every request's params may carry
  * it), not an RFC-015 member — accepted when it is an object, and ignored.
  */
-const MEMBERS = new Set(['audience', 'endpoint', 'purpose', 'fresh', '_meta'])
+const MEMBERS = new Set(['audience', 'endpoint', 'purpose', 'fresh', 'schemes', '_meta'])
 const ENDPOINT_MAX = 2048
+/** C0 and C1 controls, and DEL (r4 §3.1): a purpose reaches the audit as data. */
+const CONTROL = /[\u0000-\u001f\u007f-\u009f]/
 
 /** Length in code points, so a limit means characters rather than UTF-16 halves. */
 const chars = (s: string) => [...s].length
@@ -91,24 +99,32 @@ export function validateAccessParams(raw: unknown): ParamsCheck {
   if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) return bad('params', 'must be an object')
   const p = raw as Record<string, unknown>
   for (const k of Object.keys(p)) if (!MEMBERS.has(k)) return bad(k, 'unknown member')
-  const { audience, endpoint, purpose, fresh, _meta } = p
+  const { audience, endpoint, purpose, fresh, schemes, _meta } = p
   if (audience === undefined) return bad('audience', 'required')
   if (typeof audience !== 'string') return bad('audience', 'must be a string')
   if (chars(audience) < 1 || chars(audience) > 128) return bad('audience', 'must be 1-128 characters')
   if (endpoint !== undefined) {
     if (typeof endpoint !== 'string') return bad('endpoint', 'must be a string (URI)')
-    if (endpoint.length > ENDPOINT_MAX) return bad('endpoint', `must be at most ${ENDPOINT_MAX} characters`)
+    if (chars(endpoint) > ENDPOINT_MAX) return bad('endpoint', `must be at most ${ENDPOINT_MAX} characters`)
+    let u: URL
     try {
-      new URL(endpoint)
+      u = new URL(endpoint)
     } catch {
       return bad('endpoint', 'must be an absolute URI')
     }
+    // r4 §3.1: no userinfo — where some deployments carry a credential.
+    if (u.username || u.password || /^[a-z][a-z0-9+.-]*:\/\/[^/?#]*@/i.test(endpoint)) return bad('endpoint', 'must not carry userinfo')
   }
   if (purpose !== undefined) {
     if (typeof purpose !== 'string') return bad('purpose', 'must be a string')
     if (chars(purpose) > 256) return bad('purpose', 'must be at most 256 characters')
+    if (CONTROL.test(purpose)) return bad('purpose', 'must not contain control characters')
   }
   if (fresh !== undefined && typeof fresh !== 'boolean') return bad('fresh', 'must be a boolean')
+  if (schemes !== undefined) {
+    if (!Array.isArray(schemes) || schemes.length < 1 || schemes.length > 8) return bad('schemes', 'must be an array of 1-8 scheme names')
+    if (!schemes.every(x => typeof x === 'string' && x.length > 0 && chars(x) <= 64)) return bad('schemes', 'must hold non-empty strings')
+  }
   if (_meta !== undefined && (typeof _meta !== 'object' || _meta === null || Array.isArray(_meta))) return bad('_meta', 'must be an object')
   return {
     ok: true,
@@ -117,6 +133,7 @@ export function validateAccessParams(raw: unknown): ParamsCheck {
       ...(endpoint !== undefined ? { endpoint } : {}),
       ...(purpose !== undefined ? { purpose } : {}),
       ...(fresh !== undefined ? { fresh } : {}),
+      ...(schemes !== undefined ? { schemes: schemes as string[] } : {}),
     },
   }
 }
