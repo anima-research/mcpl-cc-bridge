@@ -72,7 +72,7 @@ test('mint: signed token statement with ttl; expiresAt from the reply, else from
   const idn = new Identity({ home: 'id.example', keyPath, fetchImpl: f })
 
   // not enrolled: refused locally, nothing sent
-  await expect(idn.mint('games', { ttl: '15m' })).rejects.toThrow(AccessRefused)
+  await expect(idn.mint('games', { ttl: '15m' })).rejects.toMatchObject({ kind: 'no_identity' })
   expect(calls).toHaveLength(0)
   idn.keyId() // creates the key (and its directory)
   writeFileSync(idn.recordPath, JSON.stringify({ sub: 'agent:cc@guest', name: 'cc', home: 'id.example', enrolledAt: 'x' }))
@@ -94,16 +94,25 @@ test('mint: signed token statement with ttl; expiresAt from the reply, else from
 
   // no expiry anywhere → MUST NOT answer (RFC-015 §3.2)
   reply = { status: 200, json: { token: 'opaque-credential-without-exp' } }
-  await expect(idn.mint('games')).rejects.toMatchObject({ reason: 'id.example did not say when the credential expires' })
+  await expect(idn.mint('games')).rejects.toMatchObject({ kind: 'unavailable', reason: 'id.example did not say when the credential expires' })
 
   reply = { status: 403, json: { error: 'audience not allowed' } }
   const e = await idn.mint('orrery').catch(x => x)
   expect(e).toBeInstanceOf(AccessRefused)
-  expect(e).toMatchObject({ audience: 'orrery', reason: 'id.example refused: audience not allowed' })
+  expect(e).toMatchObject({ audience: 'orrery', kind: 'provider_refused', reason: 'id.example refused: audience not allowed' })
+  // RFC-015 r3 refusal kinds by what the provider said
+  reply = { status: 400, json: { error: 'unknown audience' } }
+  expect(await idn.mint('nope').catch(x => x)).toMatchObject({ kind: 'provider_refused' })
+  reply = { status: 429, json: { error: 'rate limited' } }
+  expect(await idn.mint('games').catch(x => x)).toMatchObject({ kind: 'rate_limited', reason: 'id.example is rate-limiting: rate limited' })
+  reply = { status: 503, json: {} }
+  expect(await idn.mint('games').catch(x => x)).toMatchObject({ kind: 'unavailable', reason: 'id.example gave no credential: HTTP 503' })
+  const down = new Identity({ home: 'id.example', keyPath, fetchImpl: (async () => { throw new Error('connect ECONNREFUSED') }) as unknown as typeof fetch })
+  expect(await down.mint('games').catch(x => x)).toMatchObject({ kind: 'unavailable', reason: 'id.example unreachable: connect ECONNREFUSED' })
 
   // a record from another home is not this identity
   writeFileSync(idn.recordPath, JSON.stringify({ sub: 'agent:cc@guest', name: 'cc', home: 'id.elsewhere', enrolledAt: 'x' }))
-  await expect(idn.mint('games')).rejects.toMatchObject({ reason: 'this host is enrolled with id.elsewhere, not id.example' })
+  await expect(idn.mint('games')).rejects.toMatchObject({ kind: 'no_identity', reason: 'this host is enrolled with id.elsewhere, not id.example' })
 })
 
 test('aid1Payload reads exp/sub; anything else is null', () => {

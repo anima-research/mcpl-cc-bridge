@@ -10,7 +10,10 @@ import {
   AccessRefused,
   CredentialCache,
   RENEW_EARLY_MS,
+  auditEndpoint,
+  rfc3339,
   validateAccessParams,
+  type RefusalKind,
   type AccessAuditRecord,
   type AccessIssuer,
   type MintedCredential,
@@ -64,6 +67,7 @@ test('access.token is granted only by name: never by default, never by a wildcar
   expect(computeGrant(advertised, DEFAULT_GRANT)).not.toContain('access.token')
   expect(computeGrant(advertised, ['pushEvents', 'access.token'])).toEqual(['pushEvents', 'access.token'])
   expect(computeGrant(advertised, ['access.*'])).toEqual([])
+  expect(computeGrant(advertised, ['*.token'])).toEqual([]) // RFC §12 vector 10
   expect(computeGrant(advertised, ['*.*', '*'])).toEqual(['pushEvents'])
   expect(wildcardOnlyMatches(advertised, ['access.*'])).toEqual(['access.token'])
   expect(wildcardOnlyMatches(advertised, ['access.*', 'access.token'])).toEqual([])
@@ -73,6 +77,15 @@ test('access.token is granted only by name: never by default, never by a wildcar
   const fs = { apps: { description: 'apps', uses: ['pushEvents', 'access.token'] } } as never
   expect(deriveFeatureSets(fs, ['pushEvents', 'access.token']).enabled).toEqual(['apps'])
   expect(deriveFeatureSets(fs, ['pushEvents']).disabled.apps?.reason).toBe('capability_denied')
+})
+
+test('RFC 3339 UTC expiry and audited endpoints without userinfo, query or fragment (r3 §3.2, §8.2)', () => {
+  expect(rfc3339(Date.UTC(2026, 9, 25, 4, 15, 0))).toBe('2026-10-25T04:15:00Z')
+  expect(rfc3339(Date.UTC(2026, 9, 25, 4, 15, 0, 250))).toBe('2026-10-25T04:15:00.250Z')
+  expect(auditEndpoint('wss://user:pw@games.example:8443/mcpl?token=abc#frag')).toBe('wss://games.example:8443/mcpl')
+  expect(auditEndpoint('https://api.example/v1/run?key=1')).toBe('https://api.example/v1/run')
+  expect(auditEndpoint('urn:example:service?x')).toBe('urn:example:service')
+  expect(auditEndpoint('not a uri')).toBeUndefined()
 })
 
 test('the host advertises access only when it can mint', () => {
@@ -136,11 +149,11 @@ test('redaction: known credentials, aid1-shaped tokens, and (in logs) ?token= va
 
 class FakeIssuer implements AccessIssuer {
   mints: Array<{ audience: string; ttl: string }> = []
-  refuse: string | null = null
+  refuse: { kind: RefusalKind; reason: string } | null = null
   lifetimeMs = 15 * 60_000
   async mint(audience: string, opts: { ttl: string }): Promise<MintedCredential> {
     this.mints.push({ audience, ttl: opts.ttl })
-    if (this.refuse) throw new AccessRefused(audience, this.refuse)
+    if (this.refuse) throw new AccessRefused(audience, this.refuse.kind, this.refuse.reason)
     const payload = Buffer.from(JSON.stringify({ aud: audience, n: this.mints.length })).toString('base64url')
     return { credential: `aid1.${payload}.${'c2lnbmF0dXJl'.repeat(3)}${this.mints.length}`, expiresAt: Date.now() + this.lifetimeMs, principal: 'agent:test@guest' }
   }
@@ -183,6 +196,7 @@ test('host advertises access and grants access.token by name; a granted request 
   const r = await peer.request('access/token', { audience: 'games', endpoint: 'wss://games.example/mcpl', purpose: 'doom-1: opened by the agent' })
   const res = r.result as { scheme: string; credential: string; expiresAt: string; principal: string }
   expect(res.scheme).toBe('bearer')
+  expect(res.expiresAt).toMatch(/^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(\.\d+)?Z$/) // RFC 3339, UTC
   expect(res.credential.startsWith('aid1.')).toBe(true)
   expect(res.principal).toBe('agent:test@guest')
   const left = Date.parse(res.expiresAt) - Date.now()
@@ -203,6 +217,20 @@ test('host advertises access and grants access.token by name; a granted request 
   // the audit never carries a credential
   expect(JSON.stringify(audits)).not.toContain(res.credential)
   expect(JSON.stringify(audits)).not.toContain(fresh.credential)
+})
+
+test('the audit keeps an endpoint\'s scheme, host and path only — never userinfo, query or fragment (vector 13)', async () => {
+  const { peer, audits, logs } = await setup()
+  await peer.policyCount(1)
+  const leaky = 'wss://user:pw@games.example:8443/mcpl?token=abc123secret#frag'
+  await peer.request('access/token', { audience: 'games', endpoint: leaky })
+  await peer.request('access/token', { audience: 'games', endpoint: leaky, bogus: 1 }) // invalid: audited from raw params
+  expect(audits.map(a => a.endpoint)).toEqual(['wss://games.example:8443/mcpl', 'wss://games.example:8443/mcpl'])
+  for (const text of [JSON.stringify(audits), logs.join('\n')]) {
+    expect(text).not.toContain('abc123secret')
+    expect(text).not.toContain('user:pw')
+    expect(text).not.toContain('#frag')
+  }
 })
 
 test('a credential near its expiry is not handed out again', async () => {
@@ -251,15 +279,17 @@ test('malformed params from a granted server: -32602 with { field, reason }', as
   expect(audits.map(a => a.outcome)).toEqual(['invalid', 'invalid'])
 })
 
-test('identity provider refuses → -32040 { audience, reason }, no credential; no identity → -32040 and no advertisement', async () => {
+test('identity provider refuses → -32040 { audience, kind, reason }, no credential; no identity → kind no_identity and no advertisement', async () => {
   const issuer = new FakeIssuer()
-  issuer.refuse = 'id.example refused: audience not allowed'
+  issuer.refuse = { kind: 'provider_refused', reason: 'id.example refused: audience not allowed' }
   const a = await setup({ issuer })
   await a.peer.policyCount(1)
   const r = await a.peer.request('access/token', { audience: 'orrery' })
   expect(r.result).toBeUndefined()
-  expect(r.error).toMatchObject({ code: -32040, data: { audience: 'orrery', reason: 'id.example refused: audience not allowed' } })
-  expect(a.audits[0]).toMatchObject({ outcome: 'refused', audience: 'orrery', reason: 'id.example refused: audience not allowed' })
+  expect(r.error).toMatchObject({ code: -32040, data: { audience: 'orrery', kind: 'provider_refused', reason: 'id.example refused: audience not allowed' } })
+  expect(a.audits[0]).toMatchObject({ outcome: 'refused', audience: 'orrery', refusal: 'provider_refused', reason: 'id.example refused: audience not allowed' })
+  issuer.refuse = { kind: 'rate_limited', reason: 'slow down' }
+  expect((await a.peer.request('access/token', { audience: 'orrery' })).error?.data).toEqual({ audience: 'orrery', kind: 'rate_limited', reason: 'slow down' })
 
   const b = await setup({ issuer: null })
   await b.peer.policyCount(1)
@@ -267,7 +297,7 @@ test('identity provider refuses → -32040 { audience, reason }, no credential; 
   expect('access' in init.capabilities.experimental.mcpl).toBe(false)
   expect(b.logs.some(l => /access\.token granted but no identity/.test(l))).toBe(true)
   const r2 = await b.peer.request('access/token', { audience: 'games' })
-  expect(r2.error).toMatchObject({ code: -32040, data: { audience: 'games', reason: 'this host has no identity to mint from' } })
+  expect(r2.error).toMatchObject({ code: -32040, data: { audience: 'games', kind: 'no_identity', reason: 'this host has no identity to mint from' } }) // RFC §12 vector 12
 })
 
 test('revoking access.token by manifest change takes effect for the next request', async () => {
@@ -301,7 +331,7 @@ test('per-dial minting: transport.access credential at the upgrade, fresh at eac
   expect(issuer!.mints.map(m => m.audience)).toEqual(['games', 'games', 'games'])
   expect(audits.filter(a => a.kind === 'dial').map(a => a.outcome)).toEqual(['granted', 'granted', 'granted'])
 
-  issuer!.refuse = 'id.example refused: principal expired'
+  issuer!.refuse = { kind: 'provider_refused', reason: 'id.example refused: principal expired' }
   await h.restart()
   expect(h.status).toBe('disconnected')
   expect(h.lastError).toBe('connect failed: access "games": id.example refused: principal expired')

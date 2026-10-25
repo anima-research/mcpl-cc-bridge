@@ -197,7 +197,9 @@ identity provider — and use it two ways:
   15-minute lifetime and cached per (server, audience) until 60 s before it
   expires (`fresh: true` bypasses the cache). Errors: `-32002` without the
   grant, `-32602` for malformed or unknown params members, `-32040
-  { audience, reason }` when there is no identity or the issuer refuses.
+  { audience, kind, reason }` when there is no identity (`no_identity`), the
+  issuer refuses (`provider_refused`) or throttles (`rate_limited`), or gives no
+  usable answer (`unavailable`). `expiresAt` is RFC 3339 UTC (`…Z`).
   Granting `access.token` is the whole trust decision — there is no
   per-audience list; the issuer's policy for the principal is the bound. It is
   never in the default grant, and a wildcard (`access.*`, `*.*`) does not grant
@@ -208,8 +210,9 @@ identity provider — and use it two ways:
 `identity-key.json`). `identity.url` overrides the issuer base URL
 (`https://<home>`) for a local issuer; plain `http://` only to loopback.
 Every request and access dial is audited to
-`~/.claude/mcpl-bridge/access-audit.jsonl` (server, audience, endpoint,
-purpose, outcome, expiry — never the credential).
+`~/.claude/mcpl-bridge/access-audit.jsonl` (server, audience, endpoint as
+scheme/host/path only, purpose, outcome and refusal kind, expiry — never the
+credential).
 
 Credentials never reach the model: tool results, tool lists, channel
 notifications, hook context, `mcpl_status`, error strings and logs all pass a

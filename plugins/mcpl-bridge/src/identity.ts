@@ -17,7 +17,7 @@
 import { createPrivateKey, createPublicKey, generateKeyPairSync, sign as cryptoSign, type KeyObject } from 'node:crypto'
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
 import { dirname } from 'node:path'
-import type { AccessIssuer, MintedCredential } from './access'
+import type { AccessIssuer, MintedCredential, RefusalKind } from './access'
 import { AccessRefused } from './access'
 import { secrets } from './redact'
 
@@ -82,12 +82,12 @@ export class Identity implements AccessIssuer {
    * issuer is unreachable, refuses, or answers without a stated expiry.
    */
   async mint(audience: string, opts: { ttl?: string } = {}): Promise<MintedCredential> {
-    const refuse = (reason: string): never => {
-      throw new AccessRefused(audience, secrets.scrubLog(reason).slice(0, REASON_MAX))
+    const refuse = (kind: RefusalKind, reason: string): never => {
+      throw new AccessRefused(audience, kind, secrets.scrubLog(reason).slice(0, REASON_MAX))
     }
     const rec = this.record()
-    if (!rec) refuse(`this host is not enrolled with ${this.home} (operator: identity-cli enroll)`)
-    if (rec!.home !== this.home) refuse(`this host is enrolled with ${rec!.home}, not ${this.home}`)
+    if (!rec) refuse('no_identity', `this host is not enrolled with ${this.home} (operator: identity-cli enroll)`)
+    if (rec!.home !== this.home) refuse('no_identity', `this host is enrolled with ${rec!.home}, not ${this.home}`)
     const key = this.loadOrCreateKey()
     const timestamp = new Date().toISOString()
     const proof = cryptoSign(null, Buffer.from(tokenStatement(this.home, audience, timestamp), 'utf8'), key.privateKey).toString('base64url')
@@ -95,11 +95,15 @@ export class Identity implements AccessIssuer {
     try {
       res = await this.post('/token', { id: key.id, audience, timestamp, proof, ...(opts.ttl ? { ttl: opts.ttl } : {}) })
     } catch (e) {
-      return refuse(`${this.home} unreachable: ${e instanceof Error ? e.message : String(e)}`)
+      return refuse('unavailable', `${this.home} unreachable: ${e instanceof Error ? e.message : String(e)}`)
     }
     const token = res.json.token
     if (res.status !== 200 || typeof token !== 'string' || !token) {
-      return refuse(`${this.home} refused: ${typeof res.json.error === 'string' ? res.json.error : `HTTP ${res.status}`}`)
+      const said = typeof res.json.error === 'string' ? res.json.error : `HTTP ${res.status}`
+      // 429: throttled; 5xx, or a 200 without a token: no usable answer; any other status: the provider said no.
+      if (res.status === 429) return refuse('rate_limited', `${this.home} is rate-limiting: ${said}`)
+      if (res.status >= 500 || res.status === 200) return refuse('unavailable', `${this.home} gave no credential: ${said}`)
+      return refuse('provider_refused', `${this.home} refused: ${said}`)
     }
     // RFC-015 §3.2: a host that cannot state the expiry MUST NOT answer. The
     // reply's `exp` (archipelago-home token-ttl), else the token's own claim.
@@ -108,9 +112,9 @@ export class Identity implements AccessIssuer {
     const known = typeof exp === 'number' && Number.isFinite(exp)
     // The credential exists from here: track it for redaction before anything can print it.
     secrets.add(token, known ? exp * 1000 : undefined)
-    if (!known) return refuse(`${this.home} did not say when the credential expires`)
+    if (!known) return refuse('unavailable', `${this.home} did not say when the credential expires`)
     const expiresAt = (exp as number) * 1000
-    if (expiresAt <= Date.now()) return refuse(`${this.home} returned an expired credential`)
+    if (expiresAt <= Date.now()) return refuse('unavailable', `${this.home} returned an expired credential`)
     const principal = typeof res.json.sub === 'string' ? res.json.sub : typeof payload?.sub === 'string' ? payload.sub : rec!.sub
     return { credential: token, expiresAt, principal }
   }

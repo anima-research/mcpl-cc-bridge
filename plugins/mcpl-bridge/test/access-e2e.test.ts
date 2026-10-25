@@ -132,7 +132,7 @@ e2e('a server granted access.token gets a credential for "games" that verifies w
   expect(p.sub).toBe(rec.sub)
   expect(res.principal).toBe(rec.sub)
   expect(p.exp - p.iat).toBe(15 * 60)
-  expect(res.expiresAt).toBe(new Date(p.exp * 1000).toISOString())
+  expect(res.expiresAt).toBe(new Date(p.exp * 1000).toISOString().replace('.000Z', 'Z')) // RFC 3339 UTC
   const left = p.exp * 1000 - Date.now()
   expect(left).toBeGreaterThan(14 * 60_000)
   expect(left).toBeLessThanOrEqual(15 * 60_000)
@@ -154,9 +154,9 @@ e2e('an audience the principal lacks: -32040 carrying the issuer\'s reason', asy
   await peer.policyCount(1)
   const r = await peer.request('access/token', { audience: 'orrery' })
   expect(r.result).toBeUndefined()
-  expect(r.error).toMatchObject({ code: -32040, data: { audience: 'orrery', reason: `${HOME} refused: audience not allowed` } })
+  expect(r.error).toMatchObject({ code: -32040, data: { audience: 'orrery', kind: 'provider_refused', reason: `${HOME} refused: audience not allowed` } })
   const u = await peer.request('access/token', { audience: 'no-such-service' })
-  expect(u.error).toMatchObject({ code: -32040, data: { audience: 'no-such-service', reason: `${HOME} refused: unknown audience` } })
+  expect(u.error).toMatchObject({ code: -32040, data: { audience: 'no-such-service', kind: 'provider_refused', reason: `${HOME} refused: unknown audience` } })
 })
 
 e2e('transport.access: a fresh, valid token at the upgrade — on connect, on a forced reconnect, and on a server-side drop', async () => {

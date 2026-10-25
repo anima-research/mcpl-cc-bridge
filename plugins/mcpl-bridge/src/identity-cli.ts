@@ -16,7 +16,7 @@
  */
 import { existsSync } from 'fs'
 import { join, resolve } from 'path'
-import { ACCESS_TTL, AccessRefused } from './access'
+import { ACCESS_TTL, AccessRefused, rfc3339 } from './access'
 import { configPath, loadConfig, resolveIdentity } from './config'
 import { Identity } from './identity'
 
@@ -80,9 +80,9 @@ async function main(): Promise<void> {
       try {
         const c = await id.mint(aud, { ttl: ACCESS_TTL })
         const mins = Math.round((c.expiresAt - Date.now()) / 60_000)
-        console.log(`check    ${aud}: ok — ${c.principal ?? 'principal unknown'}, expires ${new Date(c.expiresAt).toISOString()} (~${mins} min)`)
+        console.log(`check    ${aud}: ok — ${c.principal ?? 'principal unknown'}, expires ${rfc3339(c.expiresAt)} (~${mins} min)`)
       } catch (e) {
-        console.log(`check    ${aud}: refused — ${e instanceof AccessRefused ? e.reason : e instanceof Error ? e.message : e}`)
+        console.log(`check    ${aud}: refused — ${e instanceof AccessRefused ? `${e.reason} (${e.kind})` : e instanceof Error ? e.message : e}`)
         process.exitCode = 2
       }
     }

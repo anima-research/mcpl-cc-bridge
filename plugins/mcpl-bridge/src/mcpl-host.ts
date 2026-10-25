@@ -49,8 +49,11 @@ import {
   ACCESS_TTL,
   AccessRefused,
   CredentialCache,
+  auditEndpoint,
   auditFields,
+  rfc3339,
   validateAccessParams,
+  type RefusalKind,
   type AccessAuditRecord,
   type AccessIssuer,
 } from './access'
@@ -264,6 +267,7 @@ export class McplServerHandle {
     const full: AccessAuditRecord = { at: new Date().toISOString(), server: this.id, ...rec }
     this.log(
       `access ${full.kind} "${full.audience}": ${full.outcome}` +
+        (full.refusal ? ` (${full.refusal})` : '') +
         (full.expiresAt ? ` until ${full.expiresAt}` : '') +
         (full.reason ? ` — ${full.reason}` : '') +
         (full.endpoint ? ` endpoint=${full.endpoint}` : '') +
@@ -288,17 +292,18 @@ export class McplServerHandle {
     const issuer = this.cb.issuer?.() ?? null
     if (!issuer) {
       const reason = 'no identity configured (add "identity" to the bridge config)'
-      this.audit({ kind: 'dial', audience, outcome: 'refused', reason })
+      this.audit({ kind: 'dial', audience, outcome: 'refused', refusal: 'no_identity', reason })
       throw new Error(`access "${audience}": ${reason}`)
     }
     try {
       const c = await issuer.mint(audience, { ttl: ACCESS_TTL })
       secrets.add(c.credential, c.expiresAt)
-      this.audit({ kind: 'dial', audience, outcome: 'granted', expiresAt: new Date(c.expiresAt).toISOString(), ...(c.principal ? { principal: c.principal } : {}) })
+      this.audit({ kind: 'dial', audience, outcome: 'granted', expiresAt: rfc3339(c.expiresAt), ...(c.principal ? { principal: c.principal } : {}) })
       return c.credential
     } catch (e) {
+      const refusal: RefusalKind = e instanceof AccessRefused ? e.kind : 'unavailable'
       const reason = e instanceof AccessRefused ? e.reason : secrets.scrubLog(e instanceof Error ? e.message : String(e))
-      this.audit({ kind: 'dial', audience, outcome: 'refused', reason })
+      this.audit({ kind: 'dial', audience, outcome: 'refused', refusal, reason })
       throw new Error(`access "${audience}": ${reason}`)
     }
   }
@@ -937,18 +942,21 @@ export class McplServerHandle {
       return
     }
     const { audience, endpoint, purpose, fresh } = check.params
-    const about = { kind: 'request' as const, audience, ...(endpoint !== undefined ? { endpoint } : {}), ...(purpose !== undefined ? { purpose } : {}) }
-    const refuse = (reason: string) => {
-      conn.sendError(rid, ERR.ACCESS_REFUSED, 'Access refused', { audience, reason })
-      this.audit({ ...about, outcome: 'refused', reason })
+    // RFC-015 r3 §8.2: the audit keeps the endpoint's scheme, host and path only.
+    const audited = auditEndpoint(endpoint)
+    const about = { kind: 'request' as const, audience, ...(audited !== undefined ? { endpoint: audited } : {}), ...(purpose !== undefined ? { purpose } : {}) }
+    const refuse = (kind: RefusalKind, reason: string) => {
+      conn.sendError(rid, ERR.ACCESS_REFUSED, 'Access refused', { audience, kind, reason })
+      this.audit({ ...about, outcome: 'refused', refusal: kind, reason })
     }
     const issuer = this.cb.issuer?.() ?? null
-    if (!issuer) return refuse('this host has no identity to mint from')
+    if (!issuer) return refuse('no_identity', 'this host has no identity to mint from')
     let got: Awaited<ReturnType<CredentialCache['get']>>
     try {
       got = await this.accessCache.get(audience, fresh === true, () => issuer.mint(audience, { ttl: ACCESS_TTL }))
     } catch (e) {
-      return refuse(e instanceof AccessRefused ? e.reason : `could not mint: ${secrets.scrubLog(e instanceof Error ? e.message : String(e))}`)
+      if (e instanceof AccessRefused) return refuse(e.kind, e.reason)
+      return refuse('unavailable', `could not mint: ${secrets.scrubLog(e instanceof Error ? e.message : String(e))}`)
     }
     // The mint took time: a grant revoked meanwhile (manifest change) or a
     // connection replaced meanwhile gets nothing.
@@ -959,7 +967,7 @@ export class McplServerHandle {
     }
     const c = got.credential
     secrets.add(c.credential, c.expiresAt)
-    const expiresAt = new Date(c.expiresAt).toISOString()
+    const expiresAt = rfc3339(c.expiresAt) // RFC-015 r3 §3.2: RFC 3339, UTC, Z
     conn.sendResponse(rid, { scheme: 'bearer', credential: c.credential, expiresAt, ...(c.principal ? { principal: c.principal } : {}) })
     this.audit({ ...about, outcome: got.cached ? 'cached' : 'granted', expiresAt, ...(c.principal ? { principal: c.principal } : {}) })
   }

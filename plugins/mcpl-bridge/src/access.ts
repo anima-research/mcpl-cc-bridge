@@ -27,15 +27,48 @@ export interface AccessIssuer {
   mint(audience: string, opts: { ttl: string }): Promise<MintedCredential>
 }
 
-/** A refusal from (or for want of) the identity provider: becomes -32040 `{ audience, reason }`. Never carries a credential. */
+/**
+ * RFC-015 r3 §3.3: what kind of refusal — servers branch on this, never on `reason`.
+ *  no_identity       the host has none to mint from (none configured, not enrolled)
+ *  host_policy       the host's own policy refuses
+ *  provider_refused  the identity provider said no
+ *  rate_limited      the provider (or host) is throttling
+ *  upstream_refused  a chain hop's own host refused (RFC §7)
+ *  unavailable       no usable answer in time (unreachable, an error, an answer without a credential or expiry)
+ */
+export type RefusalKind = 'no_identity' | 'host_policy' | 'provider_refused' | 'rate_limited' | 'upstream_refused' | 'unavailable'
+
+/** A refusal from (or for want of) the identity provider: becomes -32040 `{ audience, kind, reason }`. Never carries a credential. */
 export class AccessRefused extends Error {
   constructor(
     readonly audience: string,
+    readonly kind: RefusalKind,
     readonly reason: string,
   ) {
-    super(`access "${audience}" refused: ${reason}`)
+    super(`access "${audience}" refused (${kind}): ${reason}`)
     this.name = 'AccessRefused'
   }
+}
+
+/** RFC 3339 in UTC with a `Z` (RFC-015 r3 §3.2): `2026-10-25T04:15:00Z` — no milliseconds when there are none. */
+export function rfc3339(ms: number): string {
+  return new Date(ms).toISOString().replace(/\.000Z$/, 'Z')
+}
+
+/**
+ * An endpoint as the audit keeps it (RFC-015 r3 §8.2): scheme, host and path —
+ * never userinfo, query or fragment, where some deployments carry tokens.
+ * Undefined for something that is not a URI.
+ */
+export function auditEndpoint(endpoint: unknown): string | undefined {
+  if (typeof endpoint !== 'string' || !endpoint) return undefined
+  let u: URL
+  try {
+    u = new URL(endpoint)
+  } catch {
+    return undefined
+  }
+  return (u.host ? `${u.protocol}//${u.host}${u.pathname}` : `${u.protocol}${u.pathname}`).slice(0, 512)
 }
 
 export type AccessTokenParams = { audience: string; endpoint?: string; purpose?: string; fresh?: boolean }
@@ -151,16 +184,18 @@ export type AccessAuditRecord = {
   endpoint?: string
   purpose?: string
   outcome: 'granted' | 'cached' | 'refused' | 'denied' | 'invalid'
+  /** For outcome "refused": the -32040 kind. */
+  refusal?: RefusalKind
   reason?: string
   expiresAt?: string
   principal?: string
 }
 
-/** Audit fields from params that may not have validated: strings only, bounded. */
+/** Audit fields from params that may not have validated: strings only, bounded, the endpoint reduced to scheme/host/path. */
 export function auditFields(raw: unknown): { audience: string; endpoint?: string; purpose?: string } {
   const p = (raw && typeof raw === 'object' && !Array.isArray(raw) ? raw : {}) as Record<string, unknown>
   const cut = (v: unknown, n: number) => (typeof v === 'string' ? v.slice(0, n) : undefined)
-  const endpoint = cut(p.endpoint, 512)
+  const endpoint = auditEndpoint(p.endpoint)
   const purpose = cut(p.purpose, 256)
   return { audience: cut(p.audience, 128) ?? '', ...(endpoint !== undefined ? { endpoint } : {}), ...(purpose !== undefined ? { purpose } : {}) }
 }
