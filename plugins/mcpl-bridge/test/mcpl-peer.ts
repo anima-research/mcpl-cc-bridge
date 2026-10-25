@@ -22,6 +22,8 @@ export type PeerOptions = {
   listRev?: number
   /** Answers for other host → server methods (toolsets/list, …). */
   handlers?: Record<string, (params: Record<string, unknown>) => unknown>
+  /** Methods this peer never answers (a lost result). */
+  silent?: string[]
 }
 
 export class McplPeer {
@@ -102,6 +104,7 @@ export class McplPeer {
     const id = msg.id
     const params = (msg.params ?? {}) as Json
     if (id != null) this.received.push(String(msg.method))
+    if (this.opts.silent?.includes(String(msg.method))) return
     const custom = this.opts.handlers?.[String(msg.method)]
     if (custom) {
       this.send(ws, { id, result: custom(params) })

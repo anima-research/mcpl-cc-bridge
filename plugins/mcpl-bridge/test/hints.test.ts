@@ -7,7 +7,7 @@
 import { afterEach, expect, test } from 'bun:test'
 import type { ServerConfig } from '../src/config'
 import { callMetaTool } from '../src/meta-tools'
-import { McplServerHandle, type IncomingDelivery } from '../src/mcpl-host'
+import { McplServerHandle, REQUEST_TIMEOUTS, type IncomingDelivery } from '../src/mcpl-host'
 import { ToolPresence, keyOf } from '../src/presence'
 import { firstSentence, renderToolLines, signature } from '../src/tool-render'
 import { WakeGate } from '../src/wake'
@@ -49,21 +49,21 @@ function goLike(): ToolPresence {
   return p
 }
 
-test('hint changes apply in rev order; a stale rev is ignored; visibility is per instance; open/closed from toolsets entries', () => {
+test('hint changes apply in rev order; a reversal or a gap is flagged for recovery; visibility is per instance; open/closed from toolsets entries', () => {
   const p = goLike()
   expect(p.presents).toBe(true)
   expect(p.presenceOf('games')).toBe('static')
   expect(p.presenceOf('play')).toBe('dynamic')
   const before = p.view()
-  expect(p.apply({ rev: 2, toolsets: [{ toolset: 'game', instance: 'a', state: 'open', title: 'Go vs bot' }], tools: [{ name: 'play', instance: 'a', visible: true }, { name: 'pass', instance: 'a', visible: true }] })).toMatchObject({ applied: true })
+  expect(p.apply({ rev: 2, toolsets: [{ toolset: 'game', instance: 'a', state: 'open', title: 'Go vs bot' }], tools: [{ name: 'play', instance: 'a', visible: true }, { name: 'pass', instance: 'a', visible: true }] })).toMatchObject({ applied: true, gap: true })
   const cs = p.diff(before, p.view())
   expect(cs.changes).toHaveLength(1)
   expect(cs.changes[0]).toMatchObject({ key: keyOf('game', 'a'), opened: true, title: 'Go vs bot' })
   expect(cs.changes[0]!.appeared.map(t => t.name)).toEqual(['play', 'pass'])
-  // rev 1 after 2: out of order, never applied — stale (what it said may be missing)
-  expect(p.apply({ rev: 1, tools: [{ name: 'play', instance: 'a', visible: false }] })).toMatchObject({ applied: false, stale: true, duplicate: false })
-  // rev 2 again: already applied — a duplicate, each rev applies once (RFC §6.1)
-  expect(p.apply({ rev: 2, tools: [{ name: 'play', instance: 'a', visible: false }] })).toMatchObject({ applied: false, stale: false, duplicate: true })
+  // the first change skipped rev 1, which this host never saw: applied, and flagged as a gap
+  // rev 1 after 2, and rev 2 again: reversals — ignored, flagged for recovery (r3 §6.1)
+  expect(p.apply({ rev: 1, tools: [{ name: 'play', instance: 'a', visible: false }] })).toMatchObject({ applied: false, reversal: true })
+  expect(p.apply({ rev: 2, tools: [{ name: 'play', instance: 'a', visible: false }] })).toMatchObject({ applied: false, reversal: true })
   expect([...p.view().get(keyOf('game', 'a'))!.tools.keys()]).toEqual(['play', 'pass'])
   // a second instance is separate
   p.apply({ rev: 3, toolsets: [{ toolset: 'game', instance: 'b', state: 'open' }], tools: [{ name: 'rematch', instance: 'b', visible: true }] })
@@ -76,15 +76,19 @@ test('hint changes apply in rev order; a stale rev is ignored; visibility is per
   expect(closed.changes[0]).toMatchObject({ closed: true, gone: ['play', 'pass'] })
   expect(p.render(closed)).toBe('[go/game:a] closed. Now unavailable: play, pass.')
   // malformed changes are not applied
-  expect(p.apply({ tools: [] })).toMatchObject({ applied: false, stale: false, duplicate: false })
+  expect(p.apply({ tools: [] })).toMatchObject({ applied: false, covered: false, reversal: false })
   // a retitle: "open" again, with a new title, for one already open
   const b3 = p.view()
   p.apply({ rev: 5, toolsets: [{ toolset: 'game', instance: 'b', state: 'open', title: 'Go vs bo' }] })
   expect(p.render(p.diff(b3, p.view()))).toBe('[go/game:b] Go vs bo')
-  // tools/list's mcpl/rev covers what came before it: earlier revs are duplicates, not losses
+  // tools/list's mcpl/rev covers what came before it: earlier revs are covered, not losses
   p.noteListRev(9)
-  expect(p.apply({ rev: 8 })).toMatchObject({ duplicate: true, stale: false })
-  expect(p.apply({ rev: 10 }).applied).toBe(true)
+  expect(p.apply({ rev: 8 })).toMatchObject({ covered: true, reversal: false })
+  expect(p.apply({ rev: 10 })).toMatchObject({ applied: true, gap: false })
+  // a refused push's rev is seen, not applied: its restatement under the next rev is no gap
+  p.noteRefused({ rev: 11 })
+  expect(p.apply({ rev: 12 })).toMatchObject({ applied: true, gap: false })
+  expect(p.apply({ rev: 14 })).toMatchObject({ applied: true, gap: true })
   // a new connection starts revs over
   p.beginConnection({ toolHints: true, toolsets: { game: { instances: true } } }, true)
   expect(p.apply({ rev: 1 }).applied).toBe(true)
@@ -155,6 +159,36 @@ test('static ↔ dynamic moves wait for a boundary', () => {
   expect(p.presenceOf('games')).toBe('static') // until the host applies it
   expect(p.applyMoves()).toEqual([{ name: 'games', to: 'dynamic' }])
   expect(p.presenceOf('games')).toBe('dynamic')
+})
+
+test('r3: a toolset beats an explicit presence "static"; a hint definition changes description, schema and annotations only; an instance toolset statement needs its instance', () => {
+  const p = new ToolPresence('x')
+  p.beginConnection({ toolHints: true, toolsets: { game: { instances: true } } }, true)
+  p.setTools([
+    { name: 'build', description: 'Build.', inputSchema: obj(), _meta: { 'mcpl/presence': 'static', 'mcpl/toolset': 'builder' } },
+    { name: 'play', description: 'Play a move.', inputSchema: obj({ point: { type: 'string' } }), _meta: { 'mcpl/toolset': 'game', 'mcpl/class': ['control'] } },
+  ])
+  expect(p.presenceOf('build')).toBe('dynamic') // toolset wins
+  p.apply({ rev: 1, tools: [{ name: 'build', presence: 'static' }] })
+  expect(p.applyMoves()).toEqual([]) // ignored on a toolset's tool
+  p.apply({ rev: 2, toolsets: [{ toolset: 'game', instance: 'a', state: 'open' }], tools: [{ name: 'play', instance: 'a', visible: true }] })
+  p.apply({
+    rev: 3,
+    tools: [{ name: 'play', instance: 'a', definition: { name: 'renamed', description: 'Play: D4 or E5.', inputSchema: obj({ point: { enum: ['D4', 'E5'] } }), annotations: { readOnlyHint: false }, _meta: { 'mcpl/class': ['shell'], 'mcpl/toolset': 'other' } } }],
+  })
+  const def = p.view().get(keyOf('game', 'a'))!.tools.get('play')!
+  expect(def.name).toBe('play')
+  expect(def._meta).toEqual({ 'mcpl/toolset': 'game', 'mcpl/class': ['control'] }) // the listed class, not the hint's
+  expect(def.description).toBe('Play: D4 or E5.')
+  expect(signature(def)).toBe('play(point?: "D4"|"E5")')
+  expect(def.annotations).toEqual({ readOnlyHint: false })
+  // no instance on a statement about an instance toolset: ignored
+  p.apply({ rev: 4, tools: [{ name: 'play', visible: false }] })
+  expect(p.view().get(keyOf('game', 'a'))!.tools.has('play')).toBe(true)
+  // a server that declares toolsets but does not advertise toolHints: hints mean nothing (r3 §6.1)
+  const q = new ToolPresence('y')
+  q.beginConnection({ toolsets: { game: {} } }, true)
+  expect(q.active).toBe(false)
 })
 
 test('toolsets/list is the truth: adopted whatever its rev; what the host had but the server lost is closed; ended toolsets are told', () => {
@@ -248,11 +282,6 @@ test('handle: advertises toolHints, lists static tools only, and visibility chan
   await waitFor(() => delivered.length === 1)
   expect(delivered[0]!.meta.tags).toBe('surface:tools')
   expect(delivered[0]!.text).toBe('[lamp/lamp] tools now — act {server:"lamp", tool, args}:\n  on() — Switch on.\nclose {server:"lamp", toolset:"lamp"} closes it.')
-  // a stale rev is ignored (and the host resyncs through toolsets/list, which this peer cannot answer)
-  peer.notify('tools/hints', { rev: 2, tools: [{ name: 'on', visible: false }] })
-  await sleep(300)
-  expect([...h.presence.view().get(keyOf('lamp'))!.tools.keys()]).toEqual(['on'])
-  expect(delivered).toHaveLength(1)
   // a push carrying hints: the change follows the event's own text
   await peer.request('push/event', { featureSet: 'x', eventId: 'e1', timestamp: '', toolset: 'lamp', tags: ['surface:alert'], payload: { content: [{ type: 'text', text: 'The fuse blew.' }] }, hints: { rev: 3, tools: [{ name: 'on', visible: false }, { name: 'off', visible: true }] } })
   expect(delivered[1]!.text).toBe('The fuse blew.\n[lamp/lamp] tools now — act {server:"lamp", tool, args}:\n  off() — Switch off.\nnow unavailable: on')
@@ -292,24 +321,85 @@ test('compat: a server without hints is listed and called as today; a host that 
   expect(optOut.h.listedTools().map(t => t.name)).toEqual(['status', 'on', 'off', 'wave'])
 })
 
-test('handle: a refused push\'s hints are not applied; the same rev re-sent as tools/hints applies once, and again is a duplicate (no resync)', async () => {
-  const lists: number[] = []
-  const { peer, h, delivered } = await setup({
-    cfg: { dmAllowlist: [] }, // refuses every DM-tagged push
-    peerOpts: { handlers: { 'toolsets/list': () => (lists.push(1), { open: [] }) } },
-  })
-  const hints = { rev: 1, toolsets: [{ toolset: 'lamp', state: 'open', title: 'Lamp' }], tools: [{ name: 'on', visible: true }] }
-  const r = await peer.request('push/event', { featureSet: 'x', eventId: 'e1', timestamp: '', tags: ['chat:dm'], payload: { content: [{ type: 'text', text: 'psst' }] }, hints })
+/** A lamp peer whose tools/list and toolsets/list tell a consistent story, counting the lists it is asked for. */
+function lampPeer(state: { open: boolean; on: boolean }, counts: { tools: number; toolsets: number }) {
+  return {
+    handlers: {
+      'tools/list': () => (counts.tools++, { tools: LAMP_TOOLS.map(t => (t.name === 'on' ? { ...t, _meta: { ...t._meta, 'mcpl/visible': state.open && state.on } } : t)) }),
+      'toolsets/list': () => (counts.toolsets++, { open: state.open ? [{ toolset: 'lamp', title: 'Lamp' }] : [] }),
+    },
+  }
+}
+
+test('handle (r3): a refused push\'s hints are not applied; their restatement under a new rev applies, and is no gap', async () => {
+  const counts = { tools: 0, toolsets: 0 }
+  const { peer, h, delivered } = await setup({ cfg: { dmAllowlist: [] }, peerOpts: lampPeer({ open: false, on: false }, counts) }) // dmAllowlist [] refuses every DM-tagged push
+  const r = await peer.request('push/event', { featureSet: 'x', eventId: 'e1', timestamp: '', tags: ['chat:dm'], payload: { content: [{ type: 'text', text: 'psst' }] }, hints: { rev: 1, toolsets: [{ toolset: 'lamp', state: 'open', title: 'Lamp' }], tools: [{ name: 'on', visible: true }] } })
   expect(r.result).toMatchObject({ accepted: false })
   expect(h.presence.isOpen('lamp')).toBe(false) // not applied
-  peer.notify('tools/hints', hints) // the server re-sends, same rev
+  peer.notify('tools/hints', { rev: 2, toolsets: [{ toolset: 'lamp', state: 'open', title: 'Lamp' }], tools: [{ name: 'on', visible: true }] }) // restated, new rev
   await waitFor(() => delivered.length === 1)
   expect(delivered[0]!.text).toContain('[lamp/lamp] Lamp tools now — act {server:"lamp", tool, args}:\n  on() — Switch on.')
-  peer.notify('tools/hints', hints) // and once more: a duplicate
   await sleep(350)
-  expect(delivered).toHaveLength(1)
-  expect(lists).toHaveLength(1) // only the one at connect: a duplicate is no reason to resync
-  expect(h.presence.rev).toBe(1)
+  expect(counts).toEqual({ tools: 1, toolsets: 1 }) // only the reads at connect: rev 1 was seen (refused), so rev 2 is no gap
+})
+
+test('handle (r3): a reversal, a gap, a coalesced push with hints and a lost result each recover from tools/list AND toolsets/list', async () => {
+  const state = { open: true, on: true }
+  const counts = { tools: 0, toolsets: 0 }
+  const peerOpts = { ...lampPeer(state, counts), silent: ['tools/call'] }
+  const { peer, h, delivered, handles } = await setup({ peerOpts })
+  expect(h.presence.isOpen('lamp')).toBe(true) // adopted at connect
+  const reads = () => ({ ...counts })
+  const recovered = async (from: { tools: number; toolsets: number }) => {
+    await waitFor(() => counts.tools > from.tools && counts.toolsets > from.toolsets, 2000)
+  }
+  // reversal: rev 2, then rev 2 again
+  peer.notify('tools/hints', { rev: 1, tools: [{ name: 'on', visible: true }] })
+  peer.notify('tools/hints', { rev: 2, tools: [{ name: 'off', visible: true }] })
+  let from = reads()
+  peer.notify('tools/hints', { rev: 2, tools: [{ name: 'off', visible: false }] })
+  await recovered(from)
+  // gap: revs skipped that were never seen (the change still applies)
+  from = reads()
+  peer.notify('tools/hints', { rev: 9, tools: [{ name: 'off', visible: false }] })
+  await recovered(from)
+  // a push carrying hints AND coalesce: hints ignored (r3 §7), recovered instead
+  await sleep(250)
+  from = reads()
+  await peer.request('push/event', { featureSet: 'x', eventId: 'e2', timestamp: '', tags: [], coalesce: { key: 'lamp/state' }, payload: { content: [{ type: 'text', text: 'flicker' }] }, hints: { rev: 99, toolsets: [{ toolset: 'lamp', state: 'closed' }] } })
+  expect(h.presence.isOpen('lamp')).toBe(true)
+  expect(delivered.at(-1)!.text).toBe('flicker') // the event itself is delivered, without a change
+  await recovered(from)
+  // a lost result: the call times out, so what it changed is unknown
+  await sleep(250)
+  const was = REQUEST_TIMEOUTS.call
+  REQUEST_TIMEOUTS.call = 150
+  try {
+    from = reads()
+    const r = await callMetaTool('act', { server: 'lamp', tool: 'status' }, handles)
+    expect(r.isError).toBe(true)
+    await recovered(from)
+  } finally {
+    REQUEST_TIMEOUTS.call = was
+  }
+})
+
+test('handle (r3): an adopting open says "already open"; a close result\'s hints are applied', async () => {
+  const { handles } = await setup({
+    peerOpts: {
+      handlers: {
+        'toolsets/list': () => ({ open: [] }),
+        'toolsets/open': () => ({ toolset: 'lamp', title: 'Lamp', adopted: true, content: [{ type: 'text', text: 'Already on; brightness 3 was not applied.' }], _meta: { 'mcpl/hints': { rev: 1, toolsets: [{ toolset: 'lamp', state: 'open', title: 'Lamp' }], tools: [{ name: 'off', visible: true }] } } }),
+        'toolsets/close': () => ({ content: [{ type: 'text', text: 'Lamp off.' }], _meta: { 'mcpl/hints': { rev: 2, toolsets: [{ toolset: 'lamp', state: 'closed' }] } } }),
+      },
+    },
+  })
+  const o = await callMetaTool('open', { server: 'lamp', toolset: 'lamp', options: { brightness: 3 } }, handles)
+  expect(o.content[0]!.text).toStartWith('[lamp/lamp] Lamp — already open\nAlready on; brightness 3 was not applied.\ntools now — act {server:"lamp", tool, args}:\n  off() — Switch off.')
+  const c = await callMetaTool('close', { server: 'lamp', toolset: 'lamp' }, handles)
+  expect(c.content[0]!.text).toBe('Lamp off.\n[lamp/lamp] closed. Now unavailable: off.')
+  expect(handles.get('lamp')!.presence.rev).toBe(2) // the close's hints went through the apply path
 })
 
 test('handle: tools/list carries mcpl/rev — earlier changes are covered by it, later ones apply on top', async () => {

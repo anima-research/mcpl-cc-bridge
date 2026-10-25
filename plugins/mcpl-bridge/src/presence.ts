@@ -15,7 +15,8 @@
  *    overrides, from hint changes applied strictly in `rev` order, each rev
  *    at most once — ONE apply path for open/close results, call results,
  *    accepted pushes' `hints` and `tools/hints`; `tools/list` (`mcpl/rev`)
- *    and `toolsets/list` are full statements that later changes build on;
+ *    and `toolsets/list` are full statements that later changes build on.
+ *    A reversal or a gap tells the host to recover from both lists (r3 §6.1);
  *  - which definitions the model has been shown, so a tool's first sentence
  *    is said once.
  *
@@ -67,15 +68,18 @@ const arr = (v: unknown): unknown[] => (Array.isArray(v) ? v : [])
 const str = (v: unknown): string | undefined => (typeof v === 'string' && v ? v : undefined)
 
 /**
- * applied: a new rev, applied. duplicate: a rev already applied or already
- * covered by a full statement (tools/list, toolsets/list) — ignored, nothing
- * lost (a refused push's changes come back as tools/hints with the same rev,
- * RFC-014 §6.1). stale: an earlier rev never applied, arriving after a later
- * one — ignored, and what it said may be missing.
+ * RFC-014 r3 §6.1 — servers send changes in rev order; a refused push's
+ * changes are restated under a new rev. So:
+ *  applied:  a rev above the last applied — applied. `gap` when revs were
+ *            skipped that this host never saw (applied, refused or covered):
+ *            something may be missing.
+ *  covered:  at or below what a full statement (tools/list, toolsets/list)
+ *            already reflects — ignored, nothing lost.
+ *  reversal: at or below the last applied but newer than any full statement
+ *            — ignored, and something is off.
+ * A gap or a reversal is the host's cue to recover (re-read both lists).
  */
-export type ApplyOutcome = { applied: boolean; duplicate: boolean; stale: boolean; suggest: Suggestion[] }
-
-const APPLIED_REVS_KEPT = 1024
+export type ApplyOutcome = { applied: boolean; covered: boolean; reversal: boolean; gap: boolean; suggest: Suggestion[] }
 
 export class ToolPresence {
   /** Hints are in effect on the current connection: the host advertised toolHints and the server sends hints or declares toolsets. */
@@ -84,8 +88,9 @@ export class ToolPresence {
   surface: { title?: string; summary?: string } | null = null
   /** Last applied rev — per connection (RFC §6.1), reset at each connect. */
   rev = 0
-  /** Revs applied as changes on this connection (bounded), and the rev a full statement covers. */
-  private appliedRevs = new Set<number>()
+  /** The highest rev this connection has seen — applied, covered by a list, or carried by a push the host refused. */
+  private seen = 0
+  /** The rev the latest full statement (tools/list, toolsets/list) reflects. */
   private coveredThrough = 0
   private tools = new Map<string, ToolDef>()
   private open = new Map<string, OpenRecord>()
@@ -104,9 +109,10 @@ export class ToolPresence {
   /** A new connection's handshake: its manifest, and whether the host advertised toolHints. */
   beginConnection(mcpl: Record<string, unknown> | null | undefined, hostHints: boolean): void {
     this.rev = 0
-    this.appliedRevs.clear()
+    this.seen = 0
     this.coveredThrough = 0
-    this.active = hostHints && !!mcpl && (mcpl.toolHints === true || isObj(mcpl.toolsets))
+    // r3 §6.1: hint _meta and tools/hints from a server that did not advertise toolHints are ignored.
+    this.active = hostHints && !!mcpl && mcpl.toolHints === true
     this.setManifest(this.active ? mcpl : null)
   }
 
@@ -171,12 +177,12 @@ export class ToolPresence {
     return m && typeof m['mcpl/toolset'] === 'string' && m['mcpl/toolset'] ? (m['mcpl/toolset'] as string) : undefined
   }
 
-  /** static unless hinted dynamic (a toolset implies dynamic); a move applies only at a boundary (applyMoves). */
+  /** static unless hinted dynamic; a toolset wins over any "static" (r3 §4.1); a move applies only at a boundary (applyMoves). */
   presenceOf(name: string): Presence {
     if (!this.active) return 'static'
+    if (this.toolsetOf(name)) return 'dynamic'
     const moved = this.moved.get(name)
     if (moved) return moved
-    if (this.toolsetOf(name)) return 'dynamic'
     return this.tools.get(name)?._meta?.['mcpl/presence'] === 'dynamic' ? 'dynamic' : 'static'
   }
 
@@ -262,18 +268,22 @@ export class ToolPresence {
 
   /**
    * Apply a HintChanges (RFC §6.1) from any of its carriers. Strictly in rev
-   * order: a rev at or below the last applied is stale and ignored.
+   * order: a rev at or below the last applied is ignored (see ApplyOutcome).
    */
   apply(h: unknown): ApplyOutcome {
-    if (!isObj(h) || typeof h.rev !== 'number' || !Number.isFinite(h.rev)) return { applied: false, duplicate: false, stale: false, suggest: [] }
-    if (h.rev <= this.rev) {
-      const duplicate = this.appliedRevs.has(h.rev) || h.rev <= this.coveredThrough
-      return { applied: false, duplicate, stale: !duplicate, suggest: [] }
-    }
+    const none = { applied: false, covered: false, reversal: false, gap: false, suggest: [] as Suggestion[] }
+    if (!isObj(h) || typeof h.rev !== 'number' || !Number.isFinite(h.rev)) return none
+    if (h.rev <= this.coveredThrough) return { ...none, covered: true }
+    if (h.rev <= this.rev) return { ...none, reversal: true }
+    const gap = h.rev > this.seen + 1
     this.rev = h.rev
-    this.appliedRevs.add(h.rev)
-    if (this.appliedRevs.size > APPLIED_REVS_KEPT) for (const r of this.appliedRevs) if (r < this.rev - APPLIED_REVS_KEPT) this.appliedRevs.delete(r)
-    return { applied: true, duplicate: false, stale: false, suggest: this.applyBody(h) }
+    this.seen = Math.max(this.seen, h.rev)
+    return { ...none, applied: true, gap, suggest: this.applyBody(h) }
+  }
+
+  /** A push the host refused carried this rev: seen, not applied — the server restates its changes under a new rev (r3 §6.1). */
+  noteRefused(h: unknown): void {
+    if (isObj(h) && typeof h.rev === 'number' && Number.isFinite(h.rev)) this.seen = Math.max(this.seen, h.rev)
   }
 
   /** tools/list's `_meta["mcpl/rev"]` (RFC-014 §4.1): the list reflects changes through this rev; only later ones apply on top. */
@@ -281,6 +291,7 @@ export class ToolPresence {
     if (typeof rev !== 'number' || !Number.isFinite(rev)) return
     this.coveredThrough = Math.max(this.coveredThrough, rev)
     this.rev = Math.max(this.rev, rev)
+    this.seen = Math.max(this.seen, rev)
   }
 
   private applyBody(h: Record<string, unknown>): Suggestion[] {
@@ -296,7 +307,8 @@ export class ToolPresence {
     for (const e of arr(h.tools)) {
       if (!isObj(e) || !str(e.name) || !this.tools.has(e.name as string)) continue
       const name = e.name as string
-      if (e.presence === 'static' || e.presence === 'dynamic') {
+      // A toolset's tool is dynamic whatever a hint says (r3 §4.1).
+      if ((e.presence === 'static' || e.presence === 'dynamic') && !this.toolsetOf(name)) {
         // RFC §4.2: a move applies at a boundary the host chooses (here: compaction); until then the tool stays where it is.
         if (e.presence !== this.presenceOf(name)) this.pendingMoves.set(name, e.presence)
         else this.pendingMoves.delete(name)
@@ -304,7 +316,7 @@ export class ToolPresence {
       for (const key of this.keysFor(name, str(e.instance))) {
         if (isObj(e.definition) && this.presenceOf(name) === 'dynamic') {
           if (!this.defs.has(key)) this.defs.set(key, new Map())
-          this.defs.get(key)!.set(name, { ...(e.definition as ToolDef), name })
+          this.defs.get(key)!.set(name, this.redefine(name, e.definition))
         }
         if (typeof e.visible === 'boolean') this.setVisible(key, name, e.visible)
       }
@@ -317,14 +329,29 @@ export class ToolPresence {
     return suggest
   }
 
-  /** Where a tool's per-instance statement lands. An instance toolset statement without `instance` applies to every open instance. */
+  /**
+   * A definition from hints changes description, inputSchema and annotations
+   * only; the name and everything in _meta (its RFC-008 class above all) stay
+   * the listed definition's (r3 §6.1). The result goes through the same
+   * rendering and redaction as a listed tool.
+   */
+  private redefine(name: string, d: Record<string, unknown>): ToolDef {
+    const listed = this.tools.get(name)!
+    return {
+      ...listed,
+      ...(typeof d.description === 'string' ? { description: d.description } : {}),
+      ...(isObj(d.inputSchema) ? { inputSchema: d.inputSchema } : {}),
+      ...(isObj(d.annotations) ? { annotations: d.annotations } : {}),
+    }
+  }
+
+  /** Where a tool's statement lands. For a toolset with instances, `instance` is required (r3 §6.1); a statement without one is ignored. */
   private keysFor(name: string, instance: string | undefined): string[] {
     const ts = this.toolsetOf(name)
     if (!ts) return [keyOf(NO_TOOLSET)]
     const decl = this.declared[ts]
     if (!decl?.instances) return [keyOf(ts)]
-    if (instance) return [keyOf(ts, instance)]
-    return this.openRecords(ts).map(r => keyOf(ts, r.instance))
+    return instance ? [keyOf(ts, instance)] : []
   }
 
   private setVisible(key: string, name: string, on: boolean): void {
@@ -340,7 +367,7 @@ export class ToolPresence {
     this.defs.delete(key)
   }
 
-  /** The result of a toolsets/open: the instance is open whatever its hints say (they may have been stale). */
+  /** The result of a toolsets/open: the instance is open whatever its hints say. */
   noteOpened(toolset: string, instance: string | undefined, title: string | undefined): void {
     if (!this.isDeclared(toolset)) return
     const key = keyOf(toolset, this.declared[toolset]!.instances ? instance : undefined)

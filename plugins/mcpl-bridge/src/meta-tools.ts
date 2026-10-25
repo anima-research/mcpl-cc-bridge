@@ -165,7 +165,8 @@ async function open(handles: Map<string, McplServerHandle>, args: Record<string,
     } catch (e) {
       fail(`${h.id} did not open ${toolset}: ${rpcMessage(e)}`)
     }
-    const blocks: Block[] = [{ type: 'text', text: `[${p.label(o!.key)}]${o!.title ? ` ${o!.title}` : ''}` }, ...(o!.content as Block[])]
+    // r3 §5.2: opening what is open adopts it; its content says which options were not applied.
+    const blocks: Block[] = [{ type: 'text', text: `[${p.label(o!.key)}]${o!.title ? ` ${o!.title}` : ''}${o!.adopted ? ' — already open' : ''}` }, ...(o!.content as Block[])]
     const tail = [...p.toolBlock(o!.key, toolsAt(h, o!.key), { headed: false })]
     const gone = o!.change.changes.find(c => c.key === o!.key)?.gone ?? []
     if (gone.length) tail.push(`now unavailable: ${gone.join(', ')}`)

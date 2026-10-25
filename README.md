@@ -248,7 +248,7 @@ toolsets or dynamic tools:
 
 | tool | |
 |---|---|
-| `open {server, toolset?, instance?, options?}` | open a toolset (sends `toolsets/open`; an undeclared group is opened by the bridge alone) |
+| `open {server, toolset?, instance?, options?}` | open a toolset (sends `toolsets/open`; an undeclared group is opened by the bridge alone); an open the server adopts reads "already open" |
 | `act {server, tool, instance?, args}` | call a dynamic tool — or any tool of a surface server; `instance` rides in `_meta["mcpl/instance"]`, filled in when only one is open |
 | `look {server?, toolset?, instance?, tool?}` | what is open and what can be opened, with current tools; with `tool`, its full schema |
 | `close {server, toolset?, instance?}` | close it |
@@ -273,10 +273,15 @@ A `suggest` is shown, never acted on.
 
 Hint changes from all four carriers go through one apply path, in `rev`
 order, each `rev` at most once. A push's `hints` apply only if the bridge
-accepts the push (a refused push's changes come back as `tools/hints` with the
-same rev). `tools/list` carries `mcpl/rev`; later changes apply on top of it.
-A change that arrives after a later one (out of order, never applied) is
-dropped and the bridge re-reads the state with `toolsets/list`.
+accepts the push (the server restates a refused push's changes under a new
+rev), and never from a push that also carries RFC-006 `coalesce`. `tools/list`
+carries `mcpl/rev`; later changes apply on top of it. A definition in hints
+changes a tool's description, schema and annotations only — its name and
+RFC-008 class stay the listed ones. After a reversal, a gap in the revs, a
+coalesced push with hints, or a result lost to a timeout, the bridge
+**recovers**: it re-reads `tools/list` and `toolsets/list` and announces what
+changed. Calls into a toolset the server does not declare are gated here:
+`act` refuses them while the bridge has the group closed.
 
 After every (re)connect the bridge sends `toolsets/list` and takes it as the
 truth: what it reports is adopted (a game kept across the reconnect, or one
