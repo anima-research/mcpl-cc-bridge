@@ -159,6 +159,8 @@ Notes:
   [Opening channels](#opening-channels).
 - `disabled` — configured but not started (default `false`); `mcpl_enable`
   starts it for a session. See [Managing servers](#managing-servers-from-the-session).
+- `toolHints` — MCPL RFC-014 tool presence (default `true`); `false` makes the
+  bridge a plain host for that server. See [Toolsets](#toolsets-and-dynamic-tools-mcpl-rfc-014).
 - `transport.access` — mint this audience's credential at every dial instead of
   a static `token`; `"access.token"` in `grant` lets the server ask for
   credentials itself. See [Identity and delegated access](#identity-and-delegated-access-mcpl-rfc-015).
@@ -234,6 +236,54 @@ bun run identity status --check games                     # mint once, show expi
 (`--config <path>` picks the config; otherwise the bridge's own lookup order,
 plus `./.mcpl-bridge.json`.)
 
+## Toolsets and dynamic tools (MCPL RFC-014)
+
+The bridge advertises `toolHints`. A server that answers with hints keeps its
+**static** tools in Claude Code's tool list as `<server>__<tool>`; its
+**dynamic** tools — `play` on your turn, a world's builder tools while
+building — never enter that list, because every change to it rebuilds the
+prompt cache. They are announced in the conversation as they come and go, and
+called through four constant tools the bridge adds once any server has
+toolsets or dynamic tools:
+
+| tool | |
+|---|---|
+| `open {server, toolset?, instance?, options?}` | open a toolset (sends `toolsets/open`; an undeclared group is opened by the bridge alone) |
+| `act {server, tool, instance?, args}` | call a dynamic tool — or any tool of a surface server; `instance` rides in `_meta["mcpl/instance"]`, filled in when only one is open |
+| `look {server?, toolset?, instance?, tool?}` | what is open and what can be opened, with current tools; with `tool`, its full schema |
+| `close {server, toolset?, instance?}` | close it |
+
+A server that hints `surface` has none of its tools listed, static ones
+included; everything goes through these four. What the model reads:
+
+```
+[go/game:vs-bo] tools now — act {server:"go", instance:"vs-bo", tool, args}:
+  play(point: string) — Place a stone: column letter (A–T, no I) then row number counted from the bottom, e.g. "D4".
+  pass() — Pass.
+  resign()
+now unavailable: cancel
+```
+
+A tool's first sentence is shown the first time its definition is announced,
+the signature after that. The change a call caused follows the server's
+content in the `act` / `open` result; a change a `push/event` explains is
+appended to that channel notification (its `toolset` / `instance` in meta); a
+standalone `tools/hints` becomes a short notification tagged `surface:tools`.
+A `suggest` is shown, never acted on.
+
+Hint changes from all four carriers go through one apply path, in `rev`
+order; a stale one is dropped and the bridge re-reads the state with
+`toolsets/list`. After every (re)connect it sends `toolsets/list` and adopts
+what the server holds (a game kept across the reconnect); an instance the
+server lost is reported, not silently re-opened under its old name.
+
+**Reminders.** After compaction (and `/clear`) Claude Code runs `SessionStart`
+hooks with source `compact`; the plugin's hook returns a `<mcpl-tools>`
+block — what is open, its current tools described again, how to close it —
+which Claude Code adds to the compacted context. `look` restates the same at
+any time. Pending static↔dynamic moves (RFC-014 §4.2) are applied at that
+boundary too.
+
 ## Wake policy
 
 Every `push/event` and every `channels/incoming` on a known channel is admitted
@@ -246,6 +296,9 @@ It routes on the §16 `chat:*` tags after the host's closure (`chat:mention` ⇒
 "wake": "chat"
 ```
 
+- Host defaults under every policy (RFC-014 §7): `surface:tools` and
+  `surface:update` are held; `surface:turn`, `surface:alert`, `surface:done`
+  and `surface:invite` wake. A `wake` rule naming the tag overrides it.
 - `"all"` (default) — every delivery wakes. Right for a heartbeat, a queue, a
   server whose events are all for you.
 - `"chat"` — the loop-break preset for chat-shaped servers:
@@ -459,4 +512,11 @@ archipelago-home issuer it starts itself (temp dirs, free port, killed by pid):
 
 ```bash
 MCPL_ACCESS_E2E_ISSUER=/path/to/archipelago-home bun test test/access-e2e.test.ts
+```
+
+The RFC-014 tests run against the real go-mcpl from surfaces-mcpl (stdio and
+ws, two agents, the whole adapter); node ≥ 22 on PATH:
+
+```bash
+MCPL_GO_SERVER=/path/to/surfaces-mcpl/dist/src/servers/go/main.js bun test test/go-hints.test.ts
 ```
