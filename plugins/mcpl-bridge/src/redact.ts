@@ -4,7 +4,7 @@
  * own logs (MCPL RFC-015 §6.2, §8.3 — credentials move between host and
  * server and nowhere else).
  *
- * The bridge knows the credentials it handles — every one it minted (per-dial
+ * The bridge knows the credentials it handles — every one it minted (dial
  * `access`, RFC-015 `access/token`) and every static token it dialed with —
  * and registers them here. Anything that crosses into model context or a log
  * line is scrubbed of those exact strings, and of anything shaped like an
