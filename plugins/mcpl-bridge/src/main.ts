@@ -297,8 +297,10 @@ let configPoll: ReturnType<typeof setInterval> | null = null
 const CONFIG_POLL_MS = Number(process.env.MCPL_BRIDGE_POLL_MS) || 60_000
 /**
  * Watch the config's directory (editors save by rename, which breaks a watch
- * on the file itself), and poll its mtime behind that: fs.watch can go silent
- * (a busy fseventsd on macOS), and then a renewed token never reaches a bridge.
+ * on the file itself), and poll its mtime behind that. Under Bun on macOS, a
+ * file renamed into place reaches a directory watch with only its temporary
+ * name, which the filter below drops, so a config replaced atomically would
+ * otherwise never be noticed.
  */
 function installConfigWatch(): void {
   configWatcher?.close()

@@ -15,8 +15,8 @@ export const ACCESS_TTL = '15m'
  * Lifetime asked for the credential a dial carries (`transport.access`) — on
  * purpose not ACCESS_TTL. MCPL doors commonly hold a socket no longer than the
  * token that opened it (they close with 4001 at `exp`), so a 15-minute dial
- * credential forces a reconnect, with the
- * server's tools gone meanwhile, every 15 minutes. RFC-015 §5's 15 minutes is
+ * credential forces a reconnect, with the server's tools gone meanwhile, every
+ * 15 minutes. RFC-015 §5's 15 minutes is
  * a SHOULD aimed at credentials a server asks for to spend elsewhere; this one
  * only ever goes to the audience it names. A day also bounds how long a
  * revocation at the identity provider takes to bite, which is why this is not
