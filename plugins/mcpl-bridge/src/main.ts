@@ -18,6 +18,7 @@ import { existsSync, mkdirSync, rmSync, statSync, watch, type FSWatcher } from '
 import { homedir } from 'os'
 import { basename, dirname, join } from 'path'
 import type { AccessAuditRecord } from './access'
+import { adoptCommand } from './adopt'
 import { isWs, loadConfig, resolveIdentity, staticToken, type BridgeConfig, type IdentityConfig, type ServerConfig } from './config'
 import { Identity } from './identity'
 import { McplServerHandle, type IncomingDelivery } from './mcpl-host'
@@ -146,7 +147,7 @@ function makeHandle(id: string, serverCfg: ServerConfig, predecessor?: Promise<v
       log,
       issuer: () => identityFor(serverCfg),
       audit: writeAudit,
-      renewCommand: () => `bun run --cwd ${join(import.meta.dir, '..')} identity adopt${configPathUsed ? ` --config ${configPathUsed}` : ''}`,
+      renewCommand: () => adoptCommand(join(import.meta.dir, '..'), configPathUsed),
     },
     { disabled: !wantEnabled(id, serverCfg), predecessor },
   )

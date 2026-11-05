@@ -44,7 +44,7 @@ export async function adoptTokens(raw: RawConfig, opts: AdoptOptions): Promise<A
 
 async function adoptOne(raw: RawConfig, server: string, t: RawTransport, tok: { sub: string; aud: string; iss: string; exp: number | null }, opts: AdoptOptions): Promise<Adoption> {
   const dflt: IdentityConfig = { home: tok.iss }
-  const candidates = [raw.identity?.home === tok.iss ? raw.identity : null, dflt].filter((c): c is IdentityConfig => c !== null)
+  const candidates = [t.identity?.home === tok.iss ? t.identity : null, raw.identity?.home === tok.iss ? raw.identity : null, dflt].filter((c): c is IdentityConfig => c !== null)
   const tried = new Set<string>()
   const notes: string[] = []
   let unknownKey: string | null = null // the first key the issuer has never heard of: the one to bind
@@ -61,13 +61,21 @@ async function adoptOne(raw: RawConfig, server: string, t: RawTransport, tok: { 
         notes.push(`${resolved.keyPath} (${keyId}) is ${rec.sub}`)
         continue
       }
-      await idn.mint(tok.aud, { ttl: ACCESS_TTL }) // proves the path works before anything is rewritten; the credential goes unused
+      // The record says who this key was; only the issuer says who it is now. The credential goes unused.
+      const proven = await idn.mint(tok.aud, { ttl: ACCESS_TTL })
+      if (proven.principal !== tok.sub) {
+        notes.push(`${resolved.keyPath} (${keyId}) is ${proven.principal ?? 'unnamed by the issuer'} now, whatever its record says`)
+        continue
+      }
       delete t.token
       t.access = tok.aud
-      if (c !== raw.identity) {
-        // The default key turned out to be the one: the bridge's identity, unless this bridge already has another.
-        if (raw.identity === undefined) raw.identity = dflt
-        else t.identity = dflt
+      // The identity just proven must be the one the bridge dials with.
+      if (c !== t.identity) {
+        delete t.identity
+        if (c !== raw.identity) {
+          if (raw.identity === undefined) raw.identity = c
+          else t.identity = c
+        }
       }
       return { server, outcome: 'adopted', detail: `${server}: now renews itself, as ${tok.sub} (access "${tok.aud}")` }
     } catch (e) {
@@ -85,3 +93,9 @@ async function adoptOne(raw: RawConfig, server: string, t: RawTransport, tok: { 
       : `Run this again once ${tok.iss} answers, or with a key that is ${tok.sub}.`
   return { server, outcome: 'kept', detail: [`${server}: still on its token (${tok.sub}${exp}). No key here can renew it:`, ...notes.map(n => `  ${n}`), `  ${next}`].join('\n') }
 }
+
+const shellQuote = (s: string): string => (/^[\w@%+=:,./-]+$/.test(s) ? s : `'${s.replace(/'/g, `'\\''`)}'`)
+
+/** The command an expired token's error offers, ready to paste: a project path may well hold a space. */
+export const adoptCommand = (pluginDir: string, configPath: string | null): string =>
+  `bun run --cwd ${shellQuote(pluginDir)} identity adopt${configPath ? ` --config ${shellQuote(configPath)}` : ''}`

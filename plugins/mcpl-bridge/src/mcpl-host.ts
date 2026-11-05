@@ -46,7 +46,7 @@ import {
 //   local `access.token` path in capabilities.ts (RFC-015) until upstream has it.
 import { ERR, computeGrant, expandTags, granted, methodCapability, wildcardOnlyMatches } from './grants'
 import { holdsAmbient } from './wake'
-import { DEFAULT_GRANT, dialUrl, isLoopbackHost, isWs, resolveUrl, staticToken, type ServerConfig, type StdioTransportConfig } from './config'
+import { DEFAULT_GRANT, dialUrl, isLoopbackHost, isWs, resolveUrl, staticToken, type ServerConfig, type StdioTransportConfig, type WsTransportConfig } from './config'
 import { aid1ExpiresAt, aid1Payload } from './identity'
 import {
   ACCESS_TIME_BOUND,
@@ -553,7 +553,7 @@ export class McplServerHandle {
         secrets.add(token)
         const exp = aid1ExpiresAt(token)
         // Bun cannot report why an upgrade was refused, so this is the one way to say it: the token's own claim.
-        if (exp !== null && exp <= Date.now()) throw new Error(this.expiredToken(token!, exp))
+        if (exp !== null && exp <= Date.now()) throw new Error(this.expiredToken(t, token!, exp))
       }
       const url = resolveUrl(t, minted) // carries the credential: never logged
       const ws = new WebSocket(url)
@@ -562,7 +562,7 @@ export class McplServerHandle {
       // Registered ahead of the connection's own listener, so this is known by the time that one reports the close.
       ws.on('close', (code: number, reason: unknown) => {
         if (this.dialSocket !== ws) return
-        const said = secrets.scrub(String(reason ?? '')).replace(/[\u0000-\u001f\u007f]/g, ' ').trim().slice(0, 120)
+        const said = secrets.scrubLog(String(reason ?? '')).replace(/[\u0000-\u001f\u007f]/g, ' ').trim().slice(0, 120)
         this.lastClose = `${code}${said ? ` ${said}` : ''}`
         if (code >= 4000) this.dialFresh = true // an application close: a door turning the credential down, or its expiry
       })
@@ -639,11 +639,13 @@ export class McplServerHandle {
   }
 
   /** A static token past its expiry: the server would refuse it, so say that instead of dialing. Never the token itself. */
-  private expiredToken(token: string, exp: number): string {
+  private expiredToken(t: WsTransportConfig, token: string, exp: number): string {
     const p = aid1Payload(token)
     const whom = [typeof p?.sub === 'string' ? p.sub : null, typeof p?.aud === 'string' ? `audience ${p.aud}` : null].filter(Boolean).join(', ')
+    // The command rewrites the config, so it can do nothing for a token from the environment.
     const fix = this.cb.renewCommand?.()
-    return `static token expired ${rfc3339(exp)}${whom ? ` (${whom})` : ''} — not a server outage, and it will not come back on its own.${fix ? ` To make it renew itself: ${fix}` : ''}`
+    const way = t.token ? (fix ? ` To make it renew itself: ${fix}` : '') : t.tokenEnv ? ` It comes from $${t.tokenEnv}: renew it there, or set transport.access to mint one.` : ''
+    return `static token expired ${rfc3339(exp)}${whom ? ` (${whom})` : ''} — not a server outage, and it will not come back on its own.${way}`
   }
 
   /** ` (4401 unauthorized)`, when the socket's close said something. */

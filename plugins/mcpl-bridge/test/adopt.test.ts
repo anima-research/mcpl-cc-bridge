@@ -8,7 +8,7 @@ import { spawnSync } from 'node:child_process'
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { adoptTokens, type RawConfig } from '../src/adopt'
+import { adoptCommand, adoptTokens, type RawConfig } from '../src/adopt'
 import { resolveIdentity, type IdentityConfig } from '../src/config'
 import { Identity } from '../src/identity'
 
@@ -159,3 +159,81 @@ test('the CLI against a real issuer URL: nothing moves when the issuer is unreac
   expect(statSync(cfg).mode & 0o777).toBe(0o644)
   expect(existsSync(join(dir, 'k.pem'))).toBe(true) // the key to bind exists now
 })
+
+test('a record is not proof: a key whose record says the right principal, but which the issuer now knows as another, takes nothing over', async () => {
+  const w = world('rebound')
+  const keyPath = join(w.dir, 'rebound.pem')
+  const stale = w.makeIdentity({ home: HOME, keyPath })
+  writeFileSync(stale.recordPath, JSON.stringify({ sub: 'agent:owner@guest', name: 'x', home: HOME, enrolledAt: 'then' }))
+  w.known.set(stale.keyId(), { sub: 'agent:someone-else@guest' })
+  const original = ownerToken('docs')
+  const raw: RawConfig = { identity: { home: HOME, keyPath }, servers: { docs: { transport: { url: 'wss://docs.example/mcpl', token: original } } } }
+  const [r] = await adoptTokens(raw, { makeIdentity: w.makeIdentity })
+  expect(r!.outcome).toBe('kept')
+  expect(r!.detail).toContain('is agent:someone-else@guest now')
+  expect(raw.servers!.docs!.transport!.token).toBe(original)
+  expect(raw.servers!.docs!.transport!.access).toBeUndefined()
+})
+
+test('a server\'s own identity: tried first and kept when it is the one; replaced when another key is, so the dial uses what was proven', async () => {
+  const w = world('own')
+  const bridgeKey = join(w.dir, 'bridge.pem')
+  const ownKey = join(w.dir, 'own-server.pem')
+  const bridge = w.makeIdentity({ home: HOME, keyPath: bridgeKey })
+  const own = w.makeIdentity({ home: HOME, keyPath: ownKey })
+  // The server's own identity is the token's principal: nothing else needs to change.
+  w.known.set(own.keyId(), { sub: 'agent:owner@guest' })
+  w.known.set(bridge.keyId(), { sub: 'agent:other@guest' })
+  const ownCfg: IdentityConfig = { home: HOME, keyPath: ownKey }
+  const first: RawConfig = { identity: { home: HOME, keyPath: bridgeKey }, servers: { docs: { transport: { url: 'wss://d/mcpl', token: ownerToken('docs'), identity: ownCfg } } } }
+  const [a] = await adoptTokens(first, { makeIdentity: w.makeIdentity })
+  expect(a!.outcome).toBe('adopted')
+  expect(first.servers!.docs!.transport).toEqual({ url: 'wss://d/mcpl', access: 'docs', identity: ownCfg })
+
+  // The bridge's identity is the principal and the server's own is someone else: the override goes, or it would dial as them.
+  w.known.set(own.keyId(), { sub: 'agent:other@guest' })
+  w.known.set(bridge.keyId(), { sub: 'agent:owner@guest' })
+  rmSync(own.recordPath, { force: true })
+  rmSync(bridge.recordPath, { force: true })
+  const second: RawConfig = { identity: { home: HOME, keyPath: bridgeKey }, servers: { docs: { transport: { url: 'wss://d/mcpl', token: ownerToken('docs'), identity: ownCfg } } } }
+  const [b] = await adoptTokens(second, { makeIdentity: w.makeIdentity })
+  expect(b!.outcome).toBe('adopted')
+  expect(second.servers!.docs!.transport).toEqual({ url: 'wss://d/mcpl', access: 'docs' })
+})
+
+test('the recovery command survives a path with a space or a quote', () => {
+  expect(adoptCommand('/opt/bridge', '/home/me/cfg.json')).toBe('bun run --cwd /opt/bridge identity adopt --config /home/me/cfg.json')
+  expect(adoptCommand('/opt/my bridge', "/home/me/o'brien/cfg.json")).toBe(`bun run --cwd '/opt/my bridge' identity adopt --config '/home/me/o'\\''brien/cfg.json'`)
+  expect(adoptCommand('/opt/bridge', null)).toBe('bun run --cwd /opt/bridge identity adopt')
+})
+
+test('the CLI writes nothing if the config changed while it waited on the issuer: that edit stays', async () => {
+  const dir = join(TMP, 'race')
+  mkdirSync(dir, { recursive: true })
+  const cfg = join(dir, 'bridge.json')
+  const secret = token({ iss: 'localhost:9', sub: 'agent:owner@guest', aud: 'docs', exp: 1793816877 })
+  const edited = () => JSON.stringify({ identity: { home: 'localhost:9', keyPath: join(dir, 'k.pem'), url: `http://127.0.0.1:${issuerPort.port}` }, servers: { docs: { transport: { url: 'wss://docs.example/mcpl', token: secret } }, added: { transport: { url: 'wss://new.example/mcpl' } } } })
+  const issuerPort = Bun.serve({
+    port: 0,
+    hostname: '127.0.0.1',
+    fetch: async r => {
+      await r.json()
+      writeFileSync(cfg, edited()) // someone saves the config just now
+      const exp = Math.floor(Date.now() / 1000) + 60
+      return Response.json({ token: token({ sub: 'agent:owner@guest', aud: 'docs', exp }), sub: 'agent:owner@guest', exp })
+    },
+  })
+  try {
+    writeFileSync(cfg, JSON.stringify({ identity: { home: 'localhost:9', keyPath: join(dir, 'k.pem'), url: `http://127.0.0.1:${issuerPort.port}` }, servers: { docs: { transport: { url: 'wss://docs.example/mcpl', token: secret } } } }))
+    const proc = Bun.spawn(['bun', 'run', 'src/identity-cli.ts', 'adopt', '--config', cfg], { cwd: join(import.meta.dir, '..'), stdout: 'pipe', stderr: 'pipe', env: { ...process.env, HOME: dir } })
+    const out = await new Response(proc.stdout).text()
+    expect(await proc.exited).toBe(2)
+    expect(out).toContain('changed while this ran: nothing written')
+    expect(out).not.toContain('now renews itself')
+    expect(readFileSync(cfg, 'utf8')).toBe(edited())
+    expect(readdirSync(dir).filter(f => f.includes('.bak-'))).toHaveLength(0)
+  } finally {
+    issuerPort.stop(true)
+  }
+})
+

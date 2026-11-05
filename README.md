@@ -248,7 +248,8 @@ only if a key here proves to be the token's principal: what you own on a server
 belongs to that principal, so it refuses to change who you are. (`--only a,b`
 limits it to those servers.) A key that the issuer does not know yet gets the
 exact home-node change to make; run it again after that. It backs the config up
-first, and running bridges notice the rewrite within a minute.
+first, writes nothing if the file changed while it ran, and running bridges
+notice the rewrite within a minute.
 
 A server still on a static token shows how long it has left in `mcpl_status`.
 Once it expires, the bridge stops dialing with it and the server's last error

@@ -111,22 +111,30 @@ async function main(): Promise<void> {
 
 /**
  * Move servers from static aid1 tokens to self-renewing access. The config is
- * rewritten only if something moved: a 0600 backup first (it holds the old
- * tokens), then an atomic replace that keeps the file's mode. A running bridge
- * picks it up on its own.
+ * rewritten only if something moved and the file has not changed meanwhile: a
+ * 0600 backup first (it holds the old tokens), then an atomic replace that
+ * keeps the file's mode. A running bridge picks it up on its own.
  */
 async function adopt(path: string, only: string[] | undefined): Promise<void> {
-  const raw = JSON.parse(readFileSync(path, 'utf8')) as RawConfig
+  const original = readFileSync(path, 'utf8')
+  const raw = JSON.parse(original) as RawConfig
   const results = await adoptTokens(raw, { makeIdentity: c => new Identity(resolveIdentity(c)), ...(only ? { only } : {}) })
   if (!results.length) {
     console.log(`${path}: no server here dials with a static aid1 token${only ? ` among ${only.join(', ')}` : ''}`)
     return
   }
-  for (const r of results) console.log(r.detail)
   if (!results.some(r => r.outcome === 'adopted')) {
+    for (const r of results) console.log(r.detail)
     process.exitCode = 2
     return
   }
+  // The issuer calls took a while: what was read must still be what is there, or this would undo someone's edit.
+  if (readFileSync(path, 'utf8') !== original) {
+    console.log(`${path} changed while this ran: nothing written. Run this again.`)
+    process.exitCode = 2
+    return
+  }
+  for (const r of results) console.log(r.detail)
   const stamp = new Date().toISOString().replace(/[-:]/g, '').replace(/\.\d+Z$/, 'Z')
   const backup = `${path}.bak-pre-adopt-${stamp}`
   copyFileSync(path, backup)

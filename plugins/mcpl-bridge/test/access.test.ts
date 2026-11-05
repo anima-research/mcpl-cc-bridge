@@ -181,7 +181,7 @@ afterEach(async () => {
 
 const SERVER_CAPS = { version: '0.5', pushEvents: true, access: { token: true }, featureSets: { apps: { description: 'apps', uses: ['access.token'] } } }
 
-async function setup(opts: { verifyUpgrade?: (url: URL) => true | number; renewCommand?: string; grant?: string[]; issuer?: AccessIssuer | null; issuerFn?: () => AccessIssuer | null; transport?: Partial<{ access: string; token: string }> } = {}) {
+async function setup(opts: { verifyUpgrade?: (url: URL) => true | number; renewCommand?: string; grant?: string[]; issuer?: AccessIssuer | null; issuerFn?: () => AccessIssuer | null; transport?: Partial<{ access: string; token: string; tokenEnv: string }> } = {}) {
   const peer = await McplPeer.start({ mcpl: SERVER_CAPS, ...(opts.verifyUpgrade ? { verifyUpgrade: opts.verifyUpgrade } : {}) })
   const audits: AccessAuditRecord[] = []
   const logs: string[] = []
@@ -576,6 +576,16 @@ test('an expired static token is never dialed: the error names when, who and the
   expect(JSON.stringify(logs)).not.toContain(token)
 })
 
+test('an expired token from the environment is not told to run a command that cannot reach it', async () => {
+  process.env.MCPL_TEST_EXPIRED = aid1Token({ sub: 'agent:someone@guest', aud: 'docs', exp: 1793816877 })
+  cleanup.push(() => delete process.env.MCPL_TEST_EXPIRED)
+  const { peer, h } = await setup({ transport: { tokenEnv: 'MCPL_TEST_EXPIRED' }, renewCommand: 'bun run identity adopt' })
+  expect(peer.upgrades).toHaveLength(0)
+  expect(h.lastError).toContain('static token expired')
+  expect(h.lastError).toContain('It comes from $MCPL_TEST_EXPIRED')
+  expect(h.lastError).not.toContain('identity adopt')
+})
+
 test('a static token with time left dials as before, and reports how long it has', async () => {
   const exp = Math.floor(Date.now() / 1000) + 3600
   const token = aid1Token({ sub: 'agent:someone@guest', aud: 'docs', exp })
@@ -623,6 +633,21 @@ test('dialFailure: an ErrorEvent loses the URL, an aid1 token anywhere in the te
   expect(dialFailure(new Error(`boom ${token}`))).not.toContain(token)
   expect(dialFailure({ message: 'getaddrinfo ENOTFOUND wss://x?token=abc123' })).not.toContain('abc123')
   expect(dialFailure('plain')).toBe('plain')
+})
+
+test('a close reason echoing the dialed query does not carry an encoded credential to the model', async () => {
+  const door = Bun.serve({
+    port: 0,
+    hostname: '127.0.0.1',
+    fetch: (r, srv) => (srv.upgrade(r) ? undefined : new Response('', { status: 400 })),
+    websocket: { open: ws => void setTimeout(() => ws.close(4401, 'refused /mcpl?token=opaque%2Bshared%2Fsecret'), 20), message() {} },
+  })
+  const h = new McplServerHandle('svc', { transport: { url: `ws://127.0.0.1:${door.port}/mcpl`, token: 'opaque+shared/secret' }, grant: [], reconnectIntervalMs: 60_000 }, { deliver() {}, toolsChanged() {}, log() {} })
+  cleanup.push(() => void door.stop(true), () => h.close())
+  h.start()
+  await h.firstAttempt
+  expect(h.lastError).toContain('4401 refused')
+  expect(h.lastError).not.toContain('opaque')
 })
 
 for (const [when, delayMs] of [['at once', 0], ['a moment later', 20]] as const) {
