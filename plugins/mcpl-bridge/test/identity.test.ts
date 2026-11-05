@@ -157,3 +157,38 @@ test('config: identity + transport.access validated; defaults resolved', () => {
   bad({ servers: { s: { transport: { url: 'wss://x', access: 5 } } } })
   expect(load({ identity: { home: 'id.x', keyPath: '~/k.pem', url: 'https://id.x:8443' }, servers: {} }).config.identity?.home).toBe('id.x')
 })
+
+test('link: a key bound to a principal by the operator learns who it is and writes the record; a record already there is the answer; an unknown key is refused and writes nothing', async () => {
+  const keyPath = join(TMP, 'link', 'identity-key.pem')
+  const exp = Math.floor(Date.now() / 1000) + 60
+  const { f, calls } = fakeFetch((_p, b) =>
+    b.ttl === '1m' ? { status: 200, json: { token: aid1({ exp, sub: 'agent:bound@guest', name: 'Bound One' }), sub: 'agent:bound@guest', exp } } : { status: 500, json: {} },
+  )
+  const idn = new Identity({ home: 'id.example', keyPath, url: 'http://127.0.0.1:9', fetchImpl: f })
+  expect(idn.record()).toBeNull()
+  await expect(idn.mint('docs', { ttl: '15m' })).rejects.toMatchObject({ kind: 'no_identity' }) // nothing has written the record yet
+  const rec = await idn.link('docs')
+  expect(rec).toMatchObject({ sub: 'agent:bound@guest', name: 'Bound One', home: 'id.example' })
+  expect(idn.record()).toMatchObject({ sub: 'agent:bound@guest' })
+  expect(statSync(idn.recordPath).mode & 0o777).toBe(0o600)
+  const n = calls.length
+  expect(await idn.link('docs')).toMatchObject({ sub: 'agent:bound@guest' })
+  expect(calls.length).toBe(n)
+
+  const stranger = new Identity({
+    home: 'id.example',
+    keyPath: join(TMP, 'link2', 'identity-key.pem'),
+    url: 'http://127.0.0.1:9',
+    fetchImpl: fakeFetch(() => ({ status: 403, json: { error: 'no principal for key' } })).f,
+  })
+  await expect(stranger.link('docs')).rejects.toMatchObject({ kind: 'provider_refused', reason: 'id.example refused: no principal for key' })
+  expect(stranger.record()).toBeNull()
+})
+
+test('config: a server may carry its own identity, validated like the bridge\'s; not on stdio', () => {
+  const ok = load({ servers: { docs: { transport: { url: 'wss://docs.example/mcpl', access: 'docs', identity: { home: 'id.animalabs.ai', keyPath: '~/k.pem' } } } } })
+  expect((ok.config.servers.docs!.transport as { identity?: { home: string } }).identity?.home).toBe('id.animalabs.ai')
+  expect(() => load({ servers: { s: { transport: { url: 'wss://x', identity: { home: 'https://nope' } } } } })).toThrow('transport')
+  expect(() => load({ servers: { s: { transport: { url: 'wss://x', identity: 'id.x' } } } })).toThrow()
+  expect(() => load({ servers: { s: { transport: { command: 'node', identity: { home: 'id.x' } } } } })).toThrow('transport.identity')
+})

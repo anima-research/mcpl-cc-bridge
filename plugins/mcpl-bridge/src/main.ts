@@ -14,10 +14,11 @@
 import { Server } from '@modelcontextprotocol/sdk/server/index.js'
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js'
-import { existsSync, mkdirSync, rmSync, watch, type FSWatcher } from 'fs'
+import { existsSync, mkdirSync, rmSync, statSync, watch, type FSWatcher } from 'fs'
 import { homedir } from 'os'
 import { basename, dirname, join } from 'path'
 import type { AccessAuditRecord } from './access'
+import { adoptCommand } from './adopt'
 import { isWs, loadConfig, resolveIdentity, staticToken, type BridgeConfig, type IdentityConfig, type ServerConfig } from './config'
 import { Identity } from './identity'
 import { McplServerHandle, type IncomingDelivery } from './mcpl-host'
@@ -61,13 +62,27 @@ function trackStaticTokens(c: BridgeConfig): void {
 trackStaticTokens(config)
 
 // ── Identity (MCPL RFC-015) ──
-// The bridge's enrolled principal: mints per-dial credentials for
+// The bridge's enrolled principal: mints dial credentials for
 // `transport.access` and answers `access/token` for servers granted
 // `access.token`. Enrollment is the operator CLI's job (src/identity-cli.ts);
 // nothing here is a tool.
 const makeIdentity = (c: IdentityConfig | undefined): Identity | null => (c ? new Identity(resolveIdentity(c)) : null)
 let identity: Identity | null = makeIdentity(config.identity)
 if (identity) log(`identity: ${identity.home} — ${identity.record() ? `enrolled as ${identity.record()!.sub}` : 'not enrolled (run the identity CLI: enroll --invite … --name …)'}`)
+
+/** A server's own `transport.identity` wins over the bridge's. One Identity per config, so each key is loaded once. */
+const ownIdentities = new Map<string, Identity>()
+function identityFor(s: ServerConfig): Identity | null {
+  const own = isWs(s.transport) ? s.transport.identity : undefined
+  if (!own) return identity
+  const k = JSON.stringify(resolveIdentity(own))
+  let i = ownIdentities.get(k)
+  if (!i) {
+    i = new Identity(resolveIdentity(own))
+    ownIdentities.set(k, i)
+  }
+  return i
+}
 
 /** Servers whose connection depends on the identity: they dial with it, or may ask it for credentials. */
 const usesIdentity = (s: ServerConfig): boolean => (isWs(s.transport) && !!s.transport.access) || (s.grant ?? []).includes('access.token')
@@ -130,8 +145,9 @@ function makeHandle(id: string, serverCfg: ServerConfig, predecessor?: Promise<v
       deliver: msg => deliverToSession(msg),
       toolsChanged: scheduleToolsChanged,
       log,
-      issuer: () => identity,
+      issuer: () => identityFor(serverCfg),
       audit: writeAudit,
+      renewCommand: () => adoptCommand(join(import.meta.dir, '..'), configPathUsed),
     },
     { disabled: !wantEnabled(id, serverCfg), predecessor },
   )
@@ -277,12 +293,39 @@ async function reloadConfigInner(reason: string): Promise<ReloadResult> {
 
 let configWatcher: FSWatcher | null = null
 let watchTimer: ReturnType<typeof setTimeout> | null = null
-/** Watch the config's directory (editors save by rename, which breaks a watch on the file itself). */
+let configPoll: ReturnType<typeof setInterval> | null = null
+/** How often to compare the config's mtime, for the changes the watcher misses. */
+const CONFIG_POLL_MS = Number(process.env.MCPL_BRIDGE_POLL_MS) || 60_000
+/**
+ * Watch the config's directory (editors save by rename, which breaks a watch
+ * on the file itself), and poll its mtime behind that. Under Bun on macOS, a
+ * file renamed into place reaches a directory watch with only its temporary
+ * name, which the filter below drops, so a config replaced atomically would
+ * otherwise never be noticed.
+ */
 function installConfigWatch(): void {
   configWatcher?.close()
   configWatcher = null
+  if (configPoll) clearInterval(configPoll)
+  configPoll = null
   if (process.env.MCPL_BRIDGE_WATCH === '0' || !configPathUsed || role !== 'primary') return
   const file = basename(configPathUsed)
+  const path = configPathUsed
+  const mtime = (): number | null => {
+    try {
+      return statSync(path).mtimeMs
+    } catch {
+      return null // mid-rename, or gone: the next look decides
+    }
+  }
+  let seen = mtime()
+  configPoll = setInterval(() => {
+    const now = mtime()
+    if (now === null || now === seen) return
+    seen = now
+    void reloadConfig('config file changed (poll)')
+  }, CONFIG_POLL_MS)
+  configPoll.unref?.()
   try {
     configWatcher = watch(dirname(configPathUsed), (_event, name) => {
       if (name && name !== file) return
@@ -505,6 +548,18 @@ function duration(ms: number): string {
   return `${Math.floor(h / 24)}d`
 }
 
+/** What a server dials with, for mcpl_status: the audience and whom it is minted as, or how long a static aid1 token has left. */
+function accessNote(id: string, h: McplServerHandle): string {
+  const s = config.servers[id]
+  if (h.accessAudience) {
+    const who = s ? identityFor(s)?.principal() : undefined
+    return ` | access=${h.accessAudience}${who ? ` as ${who}` : ''}`
+  }
+  const exp = h.staticTokenExpiresAt
+  if (exp === null) return ''
+  return exp <= Date.now() ? ` | static token EXPIRED ${duration(Date.now() - exp)} ago` : ` | static token expires in ${duration(exp - Date.now())}`
+}
+
 /** Every tool result — proxied or the bridge's own (status, errors, stderr tails) — leaves through the redactor. */
 async function callToolImpl(name: string, args: Record<string, unknown>): Promise<unknown> {
   return secrets.scrubDeep(await callToolInner(name, args))
@@ -534,7 +589,7 @@ async function callToolInner(name: string, args: Record<string, unknown>): Promi
             ` | open=[${open.join(', ') || '—'}]` +
             (held > 0 ? ` | held=${held}` : '') +
             (h.pendingInferenceIds.length ? ` | pending inference: ${h.pendingInferenceIds.join(', ')}` : '') +
-            (h.accessAudience ? ` | access=${h.accessAudience}` : '') +
+            accessNote(id, h) +
             (h.presence.active ? ` | toolHints${h.presence.surface ? ' surface' : ''}: ${h.listedTools().length} listed, open=[${[...h.presence.openRecords().map(o => `${o.toolset}${o.instance ? `:${o.instance}` : ''}`), ...h.presence.openGroups].join(', ') || '—'}]` : '') +
             (h.manifestRevision ? ` | rev=${h.manifestRevision.slice(0, 18)}…` : '') +
             (h.pid ? ` | pid=${h.pid}` : '') +

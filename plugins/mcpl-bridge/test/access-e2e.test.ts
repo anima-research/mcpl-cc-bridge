@@ -12,8 +12,8 @@
  *   MCPL_ACCESS_E2E_ISSUER=~/src/archipelago-home bun test test/access-e2e.test.ts
  */
 import { afterAll, beforeAll, expect, test } from 'bun:test'
-import { execFileSync, spawn, type ChildProcess } from 'node:child_process'
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { execFileSync, spawn, spawnSync, type ChildProcess } from 'node:child_process'
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { createServer } from 'node:net'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -37,6 +37,8 @@ let issuer: ChildProcess | null = null
 let issuerUrl = ''
 let issuerId = ''
 let verifyToken: Verify
+let issuerEnv: NodeJS.ProcessEnv
+let issuerDataDir: string
 let identity: Identity
 let rec: IdentityRecord
 const peers: McplPeer[] = []
@@ -66,6 +68,8 @@ beforeAll(async () => {
   const port = await freePort()
   issuerUrl = `http://127.0.0.1:${port}`
   const env = { ...process.env, HN_DOMAIN: HOME, HN_PUBLIC_URL: issuerUrl, HN_BIND: '127.0.0.1', HN_PORT: String(port), HN_DATA_DIR: dataDir, HN_CONFIG_DIR: configDir }
+  issuerEnv = env
+  issuerDataDir = dataDir
   // The invite exists before the server starts (its invite store polls the file every 3 s).
   const invite = execFileSync(NODE, ['--import', 'tsx', 'src/cli.ts', 'invite', '--scopes', 'games:play', '--aud', 'games', '--max-uses', '1', '--label', 'mcpl-bridge-e2e'], { cwd: ISSUER_DIR, env, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim()
   expect(invite).toMatch(/^inv_/)
@@ -159,7 +163,7 @@ e2e('an audience the principal lacks: -32040 carrying the issuer\'s reason', asy
   expect(u.error).toMatchObject({ code: -32040, data: { audience: 'no-such-service', kind: 'provider_refused', reason: `${HOME} refused: unknown audience` } })
 })
 
-e2e('transport.access: a fresh, valid token at the upgrade — on connect, on a forced reconnect, and on a server-side drop', async () => {
+e2e('transport.access: a valid token at the upgrade — fresh on connect and on a forced reconnect, reused over a server-side drop', async () => {
   // The peer plays a real audience: it accepts the upgrade only with a valid games token.
   const verifyUpgrade = (url: URL) => (verifyToken(String(url.searchParams.get('token')), { issuerId, iss: HOME, aud: 'games' }).ok ? (true as const) : 401)
   const { peer, h, audits } = await connect(['pushEvents'], { access: 'games' }, { verifyUpgrade })
@@ -167,7 +171,7 @@ e2e('transport.access: a fresh, valid token at the upgrade — on connect, on a 
   expect(h.status).toBe('ready')
   const t0 = peer.token(0)
   const p0 = verifyGames(t0)
-  expect(p0.exp - p0.iat).toBe(15 * 60)
+  expect(p0.exp - p0.iat).toBe(24 * 3600) // a door closes at exp: 15 minutes would be a forced reconnect every 15 minutes
 
   await sleep(1100) // a new second, so a new mint is a different token
   await h.restart()
@@ -176,13 +180,10 @@ e2e('transport.access: a fresh, valid token at the upgrade — on connect, on a 
   verifyGames(t1)
   expect(t1).not.toBe(t0)
 
-  await sleep(1100)
-  peer.dropAll()
+  peer.dropAll() // a blip spends no mint
   await peer.policyCount(3, 10_000)
-  const t2 = peer.token(2)
-  verifyGames(t2)
-  expect(t2).not.toBe(t1)
-  expect(audits.filter(a => a.kind === 'dial' && a.outcome === 'granted')).toHaveLength(3)
+  expect(peer.token(2)).toBe(t1)
+  expect(audits.filter(a => a.kind === 'dial').map(a => a.outcome)).toEqual(['granted', 'granted', 'cached'])
   expect(JSON.stringify(audits)).not.toContain(String(t0))
 
   // An audience this principal cannot obtain: the dial fails, naming it and why, never dialing.
@@ -296,3 +297,141 @@ e2e('adapter: identity from config, access dial and access/token work, and no cr
   expect(lines[1]).toMatchObject({ server: 'apps', purpose: 'adapter e2e', principal: rec.sub })
   expect(existsSync(join(ccDir, 'mcpl-bridge', `sock-access-e2e-${process.pid}.sock`))).toBe(false)
 }, 40_000)
+
+// ── the whole way off a static token, the way an operator walks it ──
+
+e2e('expired token → adopt says what to bind → bind → adopt → a running bridge comes back by itself as the same principal, and no token shows anywhere', async () => {
+  const hn = (...args: string[]) => execFileSync(NODE, ['--import', 'tsx', 'src/cli.ts', ...args], { cwd: ISSUER_DIR!, env: issuerEnv, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim()
+  // A principal as made by hand: no key. Its ceiling is an hour; the token it has now is already dead.
+  hn('mint', '--name', 'Keyless Bot', '--aud', 'games', '--scopes', 'games:play', '--ttl', '1h')
+  const dead = hn('mint', '--name', 'Keyless Bot', '--aud', 'games', '--ttl', '0m')
+  const sub = 'agent:keyless-bot@guest'
+  expect(dead.startsWith('aid1.')).toBe(true)
+
+  const peer = await McplPeer.start({
+    mcpl: APPS,
+    verifyUpgrade: url => (verifyToken(String(url.searchParams.get('token')), { issuerId, iss: HOME, aud: 'games' }).ok ? (true as const) : 401),
+    tools: [{ name: 'hello', description: 'hello', inputSchema: { type: 'object', properties: {} } }],
+    onToolCall: () => ({ content: [{ type: 'text', text: 'hello' }] }),
+  })
+  peers.push(peer)
+  const dir = join(base, 'adopt')
+  const home = join(dir, 'home')
+  mkdirSync(home, { recursive: true })
+  const ccDir = join(dir, 'cc')
+  mkdirSync(ccDir, { recursive: true })
+  const cfgPath = join(dir, 'bridge.json')
+  const keyPath = join(dir, 'identity-key.pem')
+  writeFileSync(cfgPath, JSON.stringify({ identity: { home: HOME, keyPath, url: issuerUrl }, servers: { apps: { transport: { url: peer.url, token: dead }, grant: ['tools'] } } }), { mode: 0o644 })
+
+  const child = spawn('bun', ['run', 'src/main.ts'], {
+    cwd: ROOT,
+    env: { ...process.env, MCPL_BRIDGE_CONFIG: cfgPath, CLAUDE_CONFIG_DIR: ccDir, CLAUDE_CODE_SESSION_ID: `adopt-e2e-${process.pid}`, MCPL_BRIDGE_POLL_MS: '100' },
+    stdio: ['pipe', 'pipe', 'pipe'],
+  })
+  let stdout = ''
+  let stderr = ''
+  const waiting = new Map<number, (m: Record<string, unknown>) => void>()
+  let buf = ''
+  child.stdout.on('data', (d: Buffer) => {
+    stdout += d.toString()
+    buf += d.toString()
+    let nl
+    while ((nl = buf.indexOf('\n')) !== -1) {
+      const line = buf.slice(0, nl)
+      buf = buf.slice(nl + 1)
+      if (!line.trim()) continue
+      const m = JSON.parse(line) as Record<string, unknown>
+      if (typeof m.id === 'number') waiting.get(m.id)?.(m)
+    }
+  })
+  child.stderr.on('data', (d: Buffer) => (stderr += d.toString()))
+  let seq = 0
+  const call = (method: string, params: unknown) =>
+    new Promise<Record<string, unknown>>(resolve => {
+      const id = ++seq
+      waiting.set(id, m => resolve(m.result as Record<string, unknown>))
+      child.stdin.write(JSON.stringify({ jsonrpc: '2.0', id, method, params }) + '\n')
+    })
+  const status = async () => ((await call('tools/call', { name: 'mcpl_status', arguments: {} })).content as Array<{ text: string }>)[0]!.text
+  const adopt = () => {
+    const r = spawnSync('bun', ['run', 'src/identity-cli.ts', 'adopt', '--config', cfgPath], { cwd: ROOT, encoding: 'utf8', env: { ...process.env, HOME: home } })
+    expect(r.stdout + r.stderr).not.toContain('aid1.')
+    return r
+  }
+  try {
+    await call('initialize', { protocolVersion: '2024-11-05', capabilities: {}, clientInfo: { name: 'adopt-e2e', version: '0' } })
+    child.stdin.write(JSON.stringify({ jsonrpc: '2.0', method: 'notifications/initialized' }) + '\n')
+
+    // 1. Down, and it says why and what to do: the session need not read the token to find out.
+    let before = ''
+    for (let i = 0; i < 100 && !before.includes('static token expired'); i++) {
+      await sleep(100)
+      before = await status()
+    }
+    expect(before).toContain(`static token expired`)
+    expect(before).toContain(sub)
+    expect(before).toContain('not a server outage')
+    expect(before).toContain(`identity adopt --config ${cfgPath}`)
+    expect(before).toContain('static token EXPIRED')
+    expect(peer.upgrades).toHaveLength(0)
+
+    // 2. The key is unknown: nothing moves, and the answer is the change to make.
+    const first = adopt()
+    expect(first.status).toBe(2)
+    expect(first.stdout).toContain('no principal for key')
+    const keyId = new Identity({ home: HOME, keyPath, url: issuerUrl }).keyId()
+    expect(first.stdout).toContain(`give ${sub} "key": "${keyId}"`)
+    expect(JSON.parse(readFileSync(cfgPath, 'utf8')).servers.apps.transport.token).toBe(dead)
+
+    // 3. The operator makes it. 4. Adopt again, until the issuer's store has reloaded.
+    const principalsPath = join(issuerDataDir, 'principals.json')
+    const principals = JSON.parse(readFileSync(principalsPath, 'utf8')) as { principals: Array<Record<string, unknown>> }
+    const target = principals.principals.find(p => p.sub === sub)!
+    target.key = keyId
+    target.audiences = ['games']
+    writeFileSync(principalsPath, JSON.stringify(principals, null, 2))
+    let second = adopt()
+    for (let i = 0; i < 80 && second.status !== 0; i++) {
+      await sleep(250)
+      second = adopt()
+    }
+    expect(second.status).toBe(0)
+    expect(second.stdout).toContain(`now renews itself, as ${sub}`)
+
+    const written = JSON.parse(readFileSync(cfgPath, 'utf8'))
+    expect(written.servers.apps.transport).toEqual({ url: peer.url, access: 'games' })
+    expect(written.servers.apps.grant).toEqual(['tools'])
+    const mode = statSync(cfgPath).mode & 0o777
+    expect(mode).toBe(0o644) // as it was
+    const backups = readdirSync(dir).filter(f => f.startsWith('bridge.json.bak-pre-adopt-'))
+    expect(backups).toHaveLength(1)
+    expect(statSync(join(dir, backups[0]!)).mode & 0o777).toBe(0o600) // it holds the old token
+    expect(new Identity({ home: HOME, keyPath, url: issuerUrl }).record()?.sub).toBe(sub)
+
+    // 5. The running bridge notices, with no help, and is the same principal it was.
+    await peer.policyCount(1, 15_000)
+    const claims = verifyToken(String(peer.token(0)), { issuerId, iss: HOME, aud: 'games' })
+    expect(claims.ok).toBe(true)
+    expect((claims as unknown as { payload: { sub: string; exp: number; iat: number } }).payload.sub).toBe(sub)
+    let after = ''
+    for (let i = 0; i < 100 && !after.includes('apps: ready'); i++) {
+      await sleep(100)
+      after = await status()
+    }
+    expect(after).toContain('apps: ready')
+    expect(after).toContain(`access=games as ${sub}`)
+    expect(after).not.toContain('static token')
+  } finally {
+    child.stdin.end()
+    await Promise.race([new Promise(r => child.once('exit', r)), sleep(3000)])
+    if (child.exitCode === null) child.kill('SIGKILL')
+  }
+  const debug = readFileSync(join(ccDir, 'mcpl-bridge', 'debug.log'), 'utf8')
+  expect(debug).toContain('config file changed (poll)')
+  for (const secret of [dead, String(peer.token(0))]) {
+    for (const [where, text] of [['stdout', stdout], ['stderr', stderr], ['debug.log', debug]] as const) {
+      if (text.includes(secret)) throw new Error(`token leaked into ${where}`)
+    }
+  }
+}, 60_000)

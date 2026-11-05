@@ -88,12 +88,34 @@ export class Identity implements AccessIssuer {
   }
 
   async mint(audience: string, opts: { ttl?: string; timeoutMs?: number } = {}): Promise<MintedCredential> {
+    const rec = this.record()
+    if (!rec) throw new AccessRefused(audience, 'no_identity', `this host is not enrolled with ${this.home} (operator: identity-cli enroll)`)
+    if (rec.home !== this.home) throw new AccessRefused(audience, 'no_identity', `this host is enrolled with ${rec.home}, not ${this.home}`)
+    return this.exchange(audience, opts, rec.sub)
+  }
+
+  /**
+   * For a key the operator bound to an existing principal at the issuer: there
+   * was no invite, so nothing wrote the record. Asks the issuer who this key
+   * is and writes it. A record already there is the answer, without asking.
+   * Rejects with AccessRefused when the issuer does not know the key.
+   */
+  async link(audience: string): Promise<IdentityRecord> {
+    const existing = this.record()
+    if (existing) return existing
+    const c = await this.exchange(audience, { ttl: '1m' }) // only for its `sub`: discarded, and gone in a minute
+    if (!c.principal) throw new AccessRefused(audience, 'unavailable', `${this.home} did not say who this key is`)
+    const name = aid1Payload(c.credential)?.name
+    const rec: IdentityRecord = { sub: c.principal, name: typeof name === 'string' ? name : c.principal, home: this.home, enrolledAt: new Date().toISOString() }
+    this.writeRecord(rec)
+    return rec
+  }
+
+  /** POST /token: a fresh key proof for a credential. `knownPrincipal` is whom to report if the issuer's answer does not say. */
+  private async exchange(audience: string, opts: { ttl?: string; timeoutMs?: number }, knownPrincipal?: string): Promise<MintedCredential> {
     const refuse = (kind: RefusalKind, reason: string): never => {
       throw new AccessRefused(audience, kind, secrets.scrubLog(reason).slice(0, REASON_MAX))
     }
-    const rec = this.record()
-    if (!rec) refuse('no_identity', `this host is not enrolled with ${this.home} (operator: identity-cli enroll)`)
-    if (rec!.home !== this.home) refuse('no_identity', `this host is enrolled with ${rec!.home}, not ${this.home}`)
     const key = this.loadOrCreateKey()
     const timestamp = new Date().toISOString()
     const proof = cryptoSign(null, Buffer.from(tokenStatement(this.home, audience, timestamp), 'utf8'), key.privateKey).toString('base64url')
@@ -121,8 +143,8 @@ export class Identity implements AccessIssuer {
     if (!known) return refuse('unavailable', `${this.home} did not say when the credential expires`)
     const expiresAt = (exp as number) * 1000
     if (expiresAt <= Date.now()) return refuse('unavailable', `${this.home} returned an expired credential`)
-    const principal = typeof res.json.sub === 'string' ? res.json.sub : typeof payload?.sub === 'string' ? payload.sub : rec!.sub
-    return { credential: token, expiresAt, principal }
+    const principal = typeof res.json.sub === 'string' ? res.json.sub : typeof payload?.sub === 'string' ? payload.sub : knownPrincipal
+    return { credential: token, expiresAt, ...(principal ? { principal } : {}) }
   }
 
   /**
@@ -143,9 +165,13 @@ export class Identity implements AccessIssuer {
       throw new Error(`enrollment refused by ${this.home} (${status}): ${typeof json.error === 'string' ? json.error : 'unknown'}`)
     }
     const rec: IdentityRecord = { sub: json.sub, name, home: this.home, enrolledAt: timestamp }
+    this.writeRecord(rec)
+    return rec
+  }
+
+  private writeRecord(rec: IdentityRecord): void {
     writeFileSync(this.recordPath + '.tmp', JSON.stringify(rec, null, 2) + '\n', { mode: 0o600 })
     renameSync(this.recordPath + '.tmp', this.recordPath)
-    return rec
   }
 
   private loadOrCreateKey(): { privateKey: KeyObject; id: string } {
@@ -185,7 +211,7 @@ export class Identity implements AccessIssuer {
 }
 
 /** The payload of an aid1 token (unverified — only to read `exp`/`sub` the issuer already vouched for), or null. */
-export function aid1Payload(token: string): { exp?: unknown; sub?: unknown; aud?: unknown } | null {
+export function aid1Payload(token: string): { exp?: unknown; sub?: unknown; aud?: unknown; iss?: unknown; name?: unknown } | null {
   const parts = token.split('.')
   if (parts.length !== 3 || parts[0] !== 'aid1') return null
   try {
@@ -194,4 +220,10 @@ export function aid1Payload(token: string): { exp?: unknown; sub?: unknown; aud?
   } catch {
     return null
   }
+}
+
+/** When an aid1 token says it expires (ms since epoch); null for anything else — an opaque token, or none. */
+export function aid1ExpiresAt(token: string | undefined): number | null {
+  const exp = token ? aid1Payload(token)?.exp : undefined
+  return typeof exp === 'number' && Number.isFinite(exp) ? exp * 1000 : null
 }

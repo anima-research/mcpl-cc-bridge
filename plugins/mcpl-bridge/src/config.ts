@@ -29,12 +29,15 @@ export type WsTransportConfig = {
   tokenEnv?: string
   token?: string
   /**
-   * Audience to mint a credential for at EVERY dial (first connect and each
-   * reconnect) from the bridge's `identity`, with a 15-minute lifetime; it
-   * goes where `token` would. Takes precedence over `token` / `tokenEnv`. A
-   * failed mint fails the dial (naming the audience and the reason).
+   * Audience to mint a dial credential for from the bridge's `identity`, with
+   * a 24-hour lifetime (access.ts DIAL_TTL). It is reused across reconnects
+   * until shortly before it expires, or until the server refuses it, and goes
+   * where `token` would. Takes precedence over `token` / `tokenEnv`. A failed
+   * mint fails the dial (naming the audience and the reason).
    */
   access?: string
+  /** This server's own identity, instead of the bridge's `identity`: for one bridge that is a different principal on different servers. */
+  identity?: IdentityConfig
 }
 
 export type TransportConfig = StdioTransportConfig | WsTransportConfig
@@ -151,7 +154,7 @@ export type ServerConfig = {
 
 /**
  * The bridge's own identity: an ed25519 key enrolled as a principal at an
- * archipelago-home identity provider. Used for `transport.access` (per-dial
+ * archipelago-home identity provider. Used for `transport.access` (dial
  * credentials) and to answer RFC-015 `access/token` for servers granted
  * `access.token`. Enroll with the operator CLI (src/identity-cli.ts); nothing
  * about it is model-visible.
@@ -246,6 +249,11 @@ export function loadConfig(): { config: BridgeConfig; path: string | null } {
     if (access !== undefined) {
       if (!isWs(s.transport)) throw new Error(`${path}: servers.${id}: transport.access needs a ws/wss/mcpl url (a stdio server is not dialed)`)
       if (typeof access !== 'string' || access.length < 1 || access.length > 128) throw new Error(`${path}: servers.${id}: transport.access must be an audience name (1-128 chars)`)
+    }
+    const ownIdentity = (s.transport as { identity?: unknown }).identity
+    if (ownIdentity !== undefined) {
+      if (!isWs(s.transport)) throw new Error(`${path}: servers.${id}: transport.identity needs a ws/wss/mcpl url (a stdio server is not dialed)`)
+      validateIdentity(ownIdentity, `${path}: servers.${id}: transport`)
     }
     if (s.grant !== undefined && !Array.isArray(s.grant)) throw new Error(`${path}: servers.${id}: grant must be an array when present (omit for the default grant; [] = plain MCP)`)
     if (s.wake !== undefined && s.wake !== 'all' && s.wake !== 'chat' && (typeof s.wake !== 'object' || s.wake === null || Array.isArray(s.wake))) {

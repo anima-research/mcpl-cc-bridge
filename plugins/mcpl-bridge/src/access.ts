@@ -9,8 +9,20 @@
  * provider is the outer bound; the provider's refusal comes back as -32040.
  */
 
-/** Lifetime asked of the identity provider for every credential this host mints (RFC §5: SHOULD expire within 15 minutes). */
+/** Lifetime asked of the identity provider for what an `access/token` answers with (RFC §5: SHOULD expire within 15 minutes). Dials: DIAL_TTL. */
 export const ACCESS_TTL = '15m'
+/**
+ * Lifetime asked for the credential a dial carries (`transport.access`) — on
+ * purpose not ACCESS_TTL. MCPL doors commonly hold a socket no longer than the
+ * token that opened it (they close with 4001 at `exp`), so a 15-minute dial
+ * credential forces a reconnect, with the server's tools gone meanwhile, every
+ * 15 minutes. RFC-015 §5's 15 minutes is
+ * a SHOULD aimed at credentials a server asks for to spend elsewhere; this one
+ * only ever goes to the audience it names. A day also bounds how long a
+ * revocation at the identity provider takes to bite, which is why this is not
+ * simply the provider's ceiling (commonly 7 days).
+ */
+export const DIAL_TTL = '24h'
 /** A cached credential is reused until this long before it expires (RFC §5: the reference implementation renews 60 s early). */
 /** RFC-015 r5 §5: never answer from the cache with less than two minutes left. */
 export const RENEW_EARLY_MS = 120_000

@@ -7,7 +7,7 @@
  * as a Request, inbound method→capability enforcement, dual-shape featureSets
  * normalization, per-descriptor channel authorization, manifest re-fetch on
  * mcpl/manifestChanged, and answer-or-error discipline on every inbound id.
- * Delegated access (MCPL RFC-015): per-dial credentials for `transport.access`
+ * Delegated access (MCPL RFC-015): dial credentials for `transport.access`
  * and `access/token` answered for servers granted `access.token`.
  * Tool presence (MCPL RFC-014 r2): hint changes from every carrier through one
  * apply path (src/presence.ts), toolsets/open|close|list, instance-bound calls.
@@ -46,10 +46,12 @@ import {
 //   local `access.token` path in capabilities.ts (RFC-015) until upstream has it.
 import { ERR, computeGrant, expandTags, granted, methodCapability, wildcardOnlyMatches } from './grants'
 import { holdsAmbient } from './wake'
-import { DEFAULT_GRANT, dialUrl, isLoopbackHost, isWs, resolveUrl, staticToken, type ServerConfig, type StdioTransportConfig } from './config'
+import { DEFAULT_GRANT, dialUrl, isLoopbackHost, isWs, resolveUrl, staticToken, type ServerConfig, type StdioTransportConfig, type WsTransportConfig } from './config'
+import { aid1ExpiresAt, aid1Payload } from './identity'
 import {
   ACCESS_TIME_BOUND,
   ACCESS_TTL,
+  DIAL_TTL,
   DEFAULT_TIMEOUT_MS,
   cacheKey,
   AccessRefused,
@@ -91,6 +93,24 @@ export type HostCallbacks = {
   issuer?(): AccessIssuer | null
   /** RFC-015 §8.2 audit sink: one record per access/token request and per access dial. Never carries the credential. */
   audit?(rec: AccessAuditRecord): void
+  /** The command that moves a static token over to self-renewing access, for the error that says one has expired. */
+  renewCommand?(): string
+}
+
+/** What Bun's `ws` says when the server answers an upgrade with anything but 101. */
+const UPGRADE_REFUSED = 'Expected 101 status code'
+
+/**
+ * Why a WebSocket dial failed, safe to log and show. Bun's `ws` hands over an
+ * ErrorEvent, not an Error, and its message quotes the URL it dialed: the
+ * credential is in there. It also does not implement `unexpected-response`, so
+ * a refused upgrade's HTTP status cannot be had at all.
+ */
+export function dialFailure(e: unknown): string {
+  const raw = e && typeof e === 'object' && typeof (e as { message?: unknown }).message === 'string' ? (e as { message: string }).message : String(e)
+  const said = raw.replace(/^WebSocket connection to '.*?' failed: /, '')
+  if (said === UPGRADE_REFUSED) return 'the server refused the WebSocket upgrade (a rejected credential, a wrong path, or a server error: Bun does not report the status)'
+  return secrets.scrubLog(said)
 }
 
 type PendingInference = {
@@ -214,6 +234,19 @@ export class McplServerHandle {
   private isMcpl = false
   /** RFC-015: credentials handed to this server, per audience (RFC §5 caching). */
   private accessCache = new CredentialCache()
+  /** Apart from accessCache: a dial credential lives far longer than an `access/token` answer may (access.ts DIAL_TTL), and must not become one. */
+  private dialCache = new CredentialCache()
+  /** The server turned the last credential down, or a reload was asked for: the next dial mints instead of reusing one. */
+  private dialFresh = false
+  /** `code reason` of the current socket's close, for the error that follows it. */
+  private lastClose: string | null = null
+  /**
+   * The socket lastClose is about. Bun fires `close` the moment we call close(),
+   * so today an old socket's cannot land once a new dial has begun. A runtime
+   * that waits for the closing handshake, as the spec has it, would have a
+   * reload read as a refusal.
+   */
+  private dialSocket: unknown = null
   private warnedPlainWs = false
   /** RFC-014: this server's tool presence — hints, toolsets, instances, what the model was shown. Survives reconnects. */
   readonly presence: ToolPresence
@@ -322,9 +355,17 @@ export class McplServerHandle {
     return isWs(this.cfg.transport) ? (this.cfg.transport.access ?? null) : null
   }
 
+  /** When the static aid1 token this server dials with expires (ms since epoch); null if it dials any other way. */
+  get staticTokenExpiresAt(): number | null {
+    const t = this.cfg.transport
+    return isWs(t) && !t.access ? aid1ExpiresAt(staticToken(t)) : null
+  }
+
   /**
-   * Mint the dial credential for `transport.access` (RFC-015 §5: requested at
-   * each dial and reconnect). Throws an error naming the audience and the
+   * The dial credential for `transport.access`. Reused across reconnects until
+   * shortly before it expires (RFC-015 r5 §5), so that a network blip does not
+   * have every bridge on the machine at the provider at once: it allows 30
+   * requests a minute per address. Throws an error naming the audience and the
    * reason — never the credential — so the dial fails loudly.
    */
   private async dialCredential(audience: string): Promise<string> {
@@ -335,9 +376,11 @@ export class McplServerHandle {
       throw new Error(`access "${audience}": ${reason}`)
     }
     try {
-      const c = await issuer.mint(audience, { ttl: ACCESS_TTL })
+      const key = cacheKey(issuer.principal?.() ?? '', audience, SCHEME)
+      const { credential: c, cached } = await this.dialCache.get(key, this.dialFresh, () => issuer.mint(audience, { ttl: DIAL_TTL }))
+      this.dialFresh = false
       secrets.add(c.credential, c.expiresAt)
-      this.audit({ kind: 'dial', audience, outcome: 'granted', expiresAt: rfc3339(c.expiresAt), ...(c.principal ? { principal: c.principal } : {}) })
+      this.audit({ kind: 'dial', audience, outcome: cached ? 'cached' : 'granted', expiresAt: rfc3339(c.expiresAt), ...(c.principal ? { principal: c.principal } : {}) })
       return c.credential
     } catch (e) {
       const refusal: RefusalKind = e instanceof AccessRefused ? e.kind : 'unavailable'
@@ -361,6 +404,7 @@ export class McplServerHandle {
     this.retired = true
     this.teardown('closed')
     this.accessCache.clear()
+    this.dialCache.clear()
     return this.childGone
   }
 
@@ -421,6 +465,7 @@ export class McplServerHandle {
     return this.serialize(async () => {
       if (this.retired) throw new Error(`${this.id}: this handle was replaced; check mcpl_status`)
       if (this.wantOff || this.paused) throw new Error(`${this.id}: disabled; mcpl_enable starts it`)
+      this.dialFresh = true // someone asked for a clean start
       this.teardown('disconnected')
       await this.childGone
       if (this.halted || this.wantOff) return // closed or disabled while the old process wound down
@@ -503,20 +548,38 @@ export class McplServerHandle {
           this.log(`warning: access credential for "${t.access}" sent over plain ws:// to ${u.hostname} — use wss:// unless the link is already private (tailnet)`)
         }
       }
-      if (!minted) secrets.add(staticToken(t))
+      if (!minted) {
+        const token = staticToken(t)
+        secrets.add(token)
+        const exp = aid1ExpiresAt(token)
+        // Bun cannot report why an upgrade was refused, so this is the one way to say it: the token's own claim.
+        if (exp !== null && exp <= Date.now()) throw new Error(this.expiredToken(t, token!, exp))
+      }
       const url = resolveUrl(t, minted) // carries the credential: never logged
       const ws = new WebSocket(url)
+      this.lastClose = null
+      this.dialSocket = ws
+      // Registered ahead of the connection's own listener, so this is known by the time that one reports the close.
+      ws.on('close', (code: number, reason: unknown) => {
+        if (this.dialSocket !== ws) return
+        const said = secrets.scrubLog(String(reason ?? '')).replace(/[\u0000-\u001f\u007f]/g, ' ').trim().slice(0, 120)
+        this.lastClose = `${code}${said ? ` ${said}` : ''}`
+        if (code >= 4000) this.dialFresh = true // an application close: a door turning the credential down, or its expiry
+      })
       await new Promise<void>((resolve, reject) => {
-        const t = setTimeout(() => reject(new Error('ws open timeout')), 15_000)
+        const timer = setTimeout(() => reject(new Error('ws open timeout')), 15_000)
         ws.on('open', () => {
-          clearTimeout(t)
+          clearTimeout(timer)
           resolve()
         })
-        ws.on('error', (e: Error) => {
-          clearTimeout(t)
-          reject(e)
+        ws.on('error', (e: unknown) => {
+          clearTimeout(timer)
+          if ((e as { message?: unknown })?.message && String((e as { message: unknown }).message).endsWith(UPGRADE_REFUSED)) this.dialFresh = true
+          reject(new Error(dialFailure(e)))
         })
       })
+      // A door refusing right after the upgrade can beat the connection's own listener, which would then wait out a request timeout on a dead socket.
+      if (this.lastClose !== null) throw new Error(`the server closed the connection on arrival${this.closeDetail()}`)
       return { conn: McplConnection.fromWebSocket(ws as unknown as Parameters<typeof McplConnection.fromWebSocket>[0]), child: null, stderrTail, closed: Promise.resolve() }
     }
     const t = this.cfg.transport as StdioTransportConfig
@@ -575,6 +638,21 @@ export class McplServerHandle {
     return { conn, child, stderrTail, closed }
   }
 
+  /** A static token past its expiry: the server would refuse it, so say that instead of dialing. Never the token itself. */
+  private expiredToken(t: WsTransportConfig, token: string, exp: number): string {
+    const p = aid1Payload(token)
+    const whom = [typeof p?.sub === 'string' ? p.sub : null, typeof p?.aud === 'string' ? `audience ${p.aud}` : null].filter(Boolean).join(', ')
+    // The command rewrites the config, so it can do nothing for a token from the environment.
+    const fix = this.cb.renewCommand?.()
+    const way = t.token ? (fix ? ` To make it renew itself: ${fix}` : '') : t.tokenEnv ? ` It comes from $${t.tokenEnv}: renew it there, or set transport.access to mint one.` : ''
+    return `static token expired ${rfc3339(exp)}${whom ? ` (${whom})` : ''} — not a server outage, and it will not come back on its own.${way}`
+  }
+
+  /** ` (4401 unauthorized)`, when the socket's close said something. */
+  private closeDetail(): string {
+    return this.lastClose ? ` (${this.lastClose})` : ''
+  }
+
   private connectOnce(): Promise<void> {
     const attempt = this.connectOnceInner().finally(() => this.firstAttemptResolve())
     this.latestAttempt = attempt
@@ -617,8 +695,8 @@ export class McplServerHandle {
     conn.on('error', err => this.log(`conn error: ${err.message}`))
     conn.on('close', () => {
       if (myEpoch !== this.epoch) return
-      this.lastError = 'connection closed'
-      this.log('connection closed')
+      this.lastError = `connection closed${this.closeDetail()}`
+      this.log(this.lastError)
       this.teardown('disconnected')
       this.scheduleReconnect()
     })
@@ -626,9 +704,10 @@ export class McplServerHandle {
     try {
       await this.handshake(conn, myEpoch)
     } catch (e) {
-      this.log(`handshake failed: ${e instanceof Error ? e.message : e}`)
+      const failure = `handshake failed: ${e instanceof Error ? e.message : e}${this.closeDetail()}`
+      this.log(failure)
       if (myEpoch === this.epoch) {
-        this.lastError = `handshake failed: ${e instanceof Error ? e.message : e}`
+        this.lastError = failure
         this.teardown('disconnected')
         this.scheduleReconnect()
       }

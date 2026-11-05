@@ -161,8 +161,8 @@ Notes:
   starts it for a session. See [Managing servers](#managing-servers-from-the-session).
 - `toolHints` — MCPL RFC-014 tool presence (default `true`); `false` makes the
   bridge a plain host for that server. See [Toolsets](#toolsets-and-dynamic-tools-mcpl-rfc-014).
-- `transport.access` — mint this audience's credential at every dial instead of
-  a static `token`; `"access.token"` in `grant` lets the server ask for
+- `transport.access` — mint this audience's credential instead of holding a
+  static `token`, so it cannot expire on you; `"access.token"` in `grant` lets the server ask for
   credentials itself. See [Identity and delegated access](#identity-and-delegated-access-mcpl-rfc-015).
 
 ## Identity and delegated access (MCPL RFC-015)
@@ -187,11 +187,17 @@ identity provider — and use it two ways:
 }
 ```
 
-- **Per-dial credentials** — `transport.access: "<audience>"` mints a
-  credential for that audience, with a 15-minute lifetime, at every dial (first
-  connect and each reconnect) and sends it where `token` would go (`?token=`).
-  It takes precedence over `token` / `tokenEnv`. A failed mint is a dial
-  error naming the audience and the issuer's reason.
+- **Dial credentials** — `transport.access: "<audience>"` mints a credential
+  for that audience and sends it where `token` would go (`?token=`), so nothing
+  in the config can expire. It takes precedence over `token` / `tokenEnv`. A
+  failed mint is a dial error naming the audience and the issuer's reason.
+  The lifetime is 24 hours, not RFC-015's 15 minutes: MCPL doors close a socket
+  when the token that opened it expires, so 15 minutes would mean a forced
+  reconnect, with the server's tools gone meanwhile, every 15 minutes. A
+  credential is reused across reconnects until shortly before it expires, or
+  until the server refuses it, or `mcpl_reload` asks for a clean start.
+  `transport.identity` gives one server its own identity, when a bridge is a
+  different principal there.
 - **`access/token` (RFC-015)** — when `identity` is configured the host
   advertises `access: { token: true }`. A server granted `access.token` may
   ask for a credential for any audience the principal can obtain; the answer is
@@ -231,10 +237,23 @@ cd plugins/mcpl-bridge
 bun run identity status                                   # key id, enrollment
 bun run identity enroll --invite inv_XXXX --name cc-bridge
 bun run identity status --check games                     # mint once, show expiry (never the token)
+bun run identity adopt                                    # static aid1 tokens → transport.access
 ```
 
 (`--config <path>` picks the config; otherwise the bridge's own lookup order,
 plus `./.mcpl-bridge.json`.)
+
+`adopt` moves each server with a static aid1 token onto `transport.access`, but
+only if a key here proves to be the token's principal: what you own on a server
+belongs to that principal, so it refuses to change who you are. (`--only a,b`
+limits it to those servers.) A key that the issuer does not know yet gets the
+exact home-node change to make; run it again after that. It backs the config up
+first, writes nothing if the file changed while it ran, and running bridges
+notice the rewrite within a minute.
+
+A server still on a static token shows how long it has left in `mcpl_status`.
+Once it expires, the bridge stops dialing with it and the server's last error
+says so, naming the command above.
 
 ## Toolsets and dynamic tools (MCPL RFC-014)
 

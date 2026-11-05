@@ -12,6 +12,7 @@ import { Identity } from '../src/identity'
 import {
   ACCESS_TIME_BOUND,
   ACCESS_TTL,
+  DIAL_TTL,
   AccessRefused,
   CredentialCache,
   RENEW_EARLY_MS,
@@ -25,7 +26,7 @@ import {
 } from '../src/access'
 import { DEFAULT_GRANT, resolveUrl, type ServerConfig } from '../src/config'
 import { computeGrant, wildcardOnlyMatches } from '../src/grants'
-import { McplServerHandle, hostMcplCaps } from '../src/mcpl-host'
+import { McplServerHandle, dialFailure, hostMcplCaps } from '../src/mcpl-host'
 import { REDACTED, SecretRegistry } from '../src/redact'
 import { advertisedCapabilities, deriveFeatureSets } from '../src/vendor/mcpl-core/index.js'
 import { McplPeer } from './mcpl-peer'
@@ -173,14 +174,15 @@ class FakeIssuer implements AccessIssuer {
 }
 
 const cleanup: Array<() => unknown> = []
+const aid1Token = (claims: object) => `aid1.${Buffer.from(JSON.stringify(claims)).toString('base64url')}.${'c2lnbmF0dXJl'.repeat(6)}`
 afterEach(async () => {
   for (const f of cleanup.splice(0).reverse()) await f()
 })
 
 const SERVER_CAPS = { version: '0.5', pushEvents: true, access: { token: true }, featureSets: { apps: { description: 'apps', uses: ['access.token'] } } }
 
-async function setup(opts: { grant?: string[]; issuer?: AccessIssuer | null; issuerFn?: () => AccessIssuer | null; transport?: Partial<{ access: string; token: string }> } = {}) {
-  const peer = await McplPeer.start({ mcpl: SERVER_CAPS })
+async function setup(opts: { verifyUpgrade?: (url: URL) => true | number; renewCommand?: string; grant?: string[]; issuer?: AccessIssuer | null; issuerFn?: () => AccessIssuer | null; transport?: Partial<{ access: string; token: string; tokenEnv: string }> } = {}) {
+  const peer = await McplPeer.start({ mcpl: SERVER_CAPS, ...(opts.verifyUpgrade ? { verifyUpgrade: opts.verifyUpgrade } : {}) })
   const audits: AccessAuditRecord[] = []
   const logs: string[] = []
   const issuer = opts.issuer === undefined ? new FakeIssuer() : opts.issuer
@@ -191,6 +193,7 @@ async function setup(opts: { grant?: string[]; issuer?: AccessIssuer | null; iss
     log: l => logs.push(l),
     issuer: opts.issuerFn ?? (() => issuer),
     audit: r => audits.push(r),
+    ...(opts.renewCommand ? { renewCommand: () => opts.renewCommand! } : {}),
   })
   cleanup.push(() => peer.close(), () => h.close())
   h.start()
@@ -324,25 +327,25 @@ test('revoking access.token by manifest change takes effect for the next request
   expect((await peer.request('access/token', { audience: 'games' })).error).toMatchObject({ code: -32002, data: { capability: 'access.token' } })
 })
 
-test('per-dial minting: transport.access credential at the upgrade, fresh at each reconnect; a failed mint fails the dial without the credential', async () => {
+test('dial credential: transport.access at the upgrade, reused across a drop, fresh on a reload; a failed mint fails the dial without the credential', async () => {
   const { peer, h, issuer, audits } = await setup({ transport: { access: 'games', token: 'static-fallback-token' } })
   await peer.policyCount(1)
   const first = peer.token(0)!
   expect(first.startsWith('aid1.')).toBe(true)
   expect(first).not.toBe('static-fallback-token')
-  expect(issuer!.mints[0]).toEqual({ audience: 'games', ttl: ACCESS_TTL })
+  expect(issuer!.mints[0]).toEqual({ audience: 'games', ttl: DIAL_TTL })
   expect(h.accessAudience).toBe('games')
 
-  await h.restart()
+  await h.restart() // mcpl_reload: someone asked for a clean start
   await peer.policyCount(2)
   const second = peer.token(1)!
   expect(second).not.toBe(first)
 
-  peer.dropAll() // server-side drop → the bridge redials on its own
+  peer.dropAll() // a network blip: the bridge redials on its own, and spends no mint on it
   await peer.policyCount(3)
-  expect(peer.token(2)).not.toBe(second)
-  expect(issuer!.mints.map(m => m.audience)).toEqual(['games', 'games', 'games'])
-  expect(audits.filter(a => a.kind === 'dial').map(a => a.outcome)).toEqual(['granted', 'granted', 'granted'])
+  expect(peer.token(2)).toBe(second)
+  expect(issuer!.mints.map(m => m.audience)).toEqual(['games', 'games'])
+  expect(audits.filter(a => a.kind === 'dial').map(a => a.outcome)).toEqual(['granted', 'granted', 'cached'])
 
   issuer!.refuse = { kind: 'provider_refused', reason: 'id.example refused: principal expired' }
   await h.restart()
@@ -532,3 +535,145 @@ test('vector 24: two principals on one configured server get different cached cr
   expect(ada.mints).toHaveLength(1)
   expect(bo.mints).toHaveLength(1)
 })
+
+// ── when a dial fails: say why, and never with the credential ──
+
+test('a dial credential outlives 15 minutes, and access/token answers stay short: one is never handed out as the other', async () => {
+  const issuer = new FakeIssuer()
+  issuer.lifetimeMs = 24 * 3600_000
+  const { peer, h } = await setup({ issuer, transport: { access: 'games' } })
+  expect(h.status).toBe('ready')
+  await peer.policyCount(1)
+  const dialed = peer.token(0)
+  const res = (await peer.request('access/token', { audience: 'games' })).result as { credential: string }
+  expect(res.credential).not.toBe(dialed)
+  expect(issuer.mints).toEqual([{ audience: 'games', ttl: DIAL_TTL }, { audience: 'games', ttl: ACCESS_TTL }])
+})
+
+test('a refused credential is not offered twice: the next dial mints', async () => {
+  let refuse = false
+  const issuer = new FakeIssuer()
+  const { peer, h } = await setup({ issuer, transport: { access: 'games' }, verifyUpgrade: () => (refuse ? 401 : true) })
+  await peer.policyCount(1)
+  const n = issuer.mints.length
+  refuse = true
+  peer.dropAll()
+  while (!h.lastError?.includes('refused')) await Bun.sleep(20) // the cached one, turned down
+  expect(issuer.mints.length).toBe(n)
+  refuse = false
+  await peer.policyCount(2)
+  expect(issuer.mints.length).toBe(n + 1)
+  expect(peer.token()).not.toBe(peer.token(0))
+})
+
+test('an expired static token is never dialed: the error names when, who and the way out, not the token', async () => {
+  const token = aid1Token({ sub: 'agent:someone@guest', aud: 'docs', exp: 1793816877 })
+  const { peer, h, logs } = await setup({ transport: { token }, renewCommand: 'bun run identity adopt --config /x.json' })
+  expect(h.status).toBe('disconnected')
+  expect(peer.upgrades).toHaveLength(0)
+  expect(h.staticTokenExpiresAt).toBe(1793816877_000)
+  expect(h.lastError).toBe('connect failed: static token expired 2026-11-04T18:27:57Z (agent:someone@guest, audience docs) — not a server outage, and it will not come back on its own. To make it renew itself: bun run identity adopt --config /x.json')
+  expect(JSON.stringify(logs)).not.toContain(token)
+})
+
+test('an expired token from the environment is not told to run a command that cannot reach it', async () => {
+  process.env.MCPL_TEST_EXPIRED = aid1Token({ sub: 'agent:someone@guest', aud: 'docs', exp: 1793816877 })
+  cleanup.push(() => delete process.env.MCPL_TEST_EXPIRED)
+  const { peer, h } = await setup({ transport: { tokenEnv: 'MCPL_TEST_EXPIRED' }, renewCommand: 'bun run identity adopt' })
+  expect(peer.upgrades).toHaveLength(0)
+  expect(h.lastError).toContain('static token expired')
+  expect(h.lastError).toContain('It comes from $MCPL_TEST_EXPIRED')
+  expect(h.lastError).not.toContain('identity adopt')
+})
+
+test('a static token with time left dials as before, and reports how long it has', async () => {
+  const exp = Math.floor(Date.now() / 1000) + 3600
+  const token = aid1Token({ sub: 'agent:someone@guest', aud: 'docs', exp })
+  const { peer, h } = await setup({ transport: { token } })
+  expect(h.status).toBe('ready')
+  expect(peer.token(0)).toBe(token)
+  expect(h.staticTokenExpiresAt).toBe(exp * 1000)
+})
+
+test('an opaque static token is left alone: nothing to read an expiry from', async () => {
+  const { peer, h } = await setup({ transport: { token: 'opaque-shared-secret' } })
+  expect(h.status).toBe('ready')
+  expect(peer.token(0)).toBe('opaque-shared-secret')
+  expect(h.staticTokenExpiresAt).toBeNull()
+})
+
+test('a refused upgrade reads as one, not as [object ErrorEvent], and the URL with the credential stays out of it', async () => {
+  const token = aid1Token({ sub: 'agent:someone@guest', aud: 'docs', exp: Math.floor(Date.now() / 1000) + 3600 })
+  const { h, logs } = await setup({ transport: { token }, verifyUpgrade: () => 401 })
+  expect(h.status).toBe('disconnected')
+  expect(h.lastError).toContain('the server refused the WebSocket upgrade')
+  expect(h.lastError).not.toContain('object')
+  expect(h.lastError).not.toContain('token=')
+  expect(h.lastError).not.toContain(token)
+  expect(JSON.stringify(logs)).not.toContain(token)
+})
+
+test('an unreachable server reads as such, with the credential stripped', async () => {
+  const dead = Bun.serve({ port: 0, hostname: '127.0.0.1', fetch: () => new Response('') })
+  const port = dead.port
+  dead.stop(true)
+  const logs: string[] = []
+  const h = new McplServerHandle('svc', { transport: { url: `ws://127.0.0.1:${port}/mcpl`, token: 'some-opaque-secret' }, grant: [], reconnect: false } as ServerConfig, { deliver() {}, toolsChanged() {}, log: l => logs.push(l) })
+  cleanup.push(() => h.close())
+  h.start()
+  await h.firstAttempt
+  expect(h.lastError).toBe('connect failed: Failed to connect')
+  expect(JSON.stringify(logs)).not.toContain('some-opaque-secret')
+})
+
+test('dialFailure: an ErrorEvent loses the URL, an aid1 token anywhere in the text is scrubbed, anything else still says something', () => {
+  const token = aid1Token({ exp: 1 })
+  const event = { message: `WebSocket connection to 'wss://docs.example/mcpl?token=${token}' failed: Failed to connect` }
+  expect(dialFailure(event)).toBe('Failed to connect')
+  expect(dialFailure(new Error(`boom ${token}`))).not.toContain(token)
+  expect(dialFailure({ message: 'getaddrinfo ENOTFOUND wss://x?token=abc123' })).not.toContain('abc123')
+  expect(dialFailure('plain')).toBe('plain')
+})
+
+test('a close reason echoing the dialed query does not carry an encoded credential to the model', async () => {
+  const door = Bun.serve({
+    port: 0,
+    hostname: '127.0.0.1',
+    fetch: (r, srv) => (srv.upgrade(r) ? undefined : new Response('', { status: 400 })),
+    websocket: { open: ws => void setTimeout(() => ws.close(4401, 'refused /mcpl?token=opaque%2Bshared%2Fsecret'), 20), message() {} },
+  })
+  const h = new McplServerHandle('svc', { transport: { url: `ws://127.0.0.1:${door.port}/mcpl`, token: 'opaque+shared/secret' }, grant: [], reconnectIntervalMs: 60_000 }, { deliver() {}, toolsChanged() {}, log() {} })
+  cleanup.push(() => void door.stop(true), () => h.close())
+  h.start()
+  await h.firstAttempt
+  expect(h.lastError).toContain('4401 refused')
+  expect(h.lastError).not.toContain('opaque')
+})
+
+for (const [when, delayMs] of [['at once', 0], ['a moment later', 20]] as const) {
+  test(`a door that accepts the upgrade and closes ${when} is heard: its code and reason reach the error without a timeout, and the credential is not offered again`, async () => {
+    const door = Bun.serve({
+      port: 0,
+      hostname: '127.0.0.1',
+      fetch: (r, srv) => (srv.upgrade(r) ? undefined : new Response('', { status: 400 })),
+      websocket: {
+        open(ws) {
+          if (delayMs) setTimeout(() => ws.close(4401, 'unauthorized'), delayMs)
+          else ws.close(4401, 'unauthorized')
+        },
+        message() {},
+      },
+    })
+    const issuer = new FakeIssuer()
+    const h = new McplServerHandle('svc', { transport: { url: `ws://127.0.0.1:${door.port}/mcpl`, access: 'games' }, grant: [], reconnectIntervalMs: 50 }, { deliver() {}, toolsChanged() {}, log() {}, issuer: () => issuer })
+    cleanup.push(() => void door.stop(true), () => h.close())
+    const started = Date.now()
+    h.start()
+    await h.firstAttempt
+    expect(Date.now() - started).toBeLessThan(2000)
+    expect(h.lastError).toContain('(4401 unauthorized)')
+    const n = issuer.mints.length
+    while (issuer.mints.length === n) await Bun.sleep(20)
+    expect(issuer.mints.length).toBeGreaterThan(n)
+  })
+}
