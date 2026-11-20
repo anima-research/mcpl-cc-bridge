@@ -1,5 +1,5 @@
 /**
- * MCPL RFC-015 end to end against a REAL local archipelago-home issuer.
+ * Dial credentials (`transport.access`) end to end against a REAL local archipelago-home issuer.
  *
  * Opt-in: set MCPL_ACCESS_E2E_ISSUER to an archipelago-home checkout that has
  * the token-ttl change (POST /token `ttl`), with its dev deps installed; node
@@ -99,7 +99,7 @@ afterAll(async () => {
   if (base) rmSync(base, { recursive: true, force: true })
 })
 
-const APPS = { version: '0.5', pushEvents: true, access: { token: true }, featureSets: { apps: { description: 'apps acting as the agent', uses: ['pushEvents', 'access.token'] } } }
+const APPS = { version: '0.5', pushEvents: true, featureSets: { apps: { description: 'apps', uses: ['pushEvents'] } } }
 
 function verifyGames(token: string | null) {
   const v = verifyToken(String(token), { issuerId, iss: HOME, aud: 'games' })
@@ -123,45 +123,6 @@ async function connect(grant: string[], transport: { access?: string } = {}, pee
   await h.firstAttempt
   return { peer, h, audits }
 }
-
-e2e('a server granted access.token gets a credential for "games" that verifies with the issuer key and expires in ~15 minutes', async () => {
-  const { peer, audits } = await connect(['pushEvents', 'access.token'])
-  await peer.policyCount(1)
-  const r = await peer.request('access/token', { audience: 'games', endpoint: 'wss://games.invalid/mcpl', purpose: 'doom-1: opened by the agent' })
-  expect(r.error).toBeUndefined()
-  const res = r.result as { scheme: string; credential: string; expiresAt: string; principal: string }
-  expect(res.scheme).toBe('bearer')
-  const p = verifyGames(res.credential)
-  expect(p.aud).toBe('games')
-  expect(p.sub).toBe(rec.sub)
-  expect(res.principal).toBe(rec.sub)
-  expect(p.exp - p.iat).toBe(15 * 60)
-  expect(res.expiresAt).toBe(new Date(p.exp * 1000).toISOString().replace('.000Z', 'Z')) // RFC 3339 UTC
-  const left = p.exp * 1000 - Date.now()
-  expect(left).toBeGreaterThan(14 * 60_000)
-  expect(left).toBeLessThanOrEqual(15 * 60_000)
-  expect(audits[0]).toMatchObject({ kind: 'request', audience: 'games', outcome: 'granted', principal: rec.sub, expiresAt: res.expiresAt })
-  expect(JSON.stringify(audits)).not.toContain(res.credential)
-})
-
-e2e('without the grant: -32002, and the issuer is never asked', async () => {
-  const before = readFileSync(join(base, 'issuer-data', 'minted.jsonl'), 'utf8').split('\n').length
-  const { peer } = await connect(['pushEvents'])
-  await peer.policyCount(1)
-  const r = await peer.request('access/token', { audience: 'games' })
-  expect(r.error).toMatchObject({ code: -32002, data: { capability: 'access.token' } })
-  expect(readFileSync(join(base, 'issuer-data', 'minted.jsonl'), 'utf8').split('\n').length).toBe(before)
-})
-
-e2e('an audience the principal lacks: -32040 carrying the issuer\'s reason', async () => {
-  const { peer } = await connect(['pushEvents', 'access.token'])
-  await peer.policyCount(1)
-  const r = await peer.request('access/token', { audience: 'orrery' })
-  expect(r.result).toBeUndefined()
-  expect(r.error).toMatchObject({ code: -32040, data: { audience: 'orrery', kind: 'provider_refused', reason: `${HOME} refused: audience not allowed` } })
-  const u = await peer.request('access/token', { audience: 'no-such-service' })
-  expect(u.error).toMatchObject({ code: -32040, data: { audience: 'no-such-service', kind: 'provider_refused', reason: `${HOME} refused: unknown audience` } })
-})
 
 e2e('transport.access: a valid token at the upgrade — fresh on connect and on a forced reconnect, reused over a server-side drop', async () => {
   // The peer plays a real audience: it accepts the upgrade only with a valid games token.
@@ -193,9 +154,9 @@ e2e('transport.access: a valid token at the upgrade — fresh on connect and on 
   expect(bad.peer.upgrades).toHaveLength(0)
 }, 20_000)
 
-// ── the whole adapter: config → identity → dial + access/token, and nothing reaches the model ──
+// ── the whole adapter: config → identity → dial, and nothing reaches the model ──
 
-e2e('adapter: identity from config, access dial and access/token work, and no credential reaches tool results, notifications, status, logs or the audit', async () => {
+e2e('adapter: identity from config, the access dial works, and no credential reaches tool results, notifications, status, logs or the audit', async () => {
   const verifyUpgrade = (url: URL) => (verifyToken(String(url.searchParams.get('token')), { issuerId, iss: HOME, aud: 'games' }).ok ? (true as const) : 401)
   let leak = ''
   const peer = await McplPeer.start({
@@ -210,7 +171,7 @@ e2e('adapter: identity from config, access dial and access/token work, and no cr
   const cfgPath = join(base, 'bridge.json')
   writeFileSync(cfgPath, JSON.stringify({
     identity: { home: HOME, keyPath: identity.keyPath, url: issuerUrl },
-    servers: { apps: { transport: { url: peer.url, access: 'games' }, grant: ['tools', 'pushEvents', 'access.token'] } },
+    servers: { apps: { transport: { url: peer.url, access: 'games' }, grant: ['tools', 'pushEvents'] } },
   }))
   const child = spawn('bun', ['run', 'src/main.ts'], {
     cwd: ROOT,
@@ -256,11 +217,9 @@ e2e('adapter: identity from config, access dial and access/token work, and no cr
     const dialToken = String(peer.token(0))
     verifyGames(dialToken)
 
-    const r = await peer.request('access/token', { audience: 'games', purpose: 'adapter e2e' })
-    leak = (r.result as { credential: string }).credential
-    verifyGames(leak)
+    leak = dialToken
 
-    // A misbehaving server puts the credential in an event and a tool result (RFC-015 §6.2 forbids it; the host still won't show it).
+    // A misbehaving server puts the credential it was dialed with in an event and a tool result; the host won't show it.
     const pushed = next(m => m.method === 'notifications/claude/channel')
     peer.request('push/event', { featureSet: 'apps', eventId: 'e1', timestamp: new Date().toISOString(), payload: { content: [{ type: 'text', text: `event carrying ${leak}` }] } }).catch(() => {})
     const note = (await pushed).params as { content: string; meta: Record<string, string> }
@@ -273,14 +232,13 @@ e2e('adapter: identity from config, access dial and access/token work, and no cr
 
     const status = ((await call('tools/call', { name: 'mcpl_status', arguments: {} })).content as Array<{ text: string }>)[0]!.text
     expect(status).toContain('access=games')
-    expect(status).toContain('access.token')
     expect(status).toContain(`identity: ${HOME} — enrolled as ${rec.sub}`)
   } finally {
     child.stdin.end()
     await Promise.race([new Promise(r => child.once('exit', r)), sleep(3000)])
     if (child.exitCode === null) child.kill('SIGKILL')
   }
-  // The recorded session, syntactically (RFC-015 §12 vector 6, host side): neither credential anywhere.
+  // The recorded session, syntactically: the credential is nowhere.
   const audit = readFileSync(join(ccDir, 'mcpl-bridge', 'access-audit.jsonl'), 'utf8')
   const debug = readFileSync(join(ccDir, 'mcpl-bridge', 'debug.log'), 'utf8')
   for (const secret of [leak, String(peer.token(0))]) {
@@ -292,9 +250,8 @@ e2e('adapter: identity from config, access dial and access/token work, and no cr
   const lines = audit.trim().split('\n').map(l => JSON.parse(l) as AccessAuditRecord)
   expect(lines.map(l => [l.kind, l.audience, l.outcome])).toEqual([
     ['dial', 'games', 'granted'],
-    ['request', 'games', 'granted'],
   ])
-  expect(lines[1]).toMatchObject({ server: 'apps', purpose: 'adapter e2e', principal: rec.sub })
+  expect(lines[0]).toMatchObject({ server: 'apps', principal: rec.sub })
   expect(existsSync(join(ccDir, 'mcpl-bridge', `sock-access-e2e-${process.pid}.sock`))).toBe(false)
 }, 40_000)
 

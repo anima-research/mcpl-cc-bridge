@@ -2,8 +2,7 @@
  * An in-process MCPL server on a loopback WebSocket, for tests that need to
  * play the server side against a real McplServerHandle (or the whole
  * adapter): answers the handshake, records each upgrade URL (where a dial
- * credential arrives), and lets the test send Server → Host requests such
- * as RFC-015 `access/token`.
+ * credential arrives), and lets the test send Server → Host requests.
  */
 import { WebSocketServer, type WebSocket } from 'ws'
 import type { IncomingMessage } from 'http'

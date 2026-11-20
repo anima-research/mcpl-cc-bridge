@@ -1,11 +1,10 @@
 /**
  * Credential redaction at every edge Claude Code shows the model: tool
  * results, tool lists, channel notifications, hook context, and the bridge's
- * own logs (MCPL RFC-015 §6.2, §8.3 — credentials move between host and
- * server and nowhere else).
+ * own logs — credentials move between host and server and nowhere else.
  *
  * The bridge knows the credentials it handles — every one it minted (dial
- * `access`, RFC-015 `access/token`) and every static token it dialed with —
+ * `access`) and every static token it dialed with —
  * and registers them here. Anything that crosses into model context or a log
  * line is scrubbed of those exact strings, and of anything shaped like an
  * aid1 token whatever its source. Logs additionally lose `?token=` values.

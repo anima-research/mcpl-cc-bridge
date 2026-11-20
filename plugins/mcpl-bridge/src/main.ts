@@ -30,7 +30,7 @@ import { WakeGate } from './wake'
 import { appendFileSync } from 'fs'
 const BRIDGE_DIR = join(process.env.CLAUDE_CONFIG_DIR ?? join(homedir(), '.claude'), 'mcpl-bridge')
 const DEBUG_LOG = join(BRIDGE_DIR, 'debug.log')
-/** RFC-015 §8.2: one JSON line per credential request / access dial — never the credential. */
+/** One JSON line per access dial — never the credential. */
 const ACCESS_AUDIT_LOG = join(BRIDGE_DIR, 'access-audit.jsonl')
 try {
   mkdirSync(BRIDGE_DIR, { recursive: true })
@@ -61,11 +61,10 @@ function trackStaticTokens(c: BridgeConfig): void {
 }
 trackStaticTokens(config)
 
-// ── Identity (MCPL RFC-015) ──
+// ── Identity ──
 // The bridge's enrolled principal: mints dial credentials for
-// `transport.access` and answers `access/token` for servers granted
-// `access.token`. Enrollment is the operator CLI's job (src/identity-cli.ts);
-// nothing here is a tool.
+// `transport.access`. Enrollment is the operator CLI's job
+// (src/identity-cli.ts); nothing here is a tool.
 const makeIdentity = (c: IdentityConfig | undefined): Identity | null => (c ? new Identity(resolveIdentity(c)) : null)
 let identity: Identity | null = makeIdentity(config.identity)
 if (identity) log(`identity: ${identity.home} — ${identity.record() ? `enrolled as ${identity.record()!.sub}` : 'not enrolled (run the identity CLI: enroll --invite … --name …)'}`)
@@ -84,8 +83,8 @@ function identityFor(s: ServerConfig): Identity | null {
   return i
 }
 
-/** Servers whose connection depends on the identity: they dial with it, or may ask it for credentials. */
-const usesIdentity = (s: ServerConfig): boolean => (isWs(s.transport) && !!s.transport.access) || (s.grant ?? []).includes('access.token')
+/** Servers whose connection depends on the identity: they dial with it. */
+const usesIdentity = (s: ServerConfig): boolean => isWs(s.transport) && !!s.transport.access
 
 // ── MCP server face ──
 

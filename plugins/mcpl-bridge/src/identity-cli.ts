@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
 /**
- * Operator CLI for the bridge's identity (MCPL RFC-015) — deliberately NOT a
+ * Operator CLI for the bridge's identity — deliberately NOT a
  * tool: enrollment and its key material are the operator's business, and
  * nothing here ever reaches a model.
  *
