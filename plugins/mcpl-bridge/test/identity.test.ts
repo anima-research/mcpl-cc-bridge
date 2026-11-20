@@ -92,7 +92,7 @@ test('mint: signed token statement with ttl; expiresAt from the reply, else from
   reply = { status: 200, json: { token: aid1({ sub: 'agent:cc@guest', exp: now + 7 * 86400 }), sub: 'agent:cc@guest' } }
   expect((await idn.mint('games')).expiresAt).toBe((now + 7 * 86400) * 1000)
 
-  // no expiry anywhere → MUST NOT answer (RFC-015 §3.2)
+  // no expiry anywhere → the credential is not used
   reply = { status: 200, json: { token: 'opaque-credential-without-exp' } }
   await expect(idn.mint('games')).rejects.toMatchObject({ kind: 'unavailable', reason: 'id.example did not say when the credential expires' })
 
@@ -100,7 +100,7 @@ test('mint: signed token statement with ttl; expiresAt from the reply, else from
   const e = await idn.mint('orrery').catch(x => x)
   expect(e).toBeInstanceOf(AccessRefused)
   expect(e).toMatchObject({ audience: 'orrery', kind: 'provider_refused', reason: 'id.example refused: audience not allowed' })
-  // RFC-015 r3 refusal kinds by what the provider said
+  // refusal kinds by what the provider said
   reply = { status: 400, json: { error: 'unknown audience' } }
   expect(await idn.mint('nope').catch(x => x)).toMatchObject({ kind: 'provider_refused' })
   reply = { status: 429, json: { error: 'rate limited' } }

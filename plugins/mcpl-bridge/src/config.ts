@@ -155,8 +155,7 @@ export type ServerConfig = {
 /**
  * The bridge's own identity: an ed25519 key enrolled as a principal at an
  * archipelago-home identity provider. Used for `transport.access` (dial
- * credentials) and to answer RFC-015 `access/token` for servers granted
- * `access.token`. Enroll with the operator CLI (src/identity-cli.ts); nothing
+ * credentials). Enroll with the operator CLI (src/identity-cli.ts); nothing
  * about it is model-visible.
  */
 export type IdentityConfig = {

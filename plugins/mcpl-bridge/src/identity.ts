@@ -8,11 +8,11 @@
  * statements; archipelago-home src/statements.ts is the source of truth for
  * the statements: re-copy, don't fork. One addition: `mint` asks for a
  * lifetime (`ttl`, archipelago-home's `token-ttl` change) and reports the
- * real expiry, which RFC-015 §3.2 requires.
+ * real expiry.
  *
  * Host-side plumbing only. Nothing here is a tool, and no key, proof or
  * credential ever reaches model context: callers hand credentials to a
- * transport or to a server's `access/token` answer and nowhere else.
+ * transport and nowhere else.
  */
 import { createPrivateKey, createPublicKey, generateKeyPairSync, sign as cryptoSign, type KeyObject } from 'node:crypto'
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
@@ -58,7 +58,7 @@ export class Identity implements AccessIssuer {
     this.url = (opts.url ?? `https://${opts.home}`).replace(/\/+$/, '')
     this.recordPath = opts.keyPath.replace(/\.pem$/, '') + '.json'
     this.fetchImpl = opts.fetchImpl ?? fetch
-    // Under the 20 s an access/token answer gets (RFC-015 r4 §3.4), so the provider's silence becomes "unavailable" in time.
+    // The provider's silence becomes "unavailable" after this.
     this.timeoutMs = opts.timeoutMs ?? 15_000
   }
 
@@ -133,7 +133,7 @@ export class Identity implements AccessIssuer {
       if (res.status >= 500 || res.status === 200) return refuse('unavailable', `${this.home} gave no credential: ${said}`)
       return refuse('provider_refused', `${this.home} refused: ${said}`)
     }
-    // RFC-015 §3.2: a host that cannot state the expiry MUST NOT answer. The
+    // A credential whose expiry cannot be stated is not used. The
     // reply's `exp` (archipelago-home token-ttl), else the token's own claim.
     const payload = aid1Payload(token)
     const exp = typeof res.json.exp === 'number' ? res.json.exp : payload?.exp

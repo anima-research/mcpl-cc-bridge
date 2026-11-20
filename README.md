@@ -162,14 +162,14 @@ Notes:
 - `toolHints` — MCPL RFC-014 tool presence (default `true`); `false` makes the
   bridge a plain host for that server. See [Toolsets](#toolsets-and-dynamic-tools-mcpl-rfc-014).
 - `transport.access` — mint this audience's credential instead of holding a
-  static `token`, so it cannot expire on you; `"access.token"` in `grant` lets the server ask for
-  credentials itself. See [Identity and delegated access](#identity-and-delegated-access-mcpl-rfc-015).
+  static `token`, so it cannot expire on you. See
+  [Identity and dial credentials](#identity-and-dial-credentials).
 
-## Identity and delegated access (MCPL RFC-015)
+## Identity and dial credentials
 
 The bridge can hold an identity of its own — an ed25519 key enrolled as a
 principal at an [archipelago-home](https://github.com/anima-research/archipelago-home)
-identity provider — and use it two ways:
+identity provider — and dial servers with it:
 
 ```json
 {
@@ -178,10 +178,6 @@ identity provider — and use it two ways:
     "games": {
       "transport": { "url": "wss://games.example/mcpl", "access": "games" },
       "grant": ["tools", "pushEvents"]
-    },
-    "surfaces": {
-      "transport": { "url": "ws://127.0.0.1:7470/mcpl" },
-      "grant": ["tools", "pushEvents", "channels.register", "channels.publish", "access.token"]
     }
   }
 }
@@ -191,39 +187,21 @@ identity provider — and use it two ways:
   for that audience and sends it where `token` would go (`?token=`), so nothing
   in the config can expire. It takes precedence over `token` / `tokenEnv`. A
   failed mint is a dial error naming the audience and the issuer's reason.
-  The lifetime is 24 hours, not RFC-015's 15 minutes: MCPL doors close a socket
-  when the token that opened it expires, so 15 minutes would mean a forced
-  reconnect, with the server's tools gone meanwhile, every 15 minutes. A
+  The lifetime is 24 hours: MCPL doors close a socket when the token that
+  opened it expires, so a short one would mean a forced reconnect, with the
+  server's tools gone meanwhile, each time it ran out. A
   credential is reused across reconnects until shortly before it expires, or
   until the server refuses it, or `mcpl_reload` asks for a clean start.
   `transport.identity` gives one server its own identity, when a bridge is a
   different principal there.
-- **`access/token` (RFC-015)** — when `identity` is configured the host
-  advertises `access: { token: true }`. A server granted `access.token` may
-  ask for a credential for any audience the principal can obtain; the answer is
-  `{ scheme: "bearer", credential, expiresAt, principal }`, minted with a
-  15-minute lifetime and cached per (server, principal, audience, scheme) —
-  never answered from the cache with under two minutes left (`fresh: true`
-  bypasses it). The answer comes within `timeoutMs` − 2 s (5–120 s, default 30 s) and
-  at most 20 s. Unknown params members are ignored. Errors: `-32002` without
-  the grant, `-32602` for malformed params, `-32040
-  { audience, kind, reason }` when there is no identity (`no_identity`), the
-  issuer refuses (`provider_refused`) or throttles (`rate_limited`), or gives no
-  usable answer within 20 s (`unavailable`), or the server's `schemes` exclude
-  `bearer` (`host_policy`). `expiresAt` is RFC 3339 UTC (`…Z`).
-  Granting `access.token` is the whole trust decision — there is no
-  per-audience list; the issuer's policy for the principal is the bound. It is
-  never in the default grant, and a wildcard (`access.*`, `*.*`) does not grant
-  it: name it.
 
 `identity.keyPath` defaults to `~/.config/mcpl-bridge/identity-key.pem`
 (created 0600 on first use; the enrollment record sits beside it as
 `identity-key.json`). `identity.url` overrides the issuer base URL
 (`https://<home>`) for a local issuer; plain `http://` only to loopback.
-Every request and access dial is audited to
-`~/.claude/mcpl-bridge/access-audit.jsonl` (server, audience, endpoint as
-scheme/host/path only, purpose, outcome and refusal kind, expiry — never the
-credential).
+Every access dial is audited to
+`~/.claude/mcpl-bridge/access-audit.jsonl` (server, audience, outcome and
+refusal kind, expiry — never the credential).
 
 Credentials never reach the model: tool results, tool lists, channel
 notifications, hook context, `mcpl_status`, error strings and logs all pass a
@@ -546,12 +524,10 @@ bun test                  # unit tests
 [anima-research/mcpl-core-ts](https://github.com/anima-research/mcpl-core-ts)
 `src/` (MIT; the npm `@animalabs/mcpl-core@0.2.2` is a stale publish missing
 the grant and manifest helpers). Re-sync after upstream changes:
-`cp <mcpl-core-ts>/src/*.ts plugins/mcpl-bridge/src/vendor/mcpl-core/` —
-keeping the local `access.token` capability path (MCPL RFC-015) in
-`capabilities.ts` until upstream carries it.
+`cp <mcpl-core-ts>/src/*.ts plugins/mcpl-bridge/src/vendor/mcpl-core/`.
 
-Tests: `bun test` (unit tests, including RFC-015 against an in-process MCPL
-peer and a fake issuer). The RFC-015 end-to-end test runs against a real local
+Tests: `bun test` (unit tests, including dial credentials against an in-process
+MCPL peer and a fake issuer). The dial-credential end-to-end test runs against a real local
 archipelago-home issuer it starts itself (temp dirs, free port, killed by pid):
 
 ```bash
